@@ -13,8 +13,7 @@ final class DisplayResolverTests: XCTestCase {
                 serialNumber: 3,
                 bounds: .zero,
                 pixelsWide: 1_728,
-                pixelsHigh: 1_117,
-                localizedName: "Built-in"
+                pixelsHigh: 1_117
             ),
             DisplaySnapshot(
                 displayID: 2,
@@ -23,8 +22,7 @@ final class DisplayResolverTests: XCTestCase {
                 serialNumber: CapturedXeneonDisplay.observedSerialNumber,
                 bounds: CGRect(x: 5_088, y: 1_890, width: 2_560, height: 720),
                 pixelsWide: 2_560,
-                pixelsHigh: 720,
-                localizedName: "XENEON EDGE"
+                pixelsHigh: 720
             )
         ]
 
@@ -42,8 +40,7 @@ final class DisplayResolverTests: XCTestCase {
             serialNumber: 111,
             bounds: .zero,
             pixelsWide: 3_840,
-            pixelsHigh: 2_160,
-            localizedName: "Other Corsair"
+            pixelsHigh: 2_160
         )
         let rightSize = DisplaySnapshot(
             displayID: 11,
@@ -52,8 +49,7 @@ final class DisplayResolverTests: XCTestCase {
             serialNumber: 222,
             bounds: .zero,
             pixelsWide: 2_560,
-            pixelsHigh: 720,
-            localizedName: "XENEON EDGE"
+            pixelsHigh: 720
         )
 
         let match = resolver.resolve(from: [wrongSize, rightSize])

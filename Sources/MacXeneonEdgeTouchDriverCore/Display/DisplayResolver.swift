@@ -1,4 +1,3 @@
-import AppKit
 import CoreGraphics
 import Foundation
 
@@ -25,9 +24,6 @@ public struct DisplaySnapshot: Equatable {
     /// Physical pixel height.
     public let pixelsHigh: Int
 
-    /// Localized display name, used only for diagnostics.
-    public let localizedName: String
-
     /// Creates a display snapshot for matching or tests.
     public init(
         displayID: CGDirectDisplayID,
@@ -36,8 +32,7 @@ public struct DisplaySnapshot: Equatable {
         serialNumber: UInt32,
         bounds: CGRect,
         pixelsWide: Int,
-        pixelsHigh: Int,
-        localizedName: String
+        pixelsHigh: Int
     ) {
         self.displayID = displayID
         self.vendorNumber = vendorNumber
@@ -46,7 +41,6 @@ public struct DisplaySnapshot: Equatable {
         self.bounds = bounds
         self.pixelsWide = pixelsWide
         self.pixelsHigh = pixelsHigh
-        self.localizedName = localizedName
     }
 }
 
@@ -137,16 +131,7 @@ public final class DisplayResolver {
             serialNumber: CGDisplaySerialNumber(displayID),
             bounds: CGDisplayBounds(displayID),
             pixelsWide: CGDisplayPixelsWide(displayID),
-            pixelsHigh: CGDisplayPixelsHigh(displayID),
-            localizedName: localizedName(for: displayID)
+            pixelsHigh: CGDisplayPixelsHigh(displayID)
         )
-    }
-
-    private func localizedName(for displayID: CGDirectDisplayID) -> String {
-        let targetNumber = NSNumber(value: displayID)
-
-        return NSScreen.screens.first { screen in
-            screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber == targetNumber
-        }?.localizedName ?? "Unknown"
     }
 }

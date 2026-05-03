@@ -17,12 +17,6 @@ public enum XeneonEdgeDevice {
     /// Raw Y coordinate range observed from the HID descriptor.
     public static let rawYRange = 0...9_599
 
-    /// HID Usage Page used for the touch-down signal.
-    public static let touchButtonUsagePage = 0x09
-
-    /// HID Usage used for the touch-down signal.
-    public static let touchButtonUsage = 0x01
-
     /// Report ID observed for all touch reports during the multi-touch feasibility gate.
     public static let touchReportID = 7
 
