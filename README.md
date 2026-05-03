@@ -61,7 +61,7 @@ Optional config file:
 ```
 
 All fields are optional. Missing or malformed config falls back to defaults and logs a warning.
-`logLevel` controls the minimum level written to `driver.log`; Unified Logging is still filtered by macOS.
+`logLevel` only controls the minimum level written to `driver.log`; Unified Logging remains controlled by macOS logging configuration.
 
 ```json
 {

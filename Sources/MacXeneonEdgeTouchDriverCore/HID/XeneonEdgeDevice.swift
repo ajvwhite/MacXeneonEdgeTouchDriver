@@ -8,9 +8,6 @@ public enum XeneonEdgeDevice {
     /// USB product ID reported by the touchscreen controller.
     public static let productID = 0x0859
 
-    /// Manufacturer string observed in the HID diagnostics.
-    public static let manufacturer = "wch.cn"
-
     /// Raw X coordinate range observed from the HID descriptor.
     public static let rawXRange = 0...16_383
 
