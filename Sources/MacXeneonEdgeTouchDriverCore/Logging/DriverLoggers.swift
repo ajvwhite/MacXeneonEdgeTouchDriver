@@ -17,6 +17,39 @@ public enum DriverLogLevel: String {
     case warning = "WARNING"
     case error = "ERROR"
     case fault = "FAULT"
+
+    /// Creates a log level from a user-facing configuration name.
+    public init?(configurationName: String) {
+        switch configurationName.lowercased() {
+        case "debug":
+            self = .debug
+        case "info", "notice":
+            self = .notice
+        case "warning", "warn":
+            self = .warning
+        case "error":
+            self = .error
+        case "fault":
+            self = .fault
+        default:
+            return nil
+        }
+    }
+
+    fileprivate var priority: Int {
+        switch self {
+        case .debug:
+            return 0
+        case .notice:
+            return 1
+        case .warning:
+            return 2
+        case .error:
+            return 3
+        case .fault:
+            return 4
+        }
+    }
 }
 
 /// Shared `os.Logger` instances used by the driver.
@@ -85,8 +118,9 @@ public final class DriverFileLog {
     private var fileURL: URL?
     private var maxBytes: Int = 0
     private var fileHandle: FileHandle?
+    private var minimumLevel: DriverLogLevel = .notice
 
-    private init() {
+    public init() {
         dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     }
 
@@ -95,12 +129,18 @@ public final class DriverFileLog {
     }
 
     /// Opens the diagnostics log file. Pass `nil` or an empty path to disable file logging.
-    public func configure(fileLogPath: String?, maxBytes: Int, fileManager: FileManager = .default) throws {
+    public func configure(
+        fileLogPath: String?,
+        maxBytes: Int,
+        minimumLevel: DriverLogLevel = .notice,
+        fileManager: FileManager = .default
+    ) throws {
         lock.lock()
         defer { lock.unlock() }
 
         try fileHandle?.close()
         fileHandle = nil
+        self.minimumLevel = minimumLevel
 
         guard let fileLogPath, !fileLogPath.isEmpty else {
             fileURL = nil
@@ -129,6 +169,10 @@ public final class DriverFileLog {
     public func write(level: DriverLogLevel, category: DriverLogCategory, message: String) {
         lock.lock()
         defer { lock.unlock() }
+
+        guard level.priority >= minimumLevel.priority else {
+            return
+        }
 
         guard let fileURL, let fileHandle else {
             return

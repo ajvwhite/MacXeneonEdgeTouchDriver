@@ -12,8 +12,8 @@ public final class GestureController {
     private let mapperProvider: () -> CoordinateMapper?
     private let timing: GestureTiming
     private let schedulingQueue: DispatchQueue?
-    private weak var inputSink: SyntheticInputSink?
-    private weak var cursorController: CursorController?
+    private let inputSink: SyntheticInputSink
+    private let cursorController: CursorController
     private var pendingMouseDown: DispatchWorkItem?
     private var pendingMouseUp: DispatchWorkItem?
     private var pendingCursorReturn: DispatchWorkItem?
@@ -50,7 +50,11 @@ public final class GestureController {
                 return
             }
 
-            cursorController?.borrow(warpingTo: point)
+            guard cursorController.borrow(warpingTo: point) else {
+                DriverLoggers.log(.warning, category: .gesture, "Dropping touch down because cursor borrow failed.")
+                return
+            }
+
             state = .singleTouch(
                 SingleTouchContext(
                     contactID: event.contactID,
@@ -75,8 +79,8 @@ public final class GestureController {
                 return
             }
 
-            cursorController?.updatePosition(point)
-            inputSink?.postMouseDragged(to: point)
+            cursorController.updatePosition(point)
+            inputSink.postMouseDragged(to: point)
             currentContext.lastPoint = point
             currentContext.lastRawX = event.rawX
             currentContext.lastRawY = event.rawY
@@ -125,13 +129,13 @@ public final class GestureController {
 
         switch state {
         case .idle:
-            cursorController?.forceShow()
+            cursorController.forceShow()
 
         case .singleTouch(let context):
             if context.isMouseDownPosted {
-                inputSink?.postMouseUp(at: context.lastPoint)
+                inputSink.postMouseUp(at: context.lastPoint)
             }
-            cursorController?.returnToOrigin()
+            cursorController.returnToOrigin()
             transitionToIdle()
         }
     }
@@ -161,7 +165,7 @@ public final class GestureController {
             return
         }
 
-        inputSink?.postMouseDown(at: point)
+        inputSink.postMouseDown(at: point)
         context.isMouseDownPosted = true
         state = .singleTouch(context)
         pendingMouseDown = nil
@@ -178,7 +182,7 @@ public final class GestureController {
             return
         }
 
-        inputSink?.postMouseUp(at: point)
+        inputSink.postMouseUp(at: point)
         pendingMouseUp = nil
         pendingCursorReturn = schedule(after: timing.clickToWarpBackDelayMs) { [weak self] in
             self?.returnCursorAndIdle(contactID: contactID)
@@ -190,7 +194,7 @@ public final class GestureController {
             return
         }
 
-        cursorController?.returnToOrigin()
+        cursorController.returnToOrigin()
         pendingCursorReturn = nil
         transitionToIdle()
     }

@@ -39,7 +39,9 @@ public final class CGEventInputSink: SyntheticInputSink {
         }
 
         event.setIntegerValueField(.mouseEventButtonNumber, value: Int64(CGMouseButton.left.rawValue))
-        event.setIntegerValueField(.mouseEventClickState, value: 1)
+        if type == .leftMouseDown || type == .leftMouseUp {
+            event.setIntegerValueField(.mouseEventClickState, value: 1)
+        }
         event.post(tap: eventTap)
     }
 }

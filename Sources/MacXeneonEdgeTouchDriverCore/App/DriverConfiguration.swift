@@ -93,7 +93,11 @@ public struct DriverConfiguration: Codable, Equatable {
         var warnings: [String] = []
 
         if let logLevel = partial.logLevel {
-            configuration.logLevel = logLevel
+            if DriverLogLevel(configurationName: logLevel) != nil {
+                configuration.logLevel = logLevel
+            } else {
+                warnings.append("logLevel was not recognized and defaulted to \(configuration.logLevel).")
+            }
         }
 
         if let timing = partial.timing {

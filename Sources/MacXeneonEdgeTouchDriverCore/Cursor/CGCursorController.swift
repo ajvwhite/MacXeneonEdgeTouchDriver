@@ -3,24 +3,40 @@ import Foundation
 
 /// Borrows the system cursor while a touch gesture is active.
 public final class CGCursorController: CursorController {
-    private let displayID: CGDirectDisplayID
+    private let displayIDProvider: () -> CGDirectDisplayID
     private var savedCursorPosition: CGPoint?
     private var isCursorHidden = false
     private var isCursorAssociated = true
 
     /// Creates a CoreGraphics cursor controller.
-    public init(displayID: CGDirectDisplayID = CGMainDisplayID()) {
-        self.displayID = displayID
+    public init(displayIDProvider: @escaping () -> CGDirectDisplayID = CGMainDisplayID) {
+        self.displayIDProvider = displayIDProvider
     }
 
-    public func borrow(warpingTo point: CGPoint) {
+    public func borrow(warpingTo point: CGPoint) -> Bool {
+        let isNewBorrow = savedCursorPosition == nil
+
         if savedCursorPosition == nil {
-            savedCursorPosition = currentCursorPosition()
+            guard let currentPosition = currentCursorPosition() else {
+                DriverLoggers.log(.error, category: .cursor, "Could not read current cursor position; refusing to borrow cursor.")
+                return false
+            }
+
+            savedCursorPosition = currentPosition
             hideCursor()
             setCursorAssociation(false)
         }
 
-        warp(to: point)
+        guard warp(to: point) else {
+            if isNewBorrow {
+                setCursorAssociation(true)
+                savedCursorPosition = nil
+                showCursor()
+            }
+            return false
+        }
+
+        return true
     }
 
     public func updatePosition(_ point: CGPoint) {
@@ -29,7 +45,7 @@ public final class CGCursorController: CursorController {
             return
         }
 
-        warp(to: point)
+        _ = warp(to: point)
     }
 
     public func returnToOrigin() {
@@ -39,7 +55,7 @@ public final class CGCursorController: CursorController {
         }
 
         setCursorAssociation(true)
-        warp(to: savedCursorPosition)
+        _ = warp(to: savedCursorPosition)
         self.savedCursorPosition = nil
         showCursor()
     }
@@ -50,15 +66,17 @@ public final class CGCursorController: CursorController {
         showCursor()
     }
 
-    private func currentCursorPosition() -> CGPoint {
-        CGEvent(source: nil)?.location ?? .zero
+    private func currentCursorPosition() -> CGPoint? {
+        CGEvent(source: nil)?.location
     }
 
-    private func warp(to point: CGPoint) {
+    private func warp(to point: CGPoint) -> Bool {
         let result = CGWarpMouseCursorPosition(point)
         if result != .success {
             DriverLoggers.log(.error, category: .cursor, "CGWarpMouseCursorPosition failed with \(result.rawValue).")
+            return false
         }
+        return true
     }
 
     private func hideCursor() {
@@ -66,7 +84,7 @@ public final class CGCursorController: CursorController {
             return
         }
 
-        let result = CGDisplayHideCursor(displayID)
+        let result = CGDisplayHideCursor(displayIDProvider())
         if result == .success {
             isCursorHidden = true
         } else {
@@ -79,7 +97,7 @@ public final class CGCursorController: CursorController {
             return
         }
 
-        let result = CGDisplayShowCursor(displayID)
+        let result = CGDisplayShowCursor(displayIDProvider())
         if result == .success {
             isCursorHidden = false
         } else {

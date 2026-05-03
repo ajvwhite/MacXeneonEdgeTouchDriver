@@ -44,6 +44,19 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertFalse(result.warnings.isEmpty)
     }
 
+    func testInvalidLogLevelDefaultsWithWarning() throws {
+        let url = try writeConfig("""
+        {
+          "logLevel": "chatty"
+        }
+        """)
+
+        let result = DriverConfiguration.load(from: url)
+
+        XCTAssertEqual(result.configuration.logLevel, DriverConfiguration.defaults.logLevel)
+        XCTAssertEqual(result.warnings.count, 1)
+    }
+
     func testOutOfRangeValuesAreClamped() throws {
         let url = try writeConfig("""
         {

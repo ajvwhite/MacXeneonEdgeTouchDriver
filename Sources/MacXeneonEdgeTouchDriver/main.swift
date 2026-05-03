@@ -9,7 +9,8 @@ struct MacXeneonEdgeTouchDriverMain {
         do {
             try DriverFileLog.shared.configure(
                 fileLogPath: loadResult.configuration.diagnostics.fileLogPath,
-                maxBytes: loadResult.configuration.diagnostics.fileLogMaxBytes
+                maxBytes: loadResult.configuration.diagnostics.fileLogMaxBytes,
+                minimumLevel: DriverLogLevel(configurationName: loadResult.configuration.logLevel) ?? .notice
             )
         } catch {
             DriverLoggers.log(.error, category: .lifecycle, "Could not configure diagnostics file logging: \(error.localizedDescription)")

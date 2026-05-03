@@ -72,13 +72,14 @@ public final class DisplayResolver {
     /// Re-resolves the Xeneon display from the active display list.
     public func refresh() {
         let previousBounds = currentBounds
+        let previousDisplayID = currentDisplayID
         let match = resolve()
 
         currentDisplayID = match?.displayID
         currentBounds = match?.bounds
         currentMapper = match.map { CoordinateMapper(displayBounds: $0.bounds) }
 
-        if currentBounds != previousBounds {
+        if currentBounds != previousBounds || currentDisplayID != previousDisplayID {
             onDisplayChanged?(currentBounds)
         }
     }

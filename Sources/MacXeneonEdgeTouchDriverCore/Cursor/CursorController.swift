@@ -4,7 +4,9 @@ import Foundation
 /// Manages cursor borrow, warp, and return operations.
 public protocol CursorController: AnyObject {
     /// Saves the current cursor position, hides the cursor, and warps to `point`.
-    func borrow(warpingTo point: CGPoint)
+    ///
+    /// - Returns: `true` if the cursor was borrowed and warped successfully.
+    func borrow(warpingTo point: CGPoint) -> Bool
 
     /// Warps the borrowed cursor to a new gesture point.
     func updatePosition(_ point: CGPoint)

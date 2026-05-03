@@ -93,17 +93,126 @@ final class GestureControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .idle)
     }
 
+    func testBorrowFailureDropsTouchDown() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        cursor.shouldBorrow = false
+        let controller = makeController(input: input, cursor: cursor)
+
+        controller.handle(event(.down, rawX: 0, rawY: 0))
+
+        XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200))])
+        XCTAssertTrue(input.calls.isEmpty)
+        XCTAssertEqual(controller.state, .idle)
+    }
+
+    func testMoveBeforeDelayedMouseDownCancelsPendingMouseDown() {
+        let queue = DispatchQueue(label: "MacXeneonEdgeTouchDriverTests.delayed-move")
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            timing: GestureTiming(
+                warpToClickDelayMs: 100,
+                downToUpDelayMs: 0,
+                clickToWarpBackDelayMs: 0,
+                tapDebounceMs: 0
+            ),
+            schedulingQueue: queue
+        )
+        let delayedWorkSettled = expectation(description: "delayed mouse-down work settled")
+
+        controller.handle(event(.down, rawX: 0, rawY: 0))
+        controller.handle(event(.move, rawX: 16_383, rawY: 9_599))
+        queue.asyncAfter(deadline: .now() + .milliseconds(150)) {
+            delayedWorkSettled.fulfill()
+        }
+
+        wait(for: [delayedWorkSettled], timeout: 1.0)
+        XCTAssertEqual(
+            input.calls,
+            [
+                .mouseDown(CGPoint(x: 100, y: 200)),
+                .mouseDragged(CGPoint(x: 2_660, y: 920))
+            ]
+        )
+    }
+
+    func testDelayedTapSchedulesMouseUpThenCursorReturn() {
+        let queue = DispatchQueue(label: "MacXeneonEdgeTouchDriverTests.delayed-tap")
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            timing: GestureTiming(
+                warpToClickDelayMs: 0,
+                downToUpDelayMs: 50,
+                clickToWarpBackDelayMs: 50,
+                tapDebounceMs: 0
+            ),
+            schedulingQueue: queue
+        )
+        let becameIdle = expectation(description: "controller became idle after delayed tap")
+        controller.onBecameIdle = {
+            becameIdle.fulfill()
+        }
+
+        controller.handle(event(.down, rawX: 0, rawY: 0))
+        controller.handle(event(.up, rawX: 0, rawY: 0))
+
+        XCTAssertEqual(input.calls, [.mouseDown(CGPoint(x: 100, y: 200))])
+        XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200))])
+
+        wait(for: [becameIdle], timeout: 1.0)
+        XCTAssertEqual(input.calls, [.mouseDown(CGPoint(x: 100, y: 200)), .mouseUp(CGPoint(x: 100, y: 200))])
+        XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200)), .returnToOrigin])
+        XCTAssertEqual(controller.state, .idle)
+    }
+
+    func testForceCancelCancelsPendingMouseDownWork() {
+        let queue = DispatchQueue(label: "MacXeneonEdgeTouchDriverTests.cancel-pending")
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            timing: GestureTiming(
+                warpToClickDelayMs: 100,
+                downToUpDelayMs: 0,
+                clickToWarpBackDelayMs: 0,
+                tapDebounceMs: 0
+            ),
+            schedulingQueue: queue
+        )
+        let delayedWorkSettled = expectation(description: "pending mouse-down work settled")
+
+        controller.handle(event(.down, rawX: 0, rawY: 0))
+        controller.forceCancel()
+        queue.asyncAfter(deadline: .now() + .milliseconds(150)) {
+            delayedWorkSettled.fulfill()
+        }
+
+        wait(for: [delayedWorkSettled], timeout: 1.0)
+        XCTAssertTrue(input.calls.isEmpty)
+        XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200)), .returnToOrigin])
+        XCTAssertEqual(controller.state, .idle)
+    }
+
     private func makeController(
         input: RecordingInputSink,
         cursor: RecordingCursorController,
-        timing: GestureTiming = .immediate
+        timing: GestureTiming = .immediate,
+        schedulingQueue: DispatchQueue? = nil
     ) -> GestureController {
         let mapper = CoordinateMapper(displayBounds: CGRect(x: 100, y: 200, width: 2_560, height: 720))
         return GestureController(
             mapperProvider: { mapper },
             inputSink: input,
             cursorController: cursor,
-            timing: timing
+            timing: timing,
+            schedulingQueue: schedulingQueue
         )
     }
 
@@ -125,18 +234,31 @@ private final class RecordingInputSink: SyntheticInputSink {
         case mouseDragged(CGPoint)
     }
 
-    var calls: [Call] = []
+    private let lock = NSLock()
+    private var recordedCalls: [Call] = []
+
+    var calls: [Call] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedCalls
+    }
 
     func postMouseDown(at point: CGPoint) {
-        calls.append(.mouseDown(point))
+        append(.mouseDown(point))
     }
 
     func postMouseUp(at point: CGPoint) {
-        calls.append(.mouseUp(point))
+        append(.mouseUp(point))
     }
 
     func postMouseDragged(to point: CGPoint) {
-        calls.append(.mouseDragged(point))
+        append(.mouseDragged(point))
+    }
+
+    private func append(_ call: Call) {
+        lock.lock()
+        recordedCalls.append(call)
+        lock.unlock()
     }
 }
 
@@ -148,21 +270,36 @@ private final class RecordingCursorController: CursorController {
         case forceShow
     }
 
-    var calls: [Call] = []
+    private let lock = NSLock()
+    private var recordedCalls: [Call] = []
+    var shouldBorrow = true
 
-    func borrow(warpingTo point: CGPoint) {
-        calls.append(.borrow(point))
+    var calls: [Call] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedCalls
+    }
+
+    func borrow(warpingTo point: CGPoint) -> Bool {
+        append(.borrow(point))
+        return shouldBorrow
     }
 
     func updatePosition(_ point: CGPoint) {
-        calls.append(.update(point))
+        append(.update(point))
     }
 
     func returnToOrigin() {
-        calls.append(.returnToOrigin)
+        append(.returnToOrigin)
     }
 
     func forceShow() {
-        calls.append(.forceShow)
+        append(.forceShow)
+    }
+
+    private func append(_ call: Call) {
+        lock.lock()
+        recordedCalls.append(call)
+        lock.unlock()
     }
 }

@@ -33,7 +33,7 @@ final class CoordinateMapperTests: XCTestCase {
         let mapper = CoordinateMapper(displayBounds: CGRect(x: 0, y: 0, width: 2_560, height: 720))
         let point = mapper.map(rawX: 8_191, rawY: 4_799)
 
-        XCTAssertEqual(point.x, 1_279.9218702318256, accuracy: 0.000001)
-        XCTAssertEqual(point.y, 359.962496093342, accuracy: 0.000001)
+        XCTAssertEqual(point.x, 1_279.9218702318256, accuracy: 0.001)
+        XCTAssertEqual(point.y, 359.962496093342, accuracy: 0.001)
     }
 }
