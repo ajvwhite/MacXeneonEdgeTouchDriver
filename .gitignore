@@ -1,0 +1,25 @@
+# SwiftPM build products
+.build/
+.swiftpm/
+
+# Xcode generated files and user state
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+*.xcuserstate
+*.moved-aside
+
+# Local editor and macOS metadata
+.DS_Store
+.idea/
+.vscode/
+
+# Local runtime diagnostics and secrets
+*.log
+*.trace
+*.env
+*.local.json
+artifacts/
+hid-captures/
+diagnostics/
