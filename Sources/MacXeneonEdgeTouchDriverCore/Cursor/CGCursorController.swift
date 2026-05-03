@@ -106,6 +106,10 @@ public final class CGCursorController: CursorController {
     }
 
     private func setCursorAssociation(_ shouldAssociate: Bool) {
+        guard isCursorAssociated != shouldAssociate else {
+            return
+        }
+
         let associationValue = shouldAssociate ? boolean_t(1) : boolean_t(0)
         let result = CGAssociateMouseAndMouseCursorPosition(associationValue)
 
