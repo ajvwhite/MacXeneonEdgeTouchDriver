@@ -37,10 +37,32 @@ public final class AXFocusRestorer: FocusRestorer {
         }
         self.capturedWindow = nil
 
-        // Avoid app-level activation here; that can raise sibling windows from the same app.
+        // Make only the captured window the app's target before and after app activation.
+        // Avoid NSRunningApplication activation here; it can raise sibling windows from the same app.
         let focusedWindowResult = AXUIElementSetAttributeValue(
             capturedWindow.application,
             kAXFocusedWindowAttribute as CFString,
+            capturedWindow.window
+        )
+        let mainWindowResult = AXUIElementSetAttributeValue(
+            capturedWindow.application,
+            kAXMainWindowAttribute as CFString,
+            capturedWindow.window
+        )
+        let raiseResult = AXUIElementPerformAction(capturedWindow.window, kAXRaiseAction as CFString)
+        let frontmostResult = AXUIElementSetAttributeValue(
+            capturedWindow.application,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+        )
+        let refocusedWindowResult = AXUIElementSetAttributeValue(
+            capturedWindow.application,
+            kAXFocusedWindowAttribute as CFString,
+            capturedWindow.window
+        )
+        let remadeMainWindowResult = AXUIElementSetAttributeValue(
+            capturedWindow.application,
+            kAXMainWindowAttribute as CFString,
             capturedWindow.window
         )
         let mainResult = AXUIElementSetAttributeValue(
@@ -53,13 +75,12 @@ public final class AXFocusRestorer: FocusRestorer {
             kAXFocusedAttribute as CFString,
             kCFBooleanTrue
         )
-        let raiseResult = AXUIElementPerformAction(capturedWindow.window, kAXRaiseAction as CFString)
 
-        guard [focusedWindowResult, mainResult, focusedResult, raiseResult].contains(.success) else {
+        guard isWindowFocused(capturedWindow) else {
             DriverLoggers.log(
                 .warning,
                 category: .focus,
-                "Could not restore the previously focused window. focusedWindow=\(focusedWindowResult.rawValue), main=\(mainResult.rawValue), focused=\(focusedResult.rawValue), raise=\(raiseResult.rawValue)."
+                "Could not verify restore of the previously focused window. focusedWindow=\(focusedWindowResult.rawValue), mainWindow=\(mainWindowResult.rawValue), raise=\(raiseResult.rawValue), frontmost=\(frontmostResult.rawValue), refocusedWindow=\(refocusedWindowResult.rawValue), remadeMainWindow=\(remadeMainWindowResult.rawValue), windowMain=\(mainResult.rawValue), windowFocused=\(focusedResult.rawValue)."
             )
             return
         }
@@ -81,5 +102,18 @@ public final class AXFocusRestorer: FocusRestorer {
         }
 
         return (value as! AXUIElement)
+    }
+
+    private func isWindowFocused(_ capturedWindow: CapturedWindow) -> Bool {
+        guard let focusedApplication = copyElementAttribute(systemWideElement, attribute: kAXFocusedApplicationAttribute),
+              CFEqual(focusedApplication, capturedWindow.application) else {
+            return false
+        }
+
+        guard let focusedWindow = copyElementAttribute(capturedWindow.application, attribute: kAXFocusedWindowAttribute) else {
+            return false
+        }
+
+        return CFEqual(focusedWindow, capturedWindow.window)
     }
 }
