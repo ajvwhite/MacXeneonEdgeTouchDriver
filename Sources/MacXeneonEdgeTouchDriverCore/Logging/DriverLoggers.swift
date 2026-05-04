@@ -114,14 +114,30 @@ public final class DriverFileLog {
     public static let shared = DriverFileLog()
 
     private let lock = NSLock()
-    private let dateFormatter = ISO8601DateFormatter()
+    private let dateFormatter = DateFormatter()
+    private let dateProvider: () -> Date
+    private let timeZoneProvider: () -> TimeZone
     private var fileURL: URL?
     private var maxBytes: Int = 0
     private var fileHandle: FileHandle?
     private var minimumLevel: DriverLogLevel = .notice
 
-    public init() {
-        dateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    public convenience init() {
+        self.init(
+            dateProvider: Date.init,
+            timeZoneProvider: { .autoupdatingCurrent }
+        )
+    }
+
+    init(
+        dateProvider: @escaping () -> Date,
+        timeZoneProvider: @escaping () -> TimeZone
+    ) {
+        self.dateProvider = dateProvider
+        self.timeZoneProvider = timeZoneProvider
+        dateFormatter.calendar = Calendar(identifier: .gregorian)
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSXXXXX"
     }
 
     deinit {
@@ -178,7 +194,8 @@ public final class DriverFileLog {
             return
         }
 
-        let timestamp = dateFormatter.string(from: Date())
+        dateFormatter.timeZone = timeZoneProvider()
+        let timestamp = dateFormatter.string(from: dateProvider())
         let line = "\(timestamp) \(level.rawValue) [\(category.rawValue)] \(message)\n"
         guard let data = line.data(using: .utf8) else {
             return

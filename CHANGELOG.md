@@ -8,3 +8,4 @@
 - Creates default user configuration and writes driver diagnostics to `~/Library/Logs/MacXeneonEdgeTouchDriver/driver.log`.
 - Honors configured file-log verbosity and covers delayed gesture sequencing in tests.
 - Recovers display mapping automatically after HID or display hotplug events.
+- Writes file diagnostics using the machine's local timezone.
