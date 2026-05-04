@@ -7,7 +7,6 @@ public final class AXFocusRestorer: FocusRestorer {
     private struct CapturedWindow {
         let application: AXUIElement
         let window: AXUIElement
-        let pid: pid_t
     }
 
     private let systemWideElement: AXUIElement
@@ -30,14 +29,7 @@ public final class AXFocusRestorer: FocusRestorer {
             return
         }
 
-        var pid = pid_t()
-        let pidResult = AXUIElementGetPid(application, &pid)
-        guard pidResult == .success else {
-            DriverLoggers.log(.debug, category: .focus, "Could not capture focused application pid before touch gesture: \(pidResult.rawValue).")
-            return
-        }
-
-        capturedWindow = CapturedWindow(application: application, window: window, pid: pid)
+        capturedWindow = CapturedWindow(application: application, window: window)
     }
 
     public func restoreCapturedWindow() {
@@ -58,7 +50,7 @@ public final class AXFocusRestorer: FocusRestorer {
             capturedWindow.window
         )
         let raiseResult = AXUIElementPerformAction(capturedWindow.window, kAXRaiseAction as CFString)
-        let clickResult = clickCapturedWindowTitleBar(capturedWindow)
+        let sessionClickResult = clickCapturedWindowTitleBar(capturedWindow)
         let refocusedWindowResult = AXUIElementSetAttributeValue(
             capturedWindow.application,
             kAXFocusedWindowAttribute as CFString,
@@ -84,7 +76,7 @@ public final class AXFocusRestorer: FocusRestorer {
             DriverLoggers.log(
                 .warning,
                 category: .focus,
-                "Could not verify restore of the previously focused window. focusedWindow=\(focusedWindowResult.rawValue), mainWindow=\(mainWindowResult.rawValue), raise=\(raiseResult.rawValue), click=\(clickResult), refocusedWindow=\(refocusedWindowResult.rawValue), remadeMainWindow=\(remadeMainWindowResult.rawValue), windowMain=\(mainResult.rawValue), windowFocused=\(focusedResult.rawValue)."
+                "Could not verify restore of the previously focused window. focusedWindow=\(focusedWindowResult.rawValue), mainWindow=\(mainWindowResult.rawValue), raise=\(raiseResult.rawValue), sessionClick=\(sessionClickResult), refocusedWindow=\(refocusedWindowResult.rawValue), remadeMainWindow=\(remadeMainWindowResult.rawValue), windowMain=\(mainResult.rawValue), windowFocused=\(focusedResult.rawValue)."
             )
             return
         }
@@ -127,8 +119,8 @@ public final class AXFocusRestorer: FocusRestorer {
         }
 
         let originalPosition = CGEvent(source: nil)?.location
-        postMouseEvent(type: .leftMouseDown, at: clickPoint, to: capturedWindow.pid)
-        postMouseEvent(type: .leftMouseUp, at: clickPoint, to: capturedWindow.pid)
+        postMouseEvent(type: .leftMouseDown, at: clickPoint)
+        postMouseEvent(type: .leftMouseUp, at: clickPoint)
 
         if let originalPosition {
             CGWarpMouseCursorPosition(originalPosition)
@@ -136,7 +128,7 @@ public final class AXFocusRestorer: FocusRestorer {
         return true
     }
 
-    private func postMouseEvent(type: CGEventType, at point: CGPoint, to pid: pid_t) {
+    private func postMouseEvent(type: CGEventType, at point: CGPoint) {
         guard let event = CGEvent(
             mouseEventSource: CGEventSource(stateID: .privateState),
             mouseType: type,
@@ -149,7 +141,7 @@ public final class AXFocusRestorer: FocusRestorer {
 
         event.setIntegerValueField(.mouseEventButtonNumber, value: Int64(CGMouseButton.left.rawValue))
         event.setIntegerValueField(.mouseEventClickState, value: 1)
-        event.postToPid(pid)
+        event.post(tap: .cghidEventTap)
     }
 
     private func titleBarClickPoint(for window: AXUIElement) -> CGPoint? {
