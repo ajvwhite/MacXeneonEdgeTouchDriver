@@ -14,6 +14,7 @@ public final class GestureController {
     private let schedulingQueue: DispatchQueue?
     private let inputSink: SyntheticInputSink
     private let cursorController: CursorController
+    private let focusRestorer: FocusRestorer
     private var pendingMouseDown: DispatchWorkItem?
     private var pendingMouseUp: DispatchWorkItem?
     private var pendingCursorReturn: DispatchWorkItem?
@@ -24,12 +25,14 @@ public final class GestureController {
         mapperProvider: @escaping () -> CoordinateMapper?,
         inputSink: SyntheticInputSink,
         cursorController: CursorController,
+        focusRestorer: FocusRestorer = NoOpFocusRestorer(),
         timing: GestureTiming = .immediate,
         schedulingQueue: DispatchQueue? = nil
     ) {
         self.mapperProvider = mapperProvider
         self.inputSink = inputSink
         self.cursorController = cursorController
+        self.focusRestorer = focusRestorer
         self.timing = timing
         self.schedulingQueue = schedulingQueue
     }
@@ -50,7 +53,9 @@ public final class GestureController {
                 return
             }
 
+            focusRestorer.captureFocusedWindow()
             guard cursorController.borrow(warpingTo: point) else {
+                focusRestorer.discardCapturedWindow()
                 DriverLoggers.log(.warning, category: .gesture, "Dropping touch down because cursor borrow failed.")
                 return
             }
@@ -130,12 +135,14 @@ public final class GestureController {
         switch state {
         case .idle:
             cursorController.forceShow()
+            focusRestorer.discardCapturedWindow()
 
         case .singleTouch(let context):
             if context.isMouseDownPosted {
                 inputSink.postMouseUp(at: context.lastPoint)
             }
             cursorController.returnToOrigin()
+            focusRestorer.restoreCapturedWindow()
             transitionToIdle()
         }
     }
@@ -195,6 +202,7 @@ public final class GestureController {
         }
 
         cursorController.returnToOrigin()
+        focusRestorer.restoreCapturedWindow()
         pendingCursorReturn = nil
         transitionToIdle()
     }

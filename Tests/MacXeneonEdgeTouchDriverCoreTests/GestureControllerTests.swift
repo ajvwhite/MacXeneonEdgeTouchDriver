@@ -96,14 +96,52 @@ final class GestureControllerTests: XCTestCase {
     func testBorrowFailureDropsTouchDown() {
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
+        let focus = RecordingFocusRestorer()
         cursor.shouldBorrow = false
-        let controller = makeController(input: input, cursor: cursor)
+        let controller = makeController(input: input, cursor: cursor, focus: focus)
 
         controller.handle(event(.down, rawX: 0, rawY: 0))
 
         XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200))])
+        XCTAssertEqual(focus.calls, [.captureFocusedWindow, .discardCapturedWindow])
         XCTAssertTrue(input.calls.isEmpty)
         XCTAssertEqual(controller.state, .idle)
+    }
+
+    func testSingleTapCapturesAndRestoresFocusedWindow() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let focus = RecordingFocusRestorer()
+        var cleanupOrder: [String] = []
+        cursor.onCall = { call in
+            if case .returnToOrigin = call {
+                cleanupOrder.append("cursorReturn")
+            }
+        }
+        focus.onCall = { call in
+            if case .restoreCapturedWindow = call {
+                cleanupOrder.append("focusRestore")
+            }
+        }
+        let controller = makeController(input: input, cursor: cursor, focus: focus)
+
+        controller.handle(event(.down, rawX: 0, rawY: 0))
+        controller.handle(event(.up, rawX: 0, rawY: 0))
+
+        XCTAssertEqual(focus.calls, [.captureFocusedWindow, .restoreCapturedWindow])
+        XCTAssertEqual(cleanupOrder, ["cursorReturn", "focusRestore"])
+    }
+
+    func testForceCancelRestoresFocusedWindow() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let focus = RecordingFocusRestorer()
+        let controller = makeController(input: input, cursor: cursor, focus: focus)
+
+        controller.handle(event(.down, rawX: 0, rawY: 0))
+        controller.forceCancel()
+
+        XCTAssertEqual(focus.calls, [.captureFocusedWindow, .restoreCapturedWindow])
     }
 
     func testMoveBeforeDelayedMouseDownCancelsPendingMouseDown() {
@@ -203,6 +241,7 @@ final class GestureControllerTests: XCTestCase {
     private func makeController(
         input: RecordingInputSink,
         cursor: RecordingCursorController,
+        focus: FocusRestorer = NoOpFocusRestorer(),
         timing: GestureTiming = .immediate,
         schedulingQueue: DispatchQueue? = nil
     ) -> GestureController {
@@ -211,6 +250,7 @@ final class GestureControllerTests: XCTestCase {
             mapperProvider: { mapper },
             inputSink: input,
             cursorController: cursor,
+            focusRestorer: focus,
             timing: timing,
             schedulingQueue: schedulingQueue
         )
@@ -224,6 +264,43 @@ final class GestureControllerTests: XCTestCase {
     ) -> TouchEvent {
         let timestamp = timestampNanoseconds.map(DispatchTime.init(uptimeNanoseconds:)) ?? .now()
         return TouchEvent(kind: kind, contactID: 0, rawX: rawX, rawY: rawY, timestamp: timestamp)
+    }
+}
+
+private final class RecordingFocusRestorer: FocusRestorer {
+    enum Call: Equatable {
+        case captureFocusedWindow
+        case restoreCapturedWindow
+        case discardCapturedWindow
+    }
+
+    private let lock = NSLock()
+    private var recordedCalls: [Call] = []
+    var onCall: ((Call) -> Void)?
+
+    var calls: [Call] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedCalls
+    }
+
+    func captureFocusedWindow() {
+        append(.captureFocusedWindow)
+    }
+
+    func restoreCapturedWindow() {
+        append(.restoreCapturedWindow)
+    }
+
+    func discardCapturedWindow() {
+        append(.discardCapturedWindow)
+    }
+
+    private func append(_ call: Call) {
+        lock.lock()
+        recordedCalls.append(call)
+        lock.unlock()
+        onCall?(call)
     }
 }
 
@@ -273,6 +350,7 @@ private final class RecordingCursorController: CursorController {
     private let lock = NSLock()
     private var recordedCalls: [Call] = []
     var shouldBorrow = true
+    var onCall: ((Call) -> Void)?
 
     var calls: [Call] {
         lock.lock()
@@ -301,5 +379,6 @@ private final class RecordingCursorController: CursorController {
         lock.lock()
         recordedCalls.append(call)
         lock.unlock()
+        onCall?(call)
     }
 }

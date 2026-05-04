@@ -8,6 +8,7 @@ public enum DriverLogCategory: String {
     case gesture
     case cursor
     case display
+    case focus
 }
 
 /// Log severity levels emitted by the driver.
@@ -72,6 +73,9 @@ public enum DriverLoggers {
     /// Display discovery and reconfiguration events.
     public static let display = Logger(subsystem: subsystem, category: "display")
 
+    /// Focus capture and restoration events.
+    public static let focus = Logger(subsystem: subsystem, category: "focus")
+
     /// Writes a message to Unified Logging and the configured diagnostics file.
     public static func log(_ level: DriverLogLevel, category: DriverLogCategory, _ message: String) {
         let logger = logger(for: category)
@@ -104,6 +108,8 @@ public enum DriverLoggers {
             return cursor
         case .display:
             return display
+        case .focus:
+            return focus
         }
     }
 }

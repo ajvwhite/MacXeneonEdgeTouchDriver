@@ -9,3 +9,4 @@
 - Honors configured file-log verbosity and covers delayed gesture sequencing in tests.
 - Recovers display mapping automatically after HID or display hotplug events.
 - Writes file diagnostics using the machine's local timezone.
+- Restores focus to the exact previously focused window after touch gestures.

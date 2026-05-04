@@ -12,6 +12,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
     private let gestureQueue = DispatchQueue(label: "\(DriverLoggers.subsystem).gesture-queue")
     private let inputSink: SyntheticInputSink
     private let cursorController: CursorController
+    private let focusRestorer: FocusRestorer
 
     private lazy var gestureController = GestureController(
         mapperProvider: { [mapperStore] in
@@ -19,6 +20,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
         },
         inputSink: inputSink,
         cursorController: cursorController,
+        focusRestorer: focusRestorer,
         timing: GestureTiming(configuration: configuration.timing),
         schedulingQueue: gestureQueue
     )
@@ -48,7 +50,8 @@ public final class MacXeneonEdgeTouchDriverApplication {
             configuration: configuration,
             displayResolver: DisplayResolver(configuration: configuration.display),
             inputSink: CGEventInputSink(),
-            cursorController: CGCursorController()
+            cursorController: CGCursorController(),
+            focusRestorer: AXFocusRestorer()
         )
     }
 
@@ -57,12 +60,14 @@ public final class MacXeneonEdgeTouchDriverApplication {
         configuration: DriverConfiguration,
         displayResolver: DisplayResolver,
         inputSink: SyntheticInputSink,
-        cursorController: CursorController
+        cursorController: CursorController,
+        focusRestorer: FocusRestorer = NoOpFocusRestorer()
     ) {
         self.configuration = configuration
         self.displayResolver = displayResolver
         self.inputSink = inputSink
         self.cursorController = cursorController
+        self.focusRestorer = focusRestorer
     }
 
     deinit {
