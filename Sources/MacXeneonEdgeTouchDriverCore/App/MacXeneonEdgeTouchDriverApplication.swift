@@ -31,6 +31,9 @@ public final class MacXeneonEdgeTouchDriverApplication {
         },
         deviceRemovalHandler: { [weak self] in
             self?.handleDeviceRemoval()
+        },
+        deviceMatchedHandler: { [weak self] in
+            self?.handleDeviceMatched()
         }
     )
 
@@ -119,7 +122,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
     }
 
     fileprivate func handleDisplayReconfiguration() {
-        DispatchQueue.main.async { [weak self] in
+        gestureQueue.async { [weak self] in
             self?.refreshDisplayMapping(reason: "display reconfiguration")
         }
     }
@@ -143,7 +146,11 @@ public final class MacXeneonEdgeTouchDriverApplication {
         }
     }
 
-    private func handleTouchEvent(_ event: TouchEvent) {
+    func handleTouchEvent(_ event: TouchEvent) {
+        if mapperStore.currentMapper == nil {
+            refreshDisplayMapping(reason: "touch event without display mapper")
+        }
+
         gestureController.handle(event)
 
         switch gestureController.state {
@@ -153,6 +160,10 @@ public final class MacXeneonEdgeTouchDriverApplication {
         case .singleTouch:
             scheduleStuckGestureTimer()
         }
+    }
+
+    func handleDeviceMatched() {
+        refreshDisplayMapping(reason: "HID device match")
     }
 
     private func handleDeviceRemoval() {

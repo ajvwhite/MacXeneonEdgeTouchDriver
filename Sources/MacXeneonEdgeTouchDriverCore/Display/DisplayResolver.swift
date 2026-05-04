@@ -56,11 +56,20 @@ public final class DisplayResolver {
     public private(set) var currentMapper: CoordinateMapper?
 
     private let configuration: DriverConfiguration.Display
+    private let activeDisplayProvider: () -> [DisplaySnapshot]
     private var currentDisplayID: CGDirectDisplayID?
 
     /// Creates a display resolver using the effective configuration.
-    public init(configuration: DriverConfiguration.Display = DriverConfiguration.defaults.display) {
+    public convenience init(configuration: DriverConfiguration.Display = DriverConfiguration.defaults.display) {
+        self.init(configuration: configuration, activeDisplayProvider: Self.activeDisplaySnapshots)
+    }
+
+    init(
+        configuration: DriverConfiguration.Display = DriverConfiguration.defaults.display,
+        activeDisplayProvider: @escaping () -> [DisplaySnapshot]
+    ) {
         self.configuration = configuration
+        self.activeDisplayProvider = activeDisplayProvider
     }
 
     /// Re-resolves the Xeneon display from the active display list.
@@ -80,7 +89,7 @@ public final class DisplayResolver {
 
     /// Returns the best current Xeneon display match.
     public func resolve() -> DisplaySnapshot? {
-        resolve(from: activeDisplaySnapshots())
+        resolve(from: activeDisplayProvider())
     }
 
     /// Returns the best Xeneon display match from supplied snapshots.
@@ -105,7 +114,7 @@ public final class DisplayResolver {
         return sizeMatches.first ?? serialMatches.first ?? vendorModelMatches.first
     }
 
-    private func activeDisplaySnapshots() -> [DisplaySnapshot] {
+    private static func activeDisplaySnapshots() -> [DisplaySnapshot] {
         var displayCount: UInt32 = 0
         let countResult = CGGetActiveDisplayList(0, nil, &displayCount)
         guard countResult == .success else {
@@ -123,7 +132,7 @@ public final class DisplayResolver {
         return displayIDs.prefix(Int(displayCount)).map(makeSnapshot)
     }
 
-    private func makeSnapshot(displayID: CGDirectDisplayID) -> DisplaySnapshot {
+    private static func makeSnapshot(displayID: CGDirectDisplayID) -> DisplaySnapshot {
         DisplaySnapshot(
             displayID: displayID,
             vendorNumber: CGDisplayVendorNumber(displayID),

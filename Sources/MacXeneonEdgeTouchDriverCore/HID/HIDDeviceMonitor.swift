@@ -20,6 +20,9 @@ public final class HIDDeviceMonitor {
     /// Receives parsed touch events on the configured event queue.
     public typealias TouchEventHandler = (TouchEvent) -> Void
 
+    /// Receives device match events on the configured event queue.
+    public typealias DeviceMatchedHandler = () -> Void
+
     /// Receives device removal events on the configured event queue.
     public typealias DeviceRemovalHandler = () -> Void
 
@@ -29,6 +32,7 @@ public final class HIDDeviceMonitor {
     private let parser: HIDValueParser
     private let eventQueue: DispatchQueue
     private let touchEventHandler: TouchEventHandler
+    private let deviceMatchedHandler: DeviceMatchedHandler
     private let deviceRemovalHandler: DeviceRemovalHandler
     private let openOptions: IOOptionBits
 
@@ -45,12 +49,14 @@ public final class HIDDeviceMonitor {
         eventQueue: DispatchQueue,
         seizeDevice: Bool = true,
         touchEventHandler: @escaping TouchEventHandler,
-        deviceRemovalHandler: @escaping DeviceRemovalHandler
+        deviceRemovalHandler: @escaping DeviceRemovalHandler,
+        deviceMatchedHandler: @escaping DeviceMatchedHandler = {}
     ) {
         self.manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         self.parser = parser
         self.eventQueue = eventQueue
         self.touchEventHandler = touchEventHandler
+        self.deviceMatchedHandler = deviceMatchedHandler
         self.deviceRemovalHandler = deviceRemovalHandler
         self.openOptions = seizeDevice
             ? IOOptionBits(kIOHIDOptionsTypeSeizeDevice)
@@ -125,6 +131,10 @@ public final class HIDDeviceMonitor {
             category: .hid,
             "Xeneon Edge HID device matched. Manufacturer: \(self.deviceProperty(device, key: kIOHIDManufacturerKey) ?? "Unknown"), product: \(self.deviceProperty(device, key: kIOHIDProductKey) ?? "Unknown"), max input report size: \(registration.length)"
         )
+
+        eventQueue.async { [deviceMatchedHandler] in
+            deviceMatchedHandler()
+        }
     }
 
     fileprivate func handleDeviceRemoved(_ device: IOHIDDevice) {
