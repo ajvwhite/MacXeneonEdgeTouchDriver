@@ -1,12 +1,9 @@
 import CoreGraphics
 import Foundation
 
-/// Handles normalized touch events and emits cursor/input side effects.
+/// Classifies one raw contact as a tap, direct scroll, or hold-and-drag gesture.
 public final class GestureController {
-    /// Current controller state.
     public private(set) var state: GestureState = .idle
-
-    /// Called when all delayed cleanup has completed and the controller is idle.
     public var onBecameIdle: (() -> Void)?
 
     private let mapperProvider: () -> CoordinateMapper?
@@ -15,12 +12,11 @@ public final class GestureController {
     private let inputSink: SyntheticInputSink
     private let cursorController: CursorController
     private let focusRestorer: FocusRestorer
-    private var pendingMouseDown: DispatchWorkItem?
+    private var pendingHold: DispatchWorkItem?
     private var pendingMouseUp: DispatchWorkItem?
     private var pendingCursorReturn: DispatchWorkItem?
     private var lastCompletedTouchTimestamp: DispatchTime?
 
-    /// Creates a single-touch gesture controller.
     public init(
         mapperProvider: @escaping () -> CoordinateMapper?,
         inputSink: SyntheticInputSink,
@@ -37,98 +33,33 @@ public final class GestureController {
         self.schedulingQueue = schedulingQueue
     }
 
-    /// Handles one normalized touch event.
     public func handle(_ event: TouchEvent) {
         guard let mapper = mapperProvider() else {
             DriverLoggers.log(.warning, category: .gesture, "Dropping touch event because no display mapper is available.")
             return
         }
-
         let point = mapper.map(rawX: event.rawX, rawY: event.rawY)
 
         switch (state, event.kind) {
         case (.idle, .down):
-            guard !isDebounced(event.timestamp) else {
-                DriverLoggers.log(.debug, category: .gesture, "Ignoring touch down inside tap debounce window.")
-                return
-            }
-
-            focusRestorer.captureFocusedWindow()
-            guard cursorController.borrow(warpingTo: point) else {
-                focusRestorer.discardCapturedWindow()
-                DriverLoggers.log(.warning, category: .gesture, "Dropping touch down because cursor borrow failed.")
-                return
-            }
-
-            state = .singleTouch(
-                SingleTouchContext(
-                    contactID: event.contactID,
-                    startPoint: point,
-                    lastPoint: point,
-                    lastRawX: event.rawX,
-                    lastRawY: event.rawY,
-                    isMouseDownPosted: false,
-                    hasMoved: false
-                )
-            )
-            scheduleMouseDown(contactID: event.contactID, at: point)
-
+            beginContact(event, at: point)
         case (.singleTouch(let context), .move):
-            guard context.contactID == event.contactID else {
-                DriverLoggers.log(.warning, category: .gesture, "Ignoring move for unexpected contact ID \(event.contactID).")
-                return
-            }
-
-            ensureMouseDownPosted()
-            guard case .singleTouch(var currentContext) = state else {
-                return
-            }
-
-            cursorController.updatePosition(point)
-            inputSink.postMouseDragged(to: point)
-            currentContext.lastPoint = point
-            currentContext.lastRawX = event.rawX
-            currentContext.lastRawY = event.rawY
-            currentContext.hasMoved = true
-            state = .singleTouch(currentContext)
-
+            guard context.contactID == event.contactID else { return }
+            handleMove(event, at: point, context: context)
         case (.singleTouch(let context), .up):
-            guard context.contactID == event.contactID else {
-                DriverLoggers.log(.warning, category: .gesture, "Ignoring up for unexpected contact ID \(event.contactID).")
-                return
-            }
-
-            ensureMouseDownPosted()
-            guard case .singleTouch(var currentContext) = state else {
-                return
-            }
-
-            currentContext.lastPoint = point
-            currentContext.lastRawX = event.rawX
-            currentContext.lastRawY = event.rawY
-            state = .singleTouch(currentContext)
-            lastCompletedTouchTimestamp = event.timestamp
-
-            if currentContext.hasMoved {
-                postMouseUpAndScheduleReturn(contactID: currentContext.contactID, at: point)
-            } else {
-                scheduleMouseUpThenReturn(contactID: currentContext.contactID, at: point)
-            }
-
+            guard context.contactID == event.contactID else { return }
+            finishContact(event, at: point, context: context)
         case (.idle, .move), (.idle, .up):
             DriverLoggers.log(.debug, category: .gesture, "Ignoring touch event while idle.")
-
         case (.singleTouch, .down):
-            DriverLoggers.log(.warning, category: .gesture, "Received touch down while already tracking a single touch.")
+            DriverLoggers.log(.warning, category: .gesture, "Received touch down while already tracking a contact.")
         }
     }
 
-    /// Handles a stuck gesture timeout by cleaning up any active mouse-down state.
     public func handleIdleTimeout() {
         forceCancel()
     }
 
-    /// Forces the controller back to idle, posting cleanup events if needed.
     public func forceCancel() {
         cancelPendingWork()
 
@@ -136,10 +67,14 @@ public final class GestureController {
         case .idle:
             cursorController.forceShow()
             focusRestorer.discardCapturedWindow()
-
         case .singleTouch(let context):
-            if context.isMouseDownPosted {
+            switch context.phase {
+            case .scrolling:
+                inputSink.postScroll(deltaX: 0, deltaY: 0, phase: .ended)
+            case .dragging, .finishingTap:
                 inputSink.postMouseUp(at: context.lastPoint)
+            case .pending:
+                break
             }
             cursorController.returnToOrigin()
             focusRestorer.restoreCapturedWindow()
@@ -147,64 +82,130 @@ public final class GestureController {
         }
     }
 
-    private func scheduleMouseDown(contactID: Int, at point: CGPoint) {
-        pendingMouseDown = schedule(after: timing.warpToClickDelayMs) { [weak self] in
-            self?.postMouseDownIfNeeded(contactID: contactID, at: point)
+    private func beginContact(_ event: TouchEvent, at point: CGPoint) {
+        guard !isDebounced(event.timestamp) else { return }
+        focusRestorer.captureFocusedWindow()
+        guard cursorController.borrow(warpingTo: point) else {
+            focusRestorer.discardCapturedWindow()
+            return
+        }
+
+        state = .singleTouch(SingleTouchContext(
+            contactID: event.contactID,
+            startPoint: point,
+            lastPoint: point,
+            lastRawX: event.rawX,
+            lastRawY: event.rawY,
+            phase: .pending
+        ))
+        scheduleHoldToDrag(contactID: event.contactID)
+    }
+
+    private func handleMove(_ event: TouchEvent, at point: CGPoint, context: SingleTouchContext) {
+        var updated = context
+        let deltaX = point.x - context.lastPoint.x
+        let deltaY = point.y - context.lastPoint.y
+        updated.lastPoint = point
+        updated.lastRawX = event.rawX
+        updated.lastRawY = event.rawY
+
+        switch context.phase {
+        case .pending:
+            let distance = hypot(point.x - context.startPoint.x, point.y - context.startPoint.y)
+            guard distance >= timing.movementThresholdPoints else {
+                state = .singleTouch(updated)
+                return
+            }
+            pendingHold?.cancel()
+            pendingHold = nil
+            updated.phase = .scrolling
+            state = .singleTouch(updated)
+            inputSink.postScroll(
+                deltaX: (point.x - context.startPoint.x) * timing.scrollSensitivity,
+                deltaY: (point.y - context.startPoint.y) * timing.scrollSensitivity,
+                phase: .began
+            )
+        case .scrolling:
+            state = .singleTouch(updated)
+            inputSink.postScroll(
+                deltaX: deltaX * timing.scrollSensitivity,
+                deltaY: deltaY * timing.scrollSensitivity,
+                phase: .changed
+            )
+        case .dragging:
+            state = .singleTouch(updated)
+            cursorController.updatePosition(point)
+            inputSink.postMouseDragged(to: point)
+        case .finishingTap:
+            break
         }
     }
 
-    private func ensureMouseDownPosted() {
-        pendingMouseDown?.cancel()
-        pendingMouseDown = nil
+    private func finishContact(_ event: TouchEvent, at point: CGPoint, context: SingleTouchContext) {
+        pendingHold?.cancel()
+        pendingHold = nil
+        lastCompletedTouchTimestamp = event.timestamp
 
-        guard case .singleTouch(let context) = state else {
-            return
+        var updated = context
+        updated.lastPoint = point
+        updated.lastRawX = event.rawX
+        updated.lastRawY = event.rawY
+
+        switch context.phase {
+        case .pending:
+            updated.phase = .finishingTap
+            updated.lastPoint = context.startPoint
+            state = .singleTouch(updated)
+            inputSink.postMouseDown(at: context.startPoint)
+            scheduleMouseUpThenReturn(contactID: context.contactID, at: context.startPoint)
+        case .scrolling:
+            state = .singleTouch(updated)
+            inputSink.postScroll(deltaX: 0, deltaY: 0, phase: .ended)
+            scheduleCursorReturn(contactID: context.contactID)
+        case .dragging:
+            state = .singleTouch(updated)
+            inputSink.postMouseUp(at: point)
+            scheduleCursorReturn(contactID: context.contactID)
+        case .finishingTap:
+            break
         }
-
-        postMouseDownIfNeeded(contactID: context.contactID, at: context.startPoint)
     }
 
-    private func postMouseDownIfNeeded(contactID: Int, at point: CGPoint) {
-        guard case .singleTouch(var context) = state, context.contactID == contactID else {
-            return
+    private func scheduleHoldToDrag(contactID: Int) {
+        pendingHold = schedule(after: timing.holdToDragMs) { [weak self] in
+            guard let self,
+                  case .singleTouch(var context) = self.state,
+                  context.contactID == contactID,
+                  context.phase == .pending else { return }
+            context.phase = .dragging
+            self.state = .singleTouch(context)
+            self.inputSink.postMouseDown(at: context.startPoint)
+            self.pendingHold = nil
         }
-        guard !context.isMouseDownPosted else {
-            return
-        }
-
-        inputSink.postMouseDown(at: point)
-        context.isMouseDownPosted = true
-        state = .singleTouch(context)
-        pendingMouseDown = nil
     }
 
     private func scheduleMouseUpThenReturn(contactID: Int, at point: CGPoint) {
         pendingMouseUp = schedule(after: timing.downToUpDelayMs) { [weak self] in
-            self?.postMouseUpAndScheduleReturn(contactID: contactID, at: point)
+            guard let self,
+                  case .singleTouch(let context) = self.state,
+                  context.contactID == contactID,
+                  context.phase == .finishingTap else { return }
+            self.inputSink.postMouseUp(at: point)
+            self.pendingMouseUp = nil
+            self.scheduleCursorReturn(contactID: contactID)
         }
     }
 
-    private func postMouseUpAndScheduleReturn(contactID: Int, at point: CGPoint) {
-        guard case .singleTouch(let context) = state, context.contactID == contactID else {
-            return
-        }
-
-        inputSink.postMouseUp(at: point)
-        pendingMouseUp = nil
+    private func scheduleCursorReturn(contactID: Int) {
         pendingCursorReturn = schedule(after: timing.clickToWarpBackDelayMs) { [weak self] in
-            self?.returnCursorAndIdle(contactID: contactID)
+            guard let self,
+                  case .singleTouch(let context) = self.state,
+                  context.contactID == contactID else { return }
+            self.cursorController.returnToOrigin()
+            self.focusRestorer.restoreCapturedWindow()
+            self.pendingCursorReturn = nil
+            self.transitionToIdle()
         }
-    }
-
-    private func returnCursorAndIdle(contactID: Int) {
-        guard case .singleTouch(let context) = state, context.contactID == contactID else {
-            return
-        }
-
-        cursorController.returnToOrigin()
-        focusRestorer.restoreCapturedWindow()
-        pendingCursorReturn = nil
-        transitionToIdle()
     }
 
     private func transitionToIdle() {
@@ -213,31 +214,30 @@ public final class GestureController {
     }
 
     private func cancelPendingWork() {
-        pendingMouseDown?.cancel()
+        pendingHold?.cancel()
         pendingMouseUp?.cancel()
         pendingCursorReturn?.cancel()
-        pendingMouseDown = nil
+        pendingHold = nil
         pendingMouseUp = nil
         pendingCursorReturn = nil
     }
 
+    @discardableResult
     private func schedule(after milliseconds: Int, action: @escaping () -> Void) -> DispatchWorkItem {
         let workItem = DispatchWorkItem(block: action)
-
-        guard milliseconds > 0, let schedulingQueue else {
+        guard milliseconds > 0 else {
             workItem.perform()
             return workItem
         }
-
-        schedulingQueue.asyncAfter(deadline: .now() + .milliseconds(milliseconds), execute: workItem)
+        (schedulingQueue ?? .main).asyncAfter(
+            deadline: .now() + .milliseconds(milliseconds),
+            execute: workItem
+        )
         return workItem
     }
 
     private func isDebounced(_ timestamp: DispatchTime) -> Bool {
-        guard timing.tapDebounceMs > 0, let lastCompletedTouchTimestamp else {
-            return false
-        }
-
+        guard timing.tapDebounceMs > 0, let lastCompletedTouchTimestamp else { return false }
         let debounceNanoseconds = UInt64(timing.tapDebounceMs) * 1_000_000
         return timestamp.uptimeNanoseconds >= lastCompletedTouchTimestamp.uptimeNanoseconds &&
             timestamp.uptimeNanoseconds - lastCompletedTouchTimestamp.uptimeNanoseconds < debounceNanoseconds

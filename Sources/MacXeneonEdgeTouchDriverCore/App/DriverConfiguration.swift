@@ -38,7 +38,10 @@ public struct DriverConfiguration: Codable, Equatable {
             multiTouchEnabled: XeneonEdgeDevice.supportsMultiTouch,
             pinchHysteresisPx: 5,
             minPinchForMagnify: 10,
-            pinchModifies: .contentZoom
+            pinchModifies: .contentZoom,
+            holdToDragMs: 300,
+            movementThresholdPoints: 8,
+            scrollSensitivity: 1
         ),
         diagnostics: Diagnostics(
             fileLogPath: defaultLogURL().path,
@@ -152,6 +155,15 @@ public struct DriverConfiguration: Codable, Equatable {
             if let value = gesture.pinchModifies {
                 configuration.gesture.pinchModifies = value
             }
+            if let value = gesture.holdToDragMs {
+                configuration.gesture.holdToDragMs = clamp(value, to: 100...2_000, name: "gesture.holdToDragMs", warnings: &warnings)
+            }
+            if let value = gesture.movementThresholdPoints {
+                configuration.gesture.movementThresholdPoints = clamp(value, to: 1...100, name: "gesture.movementThresholdPoints", warnings: &warnings)
+            }
+            if let value = gesture.scrollSensitivity {
+                configuration.gesture.scrollSensitivity = clamp(value, to: 0.1...10, name: "gesture.scrollSensitivity", warnings: &warnings)
+            }
         }
 
         if let diagnostics = partial.diagnostics {
@@ -167,6 +179,14 @@ public struct DriverConfiguration: Codable, Equatable {
     }
 
     private static func clamp(_ value: Int, to range: ClosedRange<Int>, name: String, warnings: inout [String]) -> Int {
+        let clamped = min(max(value, range.lowerBound), range.upperBound)
+        if clamped != value {
+            warnings.append("\(name) was out of range and was clamped to \(clamped).")
+        }
+        return clamped
+    }
+
+    private static func clamp(_ value: Double, to range: ClosedRange<Double>, name: String, warnings: inout [String]) -> Double {
         let clamped = min(max(value, range.lowerBound), range.upperBound)
         if clamped != value {
             warnings.append("\(name) was out of range and was clamped to \(clamped).")
@@ -200,6 +220,9 @@ public extension DriverConfiguration {
         public var pinchHysteresisPx: Int
         public var minPinchForMagnify: Int
         public var pinchModifies: PinchMode
+        public var holdToDragMs: Int
+        public var movementThresholdPoints: Int
+        public var scrollSensitivity: Double
     }
 
     /// Diagnostic file logging configuration.
@@ -253,6 +276,9 @@ private struct PartialGesture: Decodable {
     var pinchHysteresisPx: Int?
     var minPinchForMagnify: Int?
     var pinchModifies: DriverConfiguration.PinchMode?
+    var holdToDragMs: Int?
+    var movementThresholdPoints: Int?
+    var scrollSensitivity: Double?
 }
 
 private struct PartialDiagnostics: Decodable {

@@ -55,7 +55,10 @@ if [ ! -f "$config_path" ]; then
     "expectedHeight": 720
   },
   "gesture": {
-    "multiTouchEnabled": false
+    "multiTouchEnabled": false,
+    "holdToDragMs": 300,
+    "movementThresholdPoints": 8,
+    "scrollSensitivity": 1.0
   },
   "diagnostics": {
     "fileLogPath": "${driver_log_path}",
@@ -73,7 +76,15 @@ sed \
   "$plist_template" > "$plist_path"
 
 launchctl bootout "gui/${uid}/${label}" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/${uid}" "$plist_path"
+attempt=1
+while ! launchctl bootstrap "gui/${uid}" "$plist_path"; do
+  if [ "$attempt" -ge 5 ]; then
+    echo "Could not bootstrap ${label} after ${attempt} attempts." >&2
+    exit 1
+  fi
+  attempt=$((attempt + 1))
+  sleep 1
+done
 launchctl enable "gui/${uid}/${label}" >/dev/null 2>&1 || true
 launchctl kickstart -k "gui/${uid}/${label}" >/dev/null 2>&1 || true
 

@@ -6,6 +6,9 @@ public struct DisplaySnapshot: Equatable {
     /// CoreGraphics display identifier.
     public let displayID: CGDirectDisplayID
 
+    /// Stable CoreGraphics display UUID used for persisted touch pairing.
+    public let uuid: String
+
     /// EDID vendor number.
     public let vendorNumber: UInt32
 
@@ -27,6 +30,7 @@ public struct DisplaySnapshot: Equatable {
     /// Creates a display snapshot for matching or tests.
     public init(
         displayID: CGDirectDisplayID,
+        uuid: String = "",
         vendorNumber: UInt32,
         modelNumber: UInt32,
         serialNumber: UInt32,
@@ -35,6 +39,7 @@ public struct DisplaySnapshot: Equatable {
         pixelsHigh: Int
     ) {
         self.displayID = displayID
+        self.uuid = uuid.isEmpty ? "display-\(displayID)" : uuid
         self.vendorNumber = vendorNumber
         self.modelNumber = modelNumber
         self.serialNumber = serialNumber
@@ -94,6 +99,17 @@ public final class DisplayResolver {
 
     /// Returns the best Xeneon display match from supplied snapshots.
     public func resolve(from displays: [DisplaySnapshot]) -> DisplaySnapshot? {
+        let matches = matchingDisplays(from: displays)
+        return matches.first
+    }
+
+    /// Returns all compatible displays in a stable visual order for pairing.
+    public func matchingDisplays() -> [DisplaySnapshot] {
+        matchingDisplays(from: activeDisplayProvider())
+    }
+
+    /// Returns all compatible displays from supplied snapshots.
+    public func matchingDisplays(from displays: [DisplaySnapshot]) -> [DisplaySnapshot] {
         let vendorModelMatches = displays.filter { display in
             display.vendorNumber == configuration.vendorNumber &&
             display.modelNumber == configuration.modelNumber
@@ -111,10 +127,20 @@ public final class DisplayResolver {
             display.pixelsHigh == configuration.expectedHeight
         }
 
-        return sizeMatches.first ?? serialMatches.first ?? vendorModelMatches.first
+        let matches = sizeMatches.isEmpty
+            ? (serialMatches.isEmpty ? vendorModelMatches : serialMatches)
+            : sizeMatches
+
+        return matches.sorted { lhs, rhs in
+            if lhs.bounds.origin.x != rhs.bounds.origin.x {
+                return lhs.bounds.origin.x < rhs.bounds.origin.x
+            }
+            return lhs.bounds.origin.y < rhs.bounds.origin.y
+        }
     }
 
-    private static func activeDisplaySnapshots() -> [DisplaySnapshot] {
+    /// Returns live snapshots for every active CoreGraphics display.
+    public static func activeDisplaySnapshots() -> [DisplaySnapshot] {
         var displayCount: UInt32 = 0
         let countResult = CGGetActiveDisplayList(0, nil, &displayCount)
         guard countResult == .success else {
@@ -135,6 +161,7 @@ public final class DisplayResolver {
     private static func makeSnapshot(displayID: CGDirectDisplayID) -> DisplaySnapshot {
         DisplaySnapshot(
             displayID: displayID,
+            uuid: displayUUID(displayID: displayID),
             vendorNumber: CGDisplayVendorNumber(displayID),
             modelNumber: CGDisplayModelNumber(displayID),
             serialNumber: CGDisplaySerialNumber(displayID),
@@ -143,4 +170,17 @@ public final class DisplayResolver {
             pixelsHigh: CGDisplayPixelsHigh(displayID)
         )
     }
+
+    private static func displayUUID(displayID: CGDirectDisplayID) -> String {
+        guard let unmanagedUUID = createDisplayUUID(displayID) else {
+            return "display-\(displayID)"
+        }
+        let uuid = unmanagedUUID.takeRetainedValue()
+        return CFUUIDCreateString(kCFAllocatorDefault, uuid) as String
+    }
 }
+
+// CoreGraphics exports this stable display identity function, but recent Swift SDKs no
+// longer surface its declaration. Keep the bridge local and degrade to display ID above.
+@_silgen_name("CGDisplayCreateUUIDFromDisplayID")
+private func createDisplayUUID(_ displayID: CGDirectDisplayID) -> Unmanaged<CFUUID>?

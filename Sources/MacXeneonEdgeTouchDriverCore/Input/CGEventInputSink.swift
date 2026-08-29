@@ -27,6 +27,24 @@ public final class CGEventInputSink: SyntheticInputSink {
         postMouseEvent(type: .leftMouseDragged, at: point)
     }
 
+    public func postScroll(deltaX: CGFloat, deltaY: CGFloat, phase: SyntheticScrollPhase) {
+        guard let event = CGEvent(
+            scrollWheelEvent2Source: eventSource,
+            units: .pixel,
+            wheelCount: 2,
+            wheel1: Int32(deltaY.rounded()),
+            wheel2: Int32(deltaX.rounded()),
+            wheel3: 0
+        ) else {
+            DriverLoggers.log(.error, category: .gesture, "Failed to create CoreGraphics pixel-scroll event.")
+            return
+        }
+
+        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase.rawValue)
+        event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        event.post(tap: eventTap)
+    }
+
     private func postMouseEvent(type: CGEventType, at point: CGPoint) {
         guard let event = CGEvent(
             mouseEventSource: eventSource,
