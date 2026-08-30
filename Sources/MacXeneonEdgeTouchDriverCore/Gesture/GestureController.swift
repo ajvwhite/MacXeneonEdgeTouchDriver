@@ -3,6 +3,11 @@ import Foundation
 
 /// Classifies one raw contact as a tap, direct scroll, or hold-and-drag gesture.
 public final class GestureController {
+    private struct EligibleTap {
+        let point: CGPoint
+        let timestamp: DispatchTime
+    }
+
     public private(set) var state: GestureState = .idle
     public var onBecameIdle: (() -> Void)?
 
@@ -12,10 +17,12 @@ public final class GestureController {
     private let inputSink: SyntheticInputSink
     private let cursorController: CursorController
     private let focusRestorer: FocusRestorer
+    private let doubleClickIntervalProvider: () -> TimeInterval
     private var pendingHold: DispatchWorkItem?
     private var pendingMouseUp: DispatchWorkItem?
     private var pendingCursorReturn: DispatchWorkItem?
     private var lastCompletedTouchTimestamp: DispatchTime?
+    private var eligibleFirstTap: EligibleTap?
 
     public init(
         mapperProvider: @escaping () -> CoordinateMapper?,
@@ -23,6 +30,7 @@ public final class GestureController {
         cursorController: CursorController,
         focusRestorer: FocusRestorer = NoOpFocusRestorer(),
         timing: GestureTiming = .immediate,
+        doubleClickIntervalProvider: @escaping () -> TimeInterval = { 0.5 },
         schedulingQueue: DispatchQueue? = nil
     ) {
         self.mapperProvider = mapperProvider
@@ -30,6 +38,7 @@ public final class GestureController {
         self.cursorController = cursorController
         self.focusRestorer = focusRestorer
         self.timing = timing
+        self.doubleClickIntervalProvider = doubleClickIntervalProvider
         self.schedulingQueue = schedulingQueue
     }
 
@@ -62,6 +71,7 @@ public final class GestureController {
 
     public func forceCancel() {
         cancelPendingWork()
+        resetDoubleClickSequence()
 
         switch state {
         case .idle:
@@ -72,7 +82,7 @@ public final class GestureController {
             case .scrolling:
                 inputSink.postScroll(deltaX: 0, deltaY: 0, phase: .ended)
             case .dragging, .finishingTap:
-                inputSink.postMouseUp(at: context.lastPoint)
+                inputSink.postMouseUp(at: context.lastPoint, clickCount: context.clickCount)
             case .pending:
                 break
             }
@@ -96,7 +106,8 @@ public final class GestureController {
             lastPoint: point,
             lastRawX: event.rawX,
             lastRawY: event.rawY,
-            phase: .pending
+            phase: .pending,
+            clickCount: 1
         ))
         scheduleHoldToDrag(contactID: event.contactID)
     }
@@ -118,6 +129,7 @@ public final class GestureController {
             }
             pendingHold?.cancel()
             pendingHold = nil
+            resetDoubleClickSequence()
             updated.phase = .scrolling
             state = .singleTouch(updated)
             inputSink.postScroll(
@@ -153,18 +165,26 @@ public final class GestureController {
 
         switch context.phase {
         case .pending:
+            let clickCount = clickCountForTap(at: context.startPoint, timestamp: event.timestamp)
             updated.phase = .finishingTap
             updated.lastPoint = context.startPoint
+            updated.clickCount = clickCount
             state = .singleTouch(updated)
-            inputSink.postMouseDown(at: context.startPoint)
-            scheduleMouseUpThenReturn(contactID: context.contactID, at: context.startPoint)
+            inputSink.postMouseDown(at: context.startPoint, clickCount: clickCount)
+            scheduleMouseUpThenReturn(
+                contactID: context.contactID,
+                at: context.startPoint,
+                clickCount: clickCount
+            )
         case .scrolling:
+            resetDoubleClickSequence()
             state = .singleTouch(updated)
             inputSink.postScroll(deltaX: 0, deltaY: 0, phase: .ended)
             scheduleCursorReturn(contactID: context.contactID)
         case .dragging:
+            resetDoubleClickSequence()
             state = .singleTouch(updated)
-            inputSink.postMouseUp(at: point)
+            inputSink.postMouseUp(at: point, clickCount: 1)
             scheduleCursorReturn(contactID: context.contactID)
         case .finishingTap:
             break
@@ -178,19 +198,21 @@ public final class GestureController {
                   context.contactID == contactID,
                   context.phase == .pending else { return }
             context.phase = .dragging
+            context.clickCount = 1
             self.state = .singleTouch(context)
-            self.inputSink.postMouseDown(at: context.startPoint)
+            self.resetDoubleClickSequence()
+            self.inputSink.postMouseDown(at: context.startPoint, clickCount: 1)
             self.pendingHold = nil
         }
     }
 
-    private func scheduleMouseUpThenReturn(contactID: Int, at point: CGPoint) {
+    private func scheduleMouseUpThenReturn(contactID: Int, at point: CGPoint, clickCount: Int) {
         pendingMouseUp = schedule(after: timing.downToUpDelayMs) { [weak self] in
             guard let self,
                   case .singleTouch(let context) = self.state,
                   context.contactID == contactID,
                   context.phase == .finishingTap else { return }
-            self.inputSink.postMouseUp(at: point)
+            self.inputSink.postMouseUp(at: point, clickCount: clickCount)
             self.pendingMouseUp = nil
             self.scheduleCursorReturn(contactID: contactID)
         }
@@ -241,5 +263,32 @@ public final class GestureController {
         let debounceNanoseconds = UInt64(timing.tapDebounceMs) * 1_000_000
         return timestamp.uptimeNanoseconds >= lastCompletedTouchTimestamp.uptimeNanoseconds &&
             timestamp.uptimeNanoseconds - lastCompletedTouchTimestamp.uptimeNanoseconds < debounceNanoseconds
+    }
+
+    private func clickCountForTap(at point: CGPoint, timestamp: DispatchTime) -> Int {
+        guard let firstTap = eligibleFirstTap else {
+            eligibleFirstTap = EligibleTap(point: point, timestamp: timestamp)
+            return 1
+        }
+
+        let interval = max(0, doubleClickIntervalProvider())
+        let maximumNanoseconds = UInt64(interval * 1_000_000_000)
+        let timestampIsOrdered = timestamp.uptimeNanoseconds >= firstTap.timestamp.uptimeNanoseconds
+        let elapsed = timestampIsOrdered
+            ? timestamp.uptimeNanoseconds - firstTap.timestamp.uptimeNanoseconds
+            : UInt64.max
+        let distance = hypot(point.x - firstTap.point.x, point.y - firstTap.point.y)
+
+        if elapsed <= maximumNanoseconds, distance <= timing.doubleClickDistancePoints {
+            eligibleFirstTap = nil
+            return 2
+        }
+
+        eligibleFirstTap = EligibleTap(point: point, timestamp: timestamp)
+        return 1
+    }
+
+    private func resetDoubleClickSequence() {
+        eligibleFirstTap = nil
     }
 }

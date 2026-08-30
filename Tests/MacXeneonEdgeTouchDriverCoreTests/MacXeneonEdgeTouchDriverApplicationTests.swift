@@ -144,8 +144,8 @@ private final class ApplicationRecordingInputSink: SyntheticInputSink {
     }
 
     private(set) var calls: [Call] = []
-    func postMouseDown(at point: CGPoint) { calls.append(.mouseDown(point)) }
-    func postMouseUp(at point: CGPoint) { calls.append(.mouseUp(point)) }
+    func postMouseDown(at point: CGPoint, clickCount: Int) { calls.append(.mouseDown(point)) }
+    func postMouseUp(at point: CGPoint, clickCount: Int) { calls.append(.mouseUp(point)) }
     func postMouseDragged(to point: CGPoint) { calls.append(.mouseDragged(point)) }
     func postScroll(deltaX: CGFloat, deltaY: CGFloat, phase: SyntheticScrollPhase) {
         calls.append(.scroll(deltaX, deltaY, phase))

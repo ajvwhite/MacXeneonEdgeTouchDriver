@@ -193,6 +193,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
             cursorController: cursorController,
             focusRestorer: focusRestorer,
             timing: GestureTiming(configuration: configuration.timing, gesture: configuration.gesture),
+            doubleClickIntervalProvider: { NSEvent.doubleClickInterval },
             schedulingQueue: gestureQueue
         )
         gesture.onBecameIdle = { [weak self] in

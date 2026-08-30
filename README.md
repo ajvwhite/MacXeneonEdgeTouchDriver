@@ -86,7 +86,8 @@ All fields are optional. Missing or malformed config falls back to defaults and 
     "multiTouchEnabled": false,
     "holdToDragMs": 300,
     "movementThresholdPoints": 8,
-    "scrollSensitivity": 1.0
+    "scrollSensitivity": 1.0,
+    "doubleClickDistancePoints": 12
   },
   "diagnostics": {
     "fileLogPath": "/Users/ajvwhite/Library/Logs/MacXeneonEdgeTouchDriver/driver.log",
@@ -110,6 +111,7 @@ Repeat for each overlay. Pairings survive driver and Mac restarts. Display bound
 Gesture behavior:
 
 - Tap and release: click.
+- Tap twice nearby within the macOS double-click interval: double-click.
 - Move immediately: pixel-precise scroll.
 - Hold still for `holdToDragMs`, then move: mouse drag.
 

@@ -99,7 +99,8 @@ final class ConfigurationTests: XCTestCase {
           "gesture": {
             "holdToDragMs": 450,
             "movementThresholdPoints": 12,
-            "scrollSensitivity": 1.5
+            "scrollSensitivity": 1.5,
+            "doubleClickDistancePoints": 16
           }
         }
         """)
@@ -109,6 +110,7 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(result.configuration.gesture.holdToDragMs, 450)
         XCTAssertEqual(result.configuration.gesture.movementThresholdPoints, 12)
         XCTAssertEqual(result.configuration.gesture.scrollSensitivity, 1.5)
+        XCTAssertEqual(result.configuration.gesture.doubleClickDistancePoints, 16)
         XCTAssertTrue(result.warnings.isEmpty)
     }
 

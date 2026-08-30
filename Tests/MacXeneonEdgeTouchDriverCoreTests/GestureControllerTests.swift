@@ -108,6 +108,71 @@ final class GestureControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .idle)
     }
 
+    func testNearbySecondTapWithinSystemIntervalPostsDoubleClick() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            doubleClickIntervalProvider: { 0.5 }
+        )
+
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_000_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_050_000_000))
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_200_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_250_000_000))
+
+        XCTAssertEqual(input.mouseClickCounts, [1, 1, 2, 2])
+    }
+
+    func testThirdTapStartsNewClickSequence() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(input: input, cursor: cursor)
+
+        for timestamp in [1_000_000_000, 1_200_000_000, 1_400_000_000] as [UInt64] {
+            controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: timestamp))
+            controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: timestamp + 50_000_000))
+        }
+
+        XCTAssertEqual(input.mouseClickCounts, [1, 1, 2, 2, 1, 1])
+    }
+
+    func testLateOrDistantSecondTapRemainsSingleClick() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            doubleClickIntervalProvider: { 0.5 }
+        )
+
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_000_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_050_000_000))
+        controller.handle(event(.down, rawX: 100, rawY: 0, timestampNanoseconds: 1_200_000_000))
+        controller.handle(event(.up, rawX: 100, rawY: 0, timestampNanoseconds: 1_250_000_000))
+        controller.handle(event(.down, rawX: 100, rawY: 0, timestampNanoseconds: 2_000_000_000))
+        controller.handle(event(.up, rawX: 100, rawY: 0, timestampNanoseconds: 2_050_000_000))
+
+        XCTAssertEqual(input.mouseClickCounts, [1, 1, 1, 1, 1, 1])
+    }
+
+    func testScrollResetsDoubleClickSequence() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(input: input, cursor: cursor)
+
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_000_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_050_000_000))
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_100_000_000))
+        controller.handle(event(.move, rawX: 1_000, rawY: 0, timestampNanoseconds: 1_150_000_000))
+        controller.handle(event(.up, rawX: 1_000, rawY: 0, timestampNanoseconds: 1_200_000_000))
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_250_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_300_000_000))
+
+        XCTAssertEqual(input.mouseClickCounts, [1, 1, 1, 1])
+    }
+
     func testBorrowFailureDropsTouchDown() {
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
@@ -290,6 +355,7 @@ final class GestureControllerTests: XCTestCase {
         cursor: RecordingCursorController,
         focus: FocusRestorer = NoOpFocusRestorer(),
         timing: GestureTiming = .immediate,
+        doubleClickIntervalProvider: @escaping () -> TimeInterval = { 0.5 },
         schedulingQueue: DispatchQueue? = nil
     ) -> GestureController {
         let mapper = CoordinateMapper(displayBounds: CGRect(x: 100, y: 200, width: 2_560, height: 720))
@@ -299,6 +365,7 @@ final class GestureControllerTests: XCTestCase {
             cursorController: cursor,
             focusRestorer: focus,
             timing: timing,
+            doubleClickIntervalProvider: doubleClickIntervalProvider,
             schedulingQueue: schedulingQueue
         )
     }
@@ -361,6 +428,7 @@ private final class RecordingInputSink: SyntheticInputSink {
 
     private let lock = NSLock()
     private var recordedCalls: [Call] = []
+    private var recordedMouseClickCounts: [Int] = []
 
     var calls: [Call] {
         lock.lock()
@@ -368,12 +436,18 @@ private final class RecordingInputSink: SyntheticInputSink {
         return recordedCalls
     }
 
-    func postMouseDown(at point: CGPoint) {
-        append(.mouseDown(point))
+    var mouseClickCounts: [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedMouseClickCounts
     }
 
-    func postMouseUp(at point: CGPoint) {
-        append(.mouseUp(point))
+    func postMouseDown(at point: CGPoint, clickCount: Int) {
+        append(.mouseDown(point), clickCount: clickCount)
+    }
+
+    func postMouseUp(at point: CGPoint, clickCount: Int) {
+        append(.mouseUp(point), clickCount: clickCount)
     }
 
     func postMouseDragged(to point: CGPoint) {
@@ -384,9 +458,12 @@ private final class RecordingInputSink: SyntheticInputSink {
         append(.scroll(deltaX: deltaX, deltaY: deltaY, phase: phase))
     }
 
-    private func append(_ call: Call) {
+    private func append(_ call: Call, clickCount: Int? = nil) {
         lock.lock()
         recordedCalls.append(call)
+        if let clickCount {
+            recordedMouseClickCounts.append(clickCount)
+        }
         lock.unlock()
     }
 }

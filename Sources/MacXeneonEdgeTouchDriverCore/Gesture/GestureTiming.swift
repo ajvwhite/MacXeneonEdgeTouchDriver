@@ -23,6 +23,9 @@ public struct GestureTiming: Equatable {
     /// Multiplier applied to pixel-scroll deltas.
     public let scrollSensitivity: CGFloat
 
+    /// Maximum mapped distance between two taps that may form a double-click.
+    public let doubleClickDistancePoints: CGFloat
+
     /// Creates gesture timing values in milliseconds.
     public init(
         warpToClickDelayMs: Int,
@@ -31,7 +34,8 @@ public struct GestureTiming: Equatable {
         tapDebounceMs: Int,
         holdToDragMs: Int = 300,
         movementThresholdPoints: CGFloat = 8,
-        scrollSensitivity: CGFloat = 1
+        scrollSensitivity: CGFloat = 1,
+        doubleClickDistancePoints: CGFloat = 12
     ) {
         self.warpToClickDelayMs = max(0, warpToClickDelayMs)
         self.downToUpDelayMs = max(0, downToUpDelayMs)
@@ -40,6 +44,7 @@ public struct GestureTiming: Equatable {
         self.holdToDragMs = max(0, holdToDragMs)
         self.movementThresholdPoints = max(1, movementThresholdPoints)
         self.scrollSensitivity = max(0.1, scrollSensitivity)
+        self.doubleClickDistancePoints = max(1, doubleClickDistancePoints)
     }
 
     /// Creates gesture timing from loaded driver configuration.
@@ -51,7 +56,8 @@ public struct GestureTiming: Equatable {
             tapDebounceMs: configuration.tapDebounceMs,
             holdToDragMs: gesture.holdToDragMs,
             movementThresholdPoints: CGFloat(gesture.movementThresholdPoints),
-            scrollSensitivity: CGFloat(gesture.scrollSensitivity)
+            scrollSensitivity: CGFloat(gesture.scrollSensitivity),
+            doubleClickDistancePoints: CGFloat(gesture.doubleClickDistancePoints)
         )
     }
 
@@ -63,6 +69,7 @@ public struct GestureTiming: Equatable {
         tapDebounceMs: 0,
         holdToDragMs: 300,
         movementThresholdPoints: 8,
-        scrollSensitivity: 1
+        scrollSensitivity: 1,
+        doubleClickDistancePoints: 12
     )
 }

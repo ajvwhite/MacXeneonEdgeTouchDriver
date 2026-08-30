@@ -33,4 +33,7 @@ public struct SingleTouchContext: Equatable {
 
     /// Current interpretation of the contact.
     public var phase: Phase
+
+    /// Click count used if this contact has emitted a mouse-down event.
+    public var clickCount: Int
 }

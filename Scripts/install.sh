@@ -58,7 +58,8 @@ if [ ! -f "$config_path" ]; then
     "multiTouchEnabled": false,
     "holdToDragMs": 300,
     "movementThresholdPoints": 8,
-    "scrollSensitivity": 1.0
+    "scrollSensitivity": 1.0,
+    "doubleClickDistancePoints": 12
   },
   "diagnostics": {
     "fileLogPath": "${driver_log_path}",

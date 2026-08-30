@@ -41,7 +41,8 @@ public struct DriverConfiguration: Codable, Equatable {
             pinchModifies: .contentZoom,
             holdToDragMs: 300,
             movementThresholdPoints: 8,
-            scrollSensitivity: 1
+            scrollSensitivity: 1,
+            doubleClickDistancePoints: 12
         ),
         diagnostics: Diagnostics(
             fileLogPath: defaultLogURL().path,
@@ -164,6 +165,9 @@ public struct DriverConfiguration: Codable, Equatable {
             if let value = gesture.scrollSensitivity {
                 configuration.gesture.scrollSensitivity = clamp(value, to: 0.1...10, name: "gesture.scrollSensitivity", warnings: &warnings)
             }
+            if let value = gesture.doubleClickDistancePoints {
+                configuration.gesture.doubleClickDistancePoints = clamp(value, to: 1...100, name: "gesture.doubleClickDistancePoints", warnings: &warnings)
+            }
         }
 
         if let diagnostics = partial.diagnostics {
@@ -223,6 +227,7 @@ public extension DriverConfiguration {
         public var holdToDragMs: Int
         public var movementThresholdPoints: Int
         public var scrollSensitivity: Double
+        public var doubleClickDistancePoints: Int
     }
 
     /// Diagnostic file logging configuration.
@@ -279,6 +284,7 @@ private struct PartialGesture: Decodable {
     var holdToDragMs: Int?
     var movementThresholdPoints: Int?
     var scrollSensitivity: Double?
+    var doubleClickDistancePoints: Int?
 }
 
 private struct PartialDiagnostics: Decodable {
