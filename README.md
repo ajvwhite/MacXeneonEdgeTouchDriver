@@ -1,8 +1,8 @@
 # Mac Xeneon Edge Touch Driver
 
-A native macOS user-space touch driver for the Corsair Xeneon Edge and compatible WCH `27C0:0859` panels. It supports multiple identical touchscreens, persistent per-controller display mapping, taps, direct pixel scrolling, and deliberate hold-to-drag.
+A native macOS user-space touch driver for the Corsair Xeneon Edge and compatible WCH `27C0:0859` panels. It supports multiple identical touchscreens, safe per-controller display mapping, taps, direct pixel scrolling, and deliberate hold-to-drag.
 
-It has no Touch Up dependency. Input capture, pairing UI, display resolution, and event injection use macOS frameworks directly.
+It has no Touch Up dependency. Input capture, pairing UI, display resolution, event injection, and hotplug observation use documented macOS frameworks directly. It does not depend on private CoreDisplay symbols, unavailable display-service bridges, or I/O Registry topology guesses.
 
 ## How To Install
 
@@ -31,6 +31,14 @@ No script uses `sudo`. Driver logs are written to:
 ```
 
 The LaunchAgent also creates `stdout.log` and `stderr.log` in the same directory for process-level output. The driver itself uses Unified Logging plus `driver.log`, so stdout and stderr are normally empty unless launchd or a lower-level runtime writes there.
+
+For a development machine that rebuilds the driver, pass a stable signing identity so macOS can keep Accessibility and Input Monitoring approval across upgrades:
+
+```sh
+CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./Scripts/install.sh
+```
+
+Without `CODESIGN_IDENTITY`, Swift's linker ad hoc signature is used. Its designated requirement changes whenever the executable changes, so macOS may require privacy approval again after an upgrade. The signing identity is supplied only through the environment and is never written into the repository, configuration, LaunchAgent, or pairing file.
 
 The installer creates a default config file if one does not already exist:
 
@@ -100,13 +108,15 @@ All fields are optional. Missing or malformed config falls back to defaults and 
 
 ## Pairing Multiple Displays
 
-When a controller has no valid saved assignment, the driver covers one compatible display with **Touch this display**. Touch that physical panel once. The raw USB controller location is then paired one-to-one with that display's CoreGraphics UUID in:
+When a controller has no valid saved assignment, the driver covers one compatible display with **Touch this display**. Touch that physical panel once. The current USB controller endpoint is then paired one-to-one with that current CoreGraphics display in:
 
 ```text
 ~/Library/Application Support/MacXeneonEdgeTouchDriver/pairings.json
 ```
 
-Repeat for each overlay. Pairings survive driver and Mac restarts. Display bounds are resolved again after rearrangement or hotplug. If a controller moves to a different USB topology, or a display's stable identity changes after replacement, the driver asks for that mapping again instead of sending touch to another screen.
+Repeat for each overlay. Pairings survive driver restarts during the same boot. They survive a Mac restart only when both the touch controller and display report public hardware serials that are unique among the attached devices. Identical controllers with duplicate serials and displays with a zero EDID serial—such as the tested Prechen panels—deliberately request pairing once after each reboot because macOS exposes no supported durable association between their USB and video endpoints.
+
+Display position is never used as identity. CoreGraphics and AppKit display-change notifications trigger a debounced refresh of live display bounds, so rearrangement, resolution changes, and ordinary hotplug update the global click destination without recalibrating an otherwise valid current-boot pairing. If AppKit is not ready to place the calibration window during login, the driver retries for a bounded period and listens for the next supported display-change event.
 
 Gesture behavior:
 
@@ -115,7 +125,7 @@ Gesture behavior:
 - Move immediately: pixel-precise scroll.
 - Hold still for `holdToDragMs`, then move: mouse drag.
 
-No controller location IDs or display UUIDs are built into the driver. Matching devices are discovered at runtime, compatible displays are selected from the display configuration, and the pairing overlay creates the local one-to-one assignments.
+No controller location IDs, display IDs, serials, screen positions, or machine-specific routes are built into the driver. Matching devices are discovered at runtime, compatible displays are selected from the display configuration, and the pairing overlay creates the local one-to-one assignments.
 
 ## Acknowledgements and Provenance
 
@@ -139,7 +149,9 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for authorship, license lin
 ## Troubleshooting
 
 - If the driver exits immediately, check Accessibility permission for the exact binary location as provided by the install script.
+- If privacy approval disappears after rebuilding, reinstall with the same `CODESIGN_IDENTITY` each time, then approve that signed binary once.
 - If HID open fails, check Input Monitoring permission and confirm no other process has seized the same VID/PID device.
 - If a panel model is not detected, run `swift run DisplayInfo` and adjust the optional display config override.
+- On identical panels without unique public serials, seeing **Touch this display** once after reboot is the intentional safety behavior. The driver will not guess from screen order or position.
 - To deliberately reset display assignments, stop the LaunchAgent, remove only `pairings.json`, and start it again; the pairing overlays will return.
 - For HID investigation, use `swift run HIDDump`; it intentionally runs in non-seize mode and is separate from the production daemon.

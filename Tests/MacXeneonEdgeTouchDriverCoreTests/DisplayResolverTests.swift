@@ -59,16 +59,16 @@ final class DisplayResolverTests: XCTestCase {
 
     func testReturnsIdenticalDisplaysInStableVisualOrder() {
         let resolver = DisplayResolver()
-        let right = matchingDisplay(id: 4, uuid: "RIGHT", x: 3_840)
-        let left = matchingDisplay(id: 5, uuid: "LEFT", x: 0)
+        let right = matchingDisplay(id: 4, runtimeIdentifier: "RIGHT", x: 3_840)
+        let left = matchingDisplay(id: 5, runtimeIdentifier: "LEFT", x: 0)
 
-        XCTAssertEqual(resolver.matchingDisplays(from: [right, left]).map(\.uuid), ["LEFT", "RIGHT"])
+        XCTAssertEqual(resolver.matchingDisplays(from: [right, left]).map(\.runtimeIdentifier), ["LEFT", "RIGHT"])
     }
 
-    private func matchingDisplay(id: CGDirectDisplayID, uuid: String, x: CGFloat) -> DisplaySnapshot {
+    private func matchingDisplay(id: CGDirectDisplayID, runtimeIdentifier: String, x: CGFloat) -> DisplaySnapshot {
         DisplaySnapshot(
             displayID: id,
-            uuid: uuid,
+            runtimeIdentifier: runtimeIdentifier,
             vendorNumber: CapturedXeneonDisplay.vendorNumber,
             modelNumber: CapturedXeneonDisplay.modelNumber,
             serialNumber: 0,

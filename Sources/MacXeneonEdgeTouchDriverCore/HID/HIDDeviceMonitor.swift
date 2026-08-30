@@ -123,7 +123,10 @@ public final class HIDDeviceMonitor {
             return
         }
 
-        let identity = TouchDeviceIdentity(locationID: locationNumber.uint32Value)
+        let identity = TouchDeviceIdentity(
+            locationID: locationNumber.uint32Value,
+            serialNumber: deviceProperty(device, key: kIOHIDSerialNumberKey)
+        )
         let registration = HIDReportRegistration(
             device: device,
             identity: identity,

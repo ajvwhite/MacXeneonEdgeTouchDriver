@@ -6,8 +6,8 @@ public struct DisplaySnapshot: Equatable {
     /// CoreGraphics display identifier.
     public let displayID: CGDirectDisplayID
 
-    /// Stable CoreGraphics display UUID used for persisted touch pairing.
-    public let uuid: String
+    /// Current-boot CoreGraphics display identifier rendered for logs and storage.
+    public let runtimeIdentifier: String
 
     /// EDID vendor number.
     public let vendorNumber: UInt32
@@ -30,7 +30,7 @@ public struct DisplaySnapshot: Equatable {
     /// Creates a display snapshot for matching or tests.
     public init(
         displayID: CGDirectDisplayID,
-        uuid: String = "",
+        runtimeIdentifier: String = "",
         vendorNumber: UInt32,
         modelNumber: UInt32,
         serialNumber: UInt32,
@@ -39,13 +39,19 @@ public struct DisplaySnapshot: Equatable {
         pixelsHigh: Int
     ) {
         self.displayID = displayID
-        self.uuid = uuid.isEmpty ? "display-\(displayID)" : uuid
+        self.runtimeIdentifier = runtimeIdentifier.isEmpty ? "display-\(displayID)" : runtimeIdentifier
         self.vendorNumber = vendorNumber
         self.modelNumber = modelNumber
         self.serialNumber = serialNumber
         self.bounds = bounds
         self.pixelsWide = pixelsWide
         self.pixelsHigh = pixelsHigh
+    }
+
+    /// Public hardware key usable only after the pairing coordinator proves uniqueness.
+    public var hardwareKey: String? {
+        guard serialNumber != 0 else { return nil }
+        return "edid:\(vendorNumber):\(modelNumber):\(serialNumber)"
     }
 }
 
@@ -161,7 +167,7 @@ public final class DisplayResolver {
     private static func makeSnapshot(displayID: CGDirectDisplayID) -> DisplaySnapshot {
         DisplaySnapshot(
             displayID: displayID,
-            uuid: displayUUID(displayID: displayID),
+            runtimeIdentifier: "display-\(displayID)",
             vendorNumber: CGDisplayVendorNumber(displayID),
             modelNumber: CGDisplayModelNumber(displayID),
             serialNumber: CGDisplaySerialNumber(displayID),
@@ -171,16 +177,4 @@ public final class DisplayResolver {
         )
     }
 
-    private static func displayUUID(displayID: CGDirectDisplayID) -> String {
-        guard let unmanagedUUID = createDisplayUUID(displayID) else {
-            return "display-\(displayID)"
-        }
-        let uuid = unmanagedUUID.takeRetainedValue()
-        return CFUUIDCreateString(kCFAllocatorDefault, uuid) as String
-    }
 }
-
-// CoreGraphics exports this stable display identity function, but recent Swift SDKs no
-// longer surface its declaration. Keep the bridge local and degrade to display ID above.
-@_silgen_name("CGDisplayCreateUUIDFromDisplayID")
-private func createDisplayUUID(_ displayID: CGDirectDisplayID) -> Unmanaged<CFUUID>?

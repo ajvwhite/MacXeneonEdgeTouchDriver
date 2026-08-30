@@ -1,34 +1,71 @@
+import CoreGraphics
 import Foundation
 
-/// Persisted one-to-one association between a USB touch controller and a display UUID.
+/// Lifetime of a persisted pairing.
+public enum PairingScope: String, Codable, Equatable, Sendable {
+    /// Runtime identifiers are trusted only during the boot in which calibration occurred.
+    case bootSession
+
+    /// Both endpoints exposed public hardware identifiers that were unique when calibrated.
+    case hardware
+}
+
+/// Persisted one-to-one association between a USB touch controller and a display.
 public struct TouchDisplayPairing: Codable, Equatable, Sendable {
     public let device: TouchDeviceIdentity
-    public let displayUUID: String
+    public let displayID: CGDirectDisplayID
+    public let displayVendorNumber: UInt32
+    public let displayModelNumber: UInt32
+    public let displaySerialNumber: UInt32
+    public let bootSessionIdentifier: String
+    public let scope: PairingScope
 
-    public init(device: TouchDeviceIdentity, displayUUID: String) {
+    public init(
+        device: TouchDeviceIdentity,
+        display: DisplaySnapshot,
+        bootSessionIdentifier: String,
+        scope: PairingScope
+    ) {
         self.device = device
-        self.displayUUID = displayUUID
+        self.displayID = display.displayID
+        self.displayVendorNumber = display.vendorNumber
+        self.displayModelNumber = display.modelNumber
+        self.displaySerialNumber = display.serialNumber
+        self.bootSessionIdentifier = bootSessionIdentifier
+        self.scope = scope
+    }
+
+    var displayHardwareKey: String? {
+        guard displaySerialNumber != 0 else { return nil }
+        return "edid:\(displayVendorNumber):\(displayModelNumber):\(displaySerialNumber)"
     }
 }
 
 private struct PairingFile: Codable {
-    var version = 1
+    var version = 2
     var pairings: [TouchDisplayPairing]
 }
 
-/// Loads and atomically persists touch-controller-to-display assignments.
+private struct LegacyPairingFile: Decodable {
+    let version: Int
+}
+
+/// Loads, validates, resolves, and atomically persists touch-display assignments.
 public final class PairingStore {
     public private(set) var pairings: [TouchDisplayPairing]
 
     private let url: URL
     private let fileManager: FileManager
+    private let bootSessionIdentifier: String
 
     public init(
         url: URL = PairingStore.defaultURL(),
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        bootSessionIdentifier: String = PairingStore.currentBootSessionIdentifier()
     ) {
         self.url = url
         self.fileManager = fileManager
+        self.bootSessionIdentifier = bootSessionIdentifier
         self.pairings = []
         load()
     }
@@ -43,37 +80,112 @@ public final class PairingStore {
             .appendingPathComponent("pairings.json", isDirectory: false)
     }
 
-    public func displayUUID(for device: TouchDeviceIdentity) -> String? {
-        pairings.first { $0.device == device }?.displayUUID
+    /// A supported, conservative marker for the current boot.
+    ///
+    /// Wall clock minus Foundation system uptime estimates the boot date. Rounding
+    /// makes the value stable across process restarts. Clock corrections may cause
+    /// a safe extra calibration but can never authorize an incorrect stale mapping.
+    public static func currentBootSessionIdentifier(
+        now: Date = Date(),
+        systemUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
+    ) -> String {
+        let bootEpochSeconds = Int64((now.timeIntervalSince1970 - systemUptime).rounded())
+        return "boot-\(bootEpochSeconds)"
     }
 
-    public func device(forDisplayUUID displayUUID: String) -> TouchDeviceIdentity? {
-        pairings.first { $0.displayUUID == displayUUID }?.device
-    }
-
-    /// Assigns a one-to-one mapping. Older records for either endpoint are removed.
-    public func assign(device: TouchDeviceIdentity, toDisplayUUID displayUUID: String) throws {
-        pairings.removeAll { pairing in
-            pairing.device == device || pairing.displayUUID == displayUUID
+    /// Resolves a controller to a current display without using display bounds as identity.
+    public func resolveDisplay(
+        for device: TouchDeviceIdentity,
+        connectedDevices: Set<TouchDeviceIdentity>,
+        displays: [DisplaySnapshot]
+    ) -> DisplaySnapshot? {
+        if let exact = pairings.first(where: {
+            $0.bootSessionIdentifier == bootSessionIdentifier &&
+            $0.device.locationID == device.locationID
+        }), let display = displays.first(where: { $0.displayID == exact.displayID }) {
+            return display
         }
-        pairings.append(TouchDisplayPairing(device: device, displayUUID: displayUUID))
-        pairings.sort { $0.device.locationID < $1.device.locationID }
+
+        guard let deviceKey = device.hardwareKey,
+              connectedDevices.filter({ $0.hardwareKey == deviceKey }).count == 1,
+              pairings.filter({ $0.scope == .hardware && $0.device.hardwareKey == deviceKey }).count == 1,
+              let pairing = pairings.first(where: {
+                  $0.scope == .hardware && $0.device.hardwareKey == deviceKey
+              }),
+              let displayKey = pairing.displayHardwareKey,
+              displays.filter({ $0.hardwareKey == displayKey }).count == 1,
+              pairings.filter({ $0.scope == .hardware && $0.displayHardwareKey == displayKey }).count == 1 else {
+            return nil
+        }
+
+        return displays.first { $0.hardwareKey == displayKey }
+    }
+
+    /// Assigns a mapping and chooses the strongest scope justified by current public data.
+    public func assign(
+        device: TouchDeviceIdentity,
+        to display: DisplaySnapshot,
+        connectedDevices: Set<TouchDeviceIdentity>,
+        displays: [DisplaySnapshot]
+    ) throws {
+        let deviceKey = device.hardwareKey
+        let displayKey = display.hardwareKey
+        let hardwareIsUnique = deviceKey != nil &&
+            displayKey != nil &&
+            connectedDevices.filter { $0.hardwareKey == deviceKey }.count == 1 &&
+            displays.filter { $0.hardwareKey == displayKey }.count == 1
+        let scope: PairingScope = hardwareIsUnique ? .hardware : .bootSession
+
+        pairings.removeAll { pairing in
+            let sameRuntimeDevice = pairing.bootSessionIdentifier == bootSessionIdentifier &&
+                pairing.device.locationID == device.locationID
+            let sameRuntimeDisplay = pairing.bootSessionIdentifier == bootSessionIdentifier &&
+                pairing.displayID == display.displayID
+            let sameHardwareDevice = scope == .hardware && pairing.scope == .hardware &&
+                pairing.device.hardwareKey == deviceKey
+            let sameHardwareDisplay = scope == .hardware && pairing.scope == .hardware &&
+                pairing.displayHardwareKey == displayKey
+            return sameRuntimeDevice || sameRuntimeDisplay || sameHardwareDevice || sameHardwareDisplay
+        }
+
+        pairings.append(TouchDisplayPairing(
+            device: device,
+            display: display,
+            bootSessionIdentifier: bootSessionIdentifier,
+            scope: scope
+        ))
+        pairings.sort {
+            if $0.bootSessionIdentifier != $1.bootSessionIdentifier {
+                return $0.bootSessionIdentifier < $1.bootSessionIdentifier
+            }
+            return $0.device.locationID < $1.device.locationID
+        }
         try save()
     }
 
     public func remove(device: TouchDeviceIdentity) throws {
-        pairings.removeAll { $0.device == device }
+        pairings.removeAll {
+            $0.bootSessionIdentifier == bootSessionIdentifier &&
+            $0.device.locationID == device.locationID
+        }
         try save()
     }
 
     private func load() {
-        guard fileManager.fileExists(atPath: url.path) else {
-            return
-        }
+        guard fileManager.fileExists(atPath: url.path) else { return }
 
         do {
             let data = try Data(contentsOf: url)
-            pairings = try JSONDecoder().decode(PairingFile.self, from: data).pairings
+            if let legacy = try? JSONDecoder().decode(LegacyPairingFile.self, from: data),
+               legacy.version < 2 {
+                DriverLoggers.log(.notice, category: .display, "Ignoring version-one runtime pairings; calibration will create supported version-two identities.")
+                pairings = []
+                return
+            }
+            let decoded = try JSONDecoder().decode(PairingFile.self, from: data)
+            pairings = decoded.pairings.filter {
+                $0.scope == .hardware || $0.bootSessionIdentifier == bootSessionIdentifier
+            }
         } catch {
             DriverLoggers.log(.error, category: .display, "Could not load pairing file at \(url.path): \(error.localizedDescription)")
             pairings = []

@@ -4,7 +4,8 @@ import Foundation
 
 /// UI boundary used by the pairing coordinator and its tests.
 public protocol PairingOverlayPresenting: AnyObject {
-    func show(on display: DisplaySnapshot, step: Int, total: Int)
+    @discardableResult
+    func show(on display: DisplaySnapshot, step: Int, total: Int) -> Bool
     func showConfirmation(on display: DisplaySnapshot)
     func hide()
 }
@@ -15,7 +16,8 @@ public final class PairingOverlayController: PairingOverlayPresenting {
 
     public init() {}
 
-    public func show(on display: DisplaySnapshot, step: Int, total: Int) {
+    @discardableResult
+    public func show(on display: DisplaySnapshot, step: Int, total: Int) -> Bool {
         present(
             on: display,
             title: "Touch this display",
@@ -24,7 +26,7 @@ public final class PairingOverlayController: PairingOverlayPresenting {
     }
 
     public func showConfirmation(on display: DisplaySnapshot) {
-        present(on: display, title: "Paired", detail: "Touch input is assigned to this display")
+        _ = present(on: display, title: "Paired", detail: "Touch input is assigned to this display")
     }
 
     public func hide() {
@@ -34,11 +36,11 @@ public final class PairingOverlayController: PairingOverlayPresenting {
         }
     }
 
-    private func present(on display: DisplaySnapshot, title: String, detail: String) {
-        runOnMain { [weak self] in
+    private func present(on display: DisplaySnapshot, title: String, detail: String) -> Bool {
+        runOnMainReturning { [weak self] in
             guard let self, let screen = Self.screen(for: display.displayID) else {
                 DriverLoggers.log(.error, category: .display, "Could not present pairing overlay for display \(display.displayID).")
-                return
+                return false
             }
 
             self.window?.orderOut(nil)
@@ -60,6 +62,7 @@ public final class PairingOverlayController: PairingOverlayPresenting {
             window.setFrame(screen.frame, display: true)
             window.orderFrontRegardless()
             self.window = window
+            return true
         }
     }
 
@@ -76,6 +79,13 @@ public final class PairingOverlayController: PairingOverlayPresenting {
         } else {
             DispatchQueue.main.async(execute: operation)
         }
+    }
+
+    private func runOnMainReturning<T>(_ operation: @escaping () -> T) -> T {
+        if Thread.isMainThread {
+            return operation()
+        }
+        return DispatchQueue.main.sync(execute: operation)
     }
 }
 

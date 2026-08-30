@@ -4,14 +4,15 @@ import XCTest
 
 final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
     func testTwoPersistedControllersRouteToDifferentDisplays() throws {
-        let left = display(id: 41, uuid: "LEFT", x: 0)
-        let right = display(id: 42, uuid: "RIGHT", x: 2_000)
+        let left = display(id: 41, runtimeIdentifier: "LEFT", x: 0)
+        let right = display(id: 42, runtimeIdentifier: "RIGHT", x: 2_000)
         let resolver = DisplayResolver(activeDisplayProvider: { [left, right] })
         let store = pairingStore()
         let first = TouchDeviceIdentity(locationID: 0x0014_0000)
         let second = TouchDeviceIdentity(locationID: 0x0110_0000)
-        try store.assign(device: first, toDisplayUUID: left.uuid)
-        try store.assign(device: second, toDisplayUUID: right.uuid)
+        let devices: Set = [first, second]
+        try store.assign(device: first, to: left, connectedDevices: devices, displays: [left, right])
+        try store.assign(device: second, to: right, connectedDevices: devices, displays: [left, right])
         let input = ApplicationRecordingInputSink()
         let cursor = ApplicationRecordingCursorController()
         let application = MacXeneonEdgeTouchDriverApplication(
@@ -39,7 +40,7 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
     }
 
     func testRawTouchPairsControllerToDisplayedTargetAndSuppressesThatContact() {
-        let target = display(id: 41, uuid: "TARGET", x: 100)
+        let target = display(id: 41, runtimeIdentifier: "TARGET", x: 100)
         let resolver = DisplayResolver(activeDisplayProvider: { [target] })
         let store = pairingStore()
         let overlay = ApplicationRecordingPairingOverlay()
@@ -58,19 +59,23 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
         application.handleTouchEvent(deviceEvent(device, .down, rawX: 5_000, rawY: 5_000))
         application.handleTouchEvent(deviceEvent(device, .up, rawX: 5_000, rawY: 5_000))
 
-        XCTAssertEqual(store.displayUUID(for: device), "TARGET")
+        XCTAssertEqual(
+            store.resolveDisplay(for: device, connectedDevices: [device], displays: [target]),
+            target
+        )
         XCTAssertEqual(overlay.calls.prefix(2), [.show("TARGET", 1, 1), .confirmation("TARGET")])
         XCTAssertTrue(input.calls.isEmpty)
     }
 
     func testAlreadyPairedControllerCannotStealSecondPairingTarget() throws {
-        let left = display(id: 41, uuid: "LEFT", x: 0)
-        let right = display(id: 42, uuid: "RIGHT", x: 2_000)
+        let left = display(id: 41, runtimeIdentifier: "LEFT", x: 0)
+        let right = display(id: 42, runtimeIdentifier: "RIGHT", x: 2_000)
         let resolver = DisplayResolver(activeDisplayProvider: { [left, right] })
         let store = pairingStore()
         let paired = TouchDeviceIdentity(locationID: 1)
         let unpaired = TouchDeviceIdentity(locationID: 2)
-        try store.assign(device: paired, toDisplayUUID: left.uuid)
+        let devices: Set = [paired, unpaired]
+        try store.assign(device: paired, to: left, connectedDevices: devices, displays: [left, right])
         let application = MacXeneonEdgeTouchDriverApplication(
             configuration: immediateConfiguration(),
             displayResolver: resolver,
@@ -84,8 +89,127 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
         application.handleDeviceMatched(unpaired)
         application.handleTouchEvent(deviceEvent(paired, .down, rawX: 0, rawY: 0))
 
-        XCTAssertEqual(store.displayUUID(for: paired), "LEFT")
-        XCTAssertNil(store.displayUUID(for: unpaired))
+        XCTAssertEqual(
+            store.resolveDisplay(for: paired, connectedDevices: devices, displays: [left, right]),
+            left
+        )
+        XCTAssertNil(store.resolveDisplay(
+            for: unpaired,
+            connectedDevices: devices,
+            displays: [left, right]
+        ))
+    }
+
+    func testDisplayBoundsChangeUpdatesDestinationWithoutRecalibration() throws {
+        var currentDisplay = display(id: 41, runtimeIdentifier: "TARGET", x: 100)
+        let resolver = DisplayResolver(activeDisplayProvider: { [currentDisplay] })
+        let store = pairingStore()
+        let device = TouchDeviceIdentity(locationID: 1)
+        try store.assign(
+            device: device,
+            to: currentDisplay,
+            connectedDevices: [device],
+            displays: [currentDisplay]
+        )
+        let input = ApplicationRecordingInputSink()
+        let application = MacXeneonEdgeTouchDriverApplication(
+            configuration: immediateConfiguration(),
+            displayResolver: resolver,
+            inputSink: input,
+            cursorController: ApplicationRecordingCursorController(),
+            pairingStore: store,
+            pairingOverlay: ApplicationRecordingPairingOverlay()
+        )
+        application.handleDeviceMatched(device)
+        application.handleTouchEvent(deviceEvent(device, .down, rawX: 0, rawY: 0))
+        application.handleTouchEvent(deviceEvent(device, .up, rawX: 0, rawY: 0))
+
+        currentDisplay = display(id: 41, runtimeIdentifier: "TARGET", x: 2_000)
+        application.refreshDisplayMappings(reason: "test arrangement change")
+        application.handleTouchEvent(deviceEvent(device, .down, rawX: 0, rawY: 0))
+        application.handleTouchEvent(deviceEvent(device, .up, rawX: 0, rawY: 0))
+
+        XCTAssertEqual(input.calls, [
+            .mouseDown(CGPoint(x: 100, y: 200)),
+            .mouseUp(CGPoint(x: 100, y: 200)),
+            .mouseDown(CGPoint(x: 2_000, y: 200)),
+            .mouseUp(CGPoint(x: 2_000, y: 200))
+        ])
+    }
+
+    func testUnavailableOverlayDoesNotAuthorizeTouchRouting() {
+        let target = display(id: 41, runtimeIdentifier: "TARGET", x: 100)
+        let resolver = DisplayResolver(activeDisplayProvider: { [target] })
+        let store = pairingStore()
+        let overlay = ApplicationRecordingPairingOverlay(canShow: false)
+        let device = TouchDeviceIdentity(locationID: 1)
+        let input = ApplicationRecordingInputSink()
+        let application = MacXeneonEdgeTouchDriverApplication(
+            configuration: immediateConfiguration(),
+            displayResolver: resolver,
+            inputSink: input,
+            cursorController: ApplicationRecordingCursorController(),
+            pairingStore: store,
+            pairingOverlay: overlay
+        )
+
+        application.handleDeviceMatched(device)
+        application.refreshDisplayMappings(reason: "test screen readiness lag")
+        application.handleTouchEvent(deviceEvent(device, .down, rawX: 0, rawY: 0))
+
+        XCTAssertTrue(store.pairings.isEmpty)
+        XCTAssertTrue(input.calls.isEmpty)
+    }
+
+    func testStagedDeviceEnumerationIsDebouncedIntoOneReconciliation() {
+        let left = display(id: 41, runtimeIdentifier: "LEFT", x: 0)
+        let right = display(id: 42, runtimeIdentifier: "RIGHT", x: 2_000)
+        let resolver = DisplayResolver(activeDisplayProvider: { [left, right] })
+        let overlay = ApplicationRecordingPairingOverlay()
+        let application = MacXeneonEdgeTouchDriverApplication(
+            configuration: immediateConfiguration(),
+            displayResolver: resolver,
+            inputSink: ApplicationRecordingInputSink(),
+            cursorController: ApplicationRecordingCursorController(),
+            pairingStore: pairingStore(),
+            pairingOverlay: overlay
+        )
+
+        application.handleDeviceMatched(TouchDeviceIdentity(locationID: 1))
+        application.handleDeviceMatched(TouchDeviceIdentity(locationID: 2))
+        waitForAsyncWork(milliseconds: 400)
+
+        XCTAssertEqual(overlay.calls.filter {
+            if case .show = $0 { return true }
+            return false
+        }, [.show("LEFT", 1, 2)])
+    }
+
+    func testPairingOverlayRetriesUntilAppKitScreenBecomesReady() {
+        let target = display(id: 41, runtimeIdentifier: "TARGET", x: 100)
+        let resolver = DisplayResolver(activeDisplayProvider: { [target] })
+        let store = pairingStore()
+        let overlay = ApplicationRecordingPairingOverlay(failuresBeforeSuccess: 2)
+        let device = TouchDeviceIdentity(locationID: 1)
+        let application = MacXeneonEdgeTouchDriverApplication(
+            configuration: immediateConfiguration(),
+            displayResolver: resolver,
+            inputSink: ApplicationRecordingInputSink(),
+            cursorController: ApplicationRecordingCursorController(),
+            pairingStore: store,
+            pairingOverlay: overlay
+        )
+
+        application.handleDeviceMatched(device)
+        application.refreshDisplayMappings(reason: "test initial screen readiness")
+        waitForAsyncWork(milliseconds: 1_100)
+        application.handleTouchEvent(deviceEvent(device, .down, rawX: 0, rawY: 0))
+
+        XCTAssertEqual(overlay.calls.filter {
+            if case .show = $0 { return true }
+            return false
+        }.count, 3)
+        XCTAssertEqual(store.pairings.count, 1)
     }
 
     private func immediateConfiguration() -> DriverConfiguration {
@@ -97,10 +221,10 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
         return configuration
     }
 
-    private func display(id: CGDirectDisplayID, uuid: String, x: CGFloat) -> DisplaySnapshot {
+    private func display(id: CGDirectDisplayID, runtimeIdentifier: String, x: CGFloat) -> DisplaySnapshot {
         DisplaySnapshot(
             displayID: id,
-            uuid: uuid,
+            runtimeIdentifier: runtimeIdentifier,
             vendorNumber: CapturedXeneonDisplay.vendorNumber,
             modelNumber: CapturedXeneonDisplay.modelNumber,
             serialNumber: 0,
@@ -132,6 +256,14 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
             device: device,
             touch: TouchEvent(kind: kind, contactID: 0, rawX: rawX, rawY: rawY, timestamp: .now())
         )
+    }
+
+    private func waitForAsyncWork(milliseconds: Int) {
+        let expectation = expectation(description: "asynchronous driver work")
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(milliseconds)) {
+            expectation.fulfill()
+        }
+        wait(for: [expectation], timeout: Double(milliseconds) / 1_000 + 1)
     }
 }
 
@@ -167,10 +299,37 @@ private final class ApplicationRecordingPairingOverlay: PairingOverlayPresenting
         case confirmation(String)
         case hide
     }
-    private(set) var calls: [Call] = []
-    func show(on display: DisplaySnapshot, step: Int, total: Int) {
-        calls.append(.show(display.uuid, step, total))
+    private let lock = NSLock()
+    private var storedCalls: [Call] = []
+    private let canShow: Bool
+    private var failuresBeforeSuccess: Int
+    var calls: [Call] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedCalls
     }
-    func showConfirmation(on display: DisplaySnapshot) { calls.append(.confirmation(display.uuid)) }
-    func hide() { calls.append(.hide) }
+    init(canShow: Bool = true, failuresBeforeSuccess: Int = 0) {
+        self.canShow = canShow
+        self.failuresBeforeSuccess = failuresBeforeSuccess
+    }
+    func show(on display: DisplaySnapshot, step: Int, total: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        storedCalls.append(.show(display.runtimeIdentifier, step, total))
+        if failuresBeforeSuccess > 0 {
+            failuresBeforeSuccess -= 1
+            return false
+        }
+        return canShow
+    }
+    func showConfirmation(on display: DisplaySnapshot) {
+        lock.lock()
+        storedCalls.append(.confirmation(display.runtimeIdentifier))
+        lock.unlock()
+    }
+    func hide() {
+        lock.lock()
+        storedCalls.append(.hide)
+        lock.unlock()
+    }
 }
