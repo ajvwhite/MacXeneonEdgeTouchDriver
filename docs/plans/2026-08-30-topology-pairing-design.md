@@ -1,45 +1,49 @@
-# Topology-based touch pairing design
+# Supported touch pairing and reconciliation design
 
 ## Goal
 
-Preserve touchscreen calibration across login, reboot, and ordinary device enumeration changes without guessing a display from its current position. Require `Touch this display` only when a physical connection route changes or the available identities are genuinely ambiguous.
+Route each touchscreen to its paired display without guessing from display position. Reuse a pairing across driver restarts in the same boot and across boots only when both endpoints expose genuinely unique hardware identities. Require `Touch this display` after a reboot when identical hardware makes the relationship ambiguous.
 
 ## Identity model
 
-CoreGraphics display IDs and UUIDs and complete USB HID location IDs are runtime observations, not persisted pairing authority. A saved pairing associates a normalized touchscreen connection fingerprint with a normalized display connection fingerprint.
+CoreGraphics display IDs and USB HID location IDs identify current runtime endpoints. They are valid pairing authority only for the current boot. The implementation uses documented CoreGraphics, AppKit, Foundation, and IOHID APIs; it does not bridge unavailable symbols, inspect private I/O Registry properties, or use legacy display-service APIs.
 
-Each fingerprint retains enough descriptive data for diagnostics, but matching is based on connection topology. Identical EDID data, zero display serials, and duplicate USB serials are expected and must not silently collapse two devices into one identity.
+A saved pairing records runtime identifiers, the current boot-session marker, and available public hardware descriptors. A pairing may cross a boot only when the controller and display descriptors are both non-empty and unique among the recorded and currently attached compatible endpoints. Identical EDID data, zero display serials, and duplicate USB serials must never silently collapse two devices into one identity.
 
-Display bounds are never identity evidence. Once a display connection has been resolved, its live CoreGraphics bounds define the coordinate destination and automatically follow arrangement changes.
+Display bounds are never identity evidence. Once a display has been resolved, its live CoreGraphics bounds convert panel-local touch coordinates into the global desktop coordinates required by synthetic mouse events. Arrangement, resolution, and bounds changes therefore update routing without changing the pairing.
 
 ## Reconciliation
 
-The driver builds a live topology snapshot after HID and display enumeration settles. It compares that snapshot with saved versioned pairings:
+The driver reconciles the current HID controllers, compatible CoreGraphics displays, and saved versioned pairings after enumeration settles:
 
-1. If both saved connection fingerprints resolve uniquely, bind the current runtime HID and CoreGraphics identifiers without calibration.
-2. If an affected connection fingerprint changed or no longer resolves uniquely, leave only that pairing unresolved.
-3. Present `Touch this display` for unresolved compatible displays one at a time.
-4. Persist the newly calibrated topology association and keep runtime identifiers session-local.
+1. Reuse an exact runtime pairing when its boot-session marker still matches and both endpoints remain attached.
+2. Across boots, reuse only a pairing whose public controller and display hardware identities both resolve uniquely.
+3. Leave every ambiguous or missing association unresolved instead of guessing.
+4. Present `Touch this display` for unresolved compatible displays one at a time.
+5. Persist the new association atomically with the current boot-session marker and public descriptors.
 
 Enumeration is event-driven and debounced rather than based on an assumed display count. Display reconfiguration, AppKit screen-parameter changes, HID arrival, and HID removal all schedule reconciliation. A bounded retry handles the interval where CoreGraphics has announced a display but AppKit cannot yet create a window on its `NSScreen`.
 
 ## Safety and ambiguity
 
-The driver must never guess from left-to-right order, display coordinates, enumeration order, stale UUIDs, or model name alone. While a pairing is unresolved, events from that controller are consumed but do not create synthetic mouse input.
+The driver must never guess a controller-to-display relationship from left-to-right order, display coordinates, enumeration order, stale runtime identifiers, or model name alone. Display order is used only to choose which unpaired display shows the next calibration prompt. While a pairing is unresolved, events from that controller are consumed but do not create synthetic mouse input.
 
-A physical route change is treated as a potentially new arrangement and requires calibration for the affected route. Unchanged normalized topology may reuse calibration even when macOS assigns different runtime IDs after reboot.
+Hotplug or a display-bounds change triggers reconciliation. Exact current-boot mappings survive ordinary rearrangement and driver restart. Identical devices whose public identifiers cannot prove their relationship require calibration once in each new boot session.
 
 ## Persistence and migration
 
-The pairing file moves to a versioned topology schema. Existing version-one runtime-ID pairings are read safely but are not silently trusted when their endpoints cannot be proven against current topology. The first run after upgrade may request one calibration pass and then writes the new schema atomically.
+The pairing file moves to a version-two schema. Existing version-one runtime-ID/UUID pairings are parsed safely but never trusted across the migration because neither endpoint can be proven. The first run after upgrade requests calibration and writes the new schema atomically.
+
+The boot-session marker is derived from documented Foundation wall-clock and system-uptime values. If clock correction makes the marker uncertain, the safe failure mode is another calibration rather than an incorrect click destination.
 
 ## Verification
 
 Tests must cover:
 
-- unchanged topology with changed USB location IDs and display UUIDs;
+- same-boot process restart with unchanged runtime identifiers;
+- new boot with ambiguous or changed runtime identifiers;
+- cross-boot restoration only with unique public hardware descriptors;
 - identical display EDID and duplicate USB serial values;
-- changed USB or display connection routes requiring calibration;
 - live display-bound changes with unchanged topology;
 - staged login enumeration and debounced reconciliation;
 - CoreGraphics/AppKit screen-readiness lag and overlay retry;
