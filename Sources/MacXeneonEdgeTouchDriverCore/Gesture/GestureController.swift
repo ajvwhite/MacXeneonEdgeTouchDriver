@@ -21,8 +21,10 @@ public final class GestureController {
     private var pendingHold: DispatchWorkItem?
     private var pendingMouseUp: DispatchWorkItem?
     private var pendingCursorReturn: DispatchWorkItem?
+    private var pendingFocusRestore: DispatchWorkItem?
     private var lastCompletedTouchTimestamp: DispatchTime?
     private var eligibleFirstTap: EligibleTap?
+    private var hasCapturedFocus = false
 
     public init(
         mapperProvider: @escaping () -> CoordinateMapper?,
@@ -51,7 +53,11 @@ public final class GestureController {
 
         switch (state, event.kind) {
         case (.idle, .down):
-            beginContact(event, at: point)
+            let continuesTapSequence = isSecondTapCandidate(at: point, timestamp: event.timestamp)
+            if eligibleFirstTap != nil, !continuesTapSequence {
+                finalizeTapSequenceFocus()
+            }
+            beginContact(event, at: point, continuesTapSequence: continuesTapSequence)
         case (.singleTouch(let context), .move):
             guard context.contactID == event.contactID else { return }
             handleMove(event, at: point, context: context)
@@ -60,8 +66,14 @@ public final class GestureController {
             finishContact(event, at: point, context: context)
         case (.idle, .move), (.idle, .up):
             DriverLoggers.log(.debug, category: .gesture, "Ignoring touch event while idle.")
-        case (.singleTouch, .down):
-            DriverLoggers.log(.warning, category: .gesture, "Received touch down while already tracking a contact.")
+        case (.singleTouch(let context), .down):
+            guard context.phase == .finishingTap,
+                  isSecondTapCandidate(at: point, timestamp: event.timestamp) else {
+                DriverLoggers.log(.warning, category: .gesture, "Received touch down while already tracking a contact.")
+                return
+            }
+            completeFinishingTapImmediately(context)
+            beginContact(event, at: point, continuesTapSequence: true)
         }
     }
 
@@ -76,7 +88,7 @@ public final class GestureController {
         switch state {
         case .idle:
             cursorController.forceShow()
-            focusRestorer.discardCapturedWindow()
+            finalizeCapturedFocus()
         case .singleTouch(let context):
             switch context.phase {
             case .scrolling:
@@ -87,16 +99,33 @@ public final class GestureController {
                 break
             }
             cursorController.returnToOrigin()
-            focusRestorer.restoreCapturedWindow()
+            finalizeCapturedFocus()
             transitionToIdle()
         }
     }
 
-    private func beginContact(_ event: TouchEvent, at point: CGPoint) {
-        guard !isDebounced(event.timestamp) else { return }
-        focusRestorer.captureFocusedWindow()
+    private func beginContact(
+        _ event: TouchEvent,
+        at point: CGPoint,
+        continuesTapSequence: Bool
+    ) {
+        guard continuesTapSequence || !isDebounced(event.timestamp) else { return }
+
+        if continuesTapSequence {
+            pendingFocusRestore?.cancel()
+            pendingFocusRestore = nil
+        } else {
+            focusRestorer.captureFocusedWindow()
+            hasCapturedFocus = true
+        }
+
         guard cursorController.borrow(warpingTo: point) else {
-            focusRestorer.discardCapturedWindow()
+            if continuesTapSequence {
+                finalizeTapSequenceFocus()
+            } else {
+                focusRestorer.discardCapturedWindow()
+                hasCapturedFocus = false
+            }
             return
         }
 
@@ -110,6 +139,19 @@ public final class GestureController {
             clickCount: 1
         ))
         scheduleHoldToDrag(contactID: event.contactID)
+    }
+
+    private func completeFinishingTapImmediately(_ context: SingleTouchContext) {
+        pendingMouseUp?.cancel()
+        pendingCursorReturn?.cancel()
+
+        if pendingMouseUp != nil {
+            inputSink.postMouseUp(at: context.lastPoint, clickCount: context.clickCount)
+        }
+        pendingMouseUp = nil
+        pendingCursorReturn = nil
+        cursorController.returnToOrigin()
+        transitionToIdle()
     }
 
     private func handleMove(_ event: TouchEvent, at point: CGPoint, context: SingleTouchContext) {
@@ -180,12 +222,12 @@ public final class GestureController {
             resetDoubleClickSequence()
             state = .singleTouch(updated)
             inputSink.postScroll(deltaX: 0, deltaY: 0, phase: .ended)
-            scheduleCursorReturn(contactID: context.contactID)
+            scheduleCursorReturn(contactID: context.contactID, completedTapClickCount: nil)
         case .dragging:
             resetDoubleClickSequence()
             state = .singleTouch(updated)
             inputSink.postMouseUp(at: point, clickCount: 1)
-            scheduleCursorReturn(contactID: context.contactID)
+            scheduleCursorReturn(contactID: context.contactID, completedTapClickCount: nil)
         case .finishingTap:
             break
         }
@@ -214,19 +256,34 @@ public final class GestureController {
                   context.phase == .finishingTap else { return }
             self.inputSink.postMouseUp(at: point, clickCount: clickCount)
             self.pendingMouseUp = nil
-            self.scheduleCursorReturn(contactID: contactID)
+            self.scheduleCursorReturn(
+                contactID: contactID,
+                completedTapClickCount: clickCount
+            )
         }
     }
 
-    private func scheduleCursorReturn(contactID: Int) {
+    private func scheduleCursorReturn(
+        contactID: Int,
+        completedTapClickCount: Int?
+    ) {
         pendingCursorReturn = schedule(after: timing.clickToWarpBackDelayMs) { [weak self] in
             guard let self,
                   case .singleTouch(let context) = self.state,
                   context.contactID == contactID else { return }
             self.cursorController.returnToOrigin()
-            self.focusRestorer.restoreCapturedWindow()
             self.pendingCursorReturn = nil
             self.transitionToIdle()
+
+            if let completedTapClickCount {
+                if completedTapClickCount == 2 {
+                    self.finalizeTapSequenceFocus()
+                } else {
+                    self.scheduleTapSequenceFocusRestore()
+                }
+            } else {
+                self.finalizeTapSequenceFocus()
+            }
         }
     }
 
@@ -239,9 +296,11 @@ public final class GestureController {
         pendingHold?.cancel()
         pendingMouseUp?.cancel()
         pendingCursorReturn?.cancel()
+        pendingFocusRestore?.cancel()
         pendingHold = nil
         pendingMouseUp = nil
         pendingCursorReturn = nil
+        pendingFocusRestore = nil
     }
 
     @discardableResult
@@ -281,6 +340,7 @@ public final class GestureController {
 
         if elapsed <= maximumNanoseconds, distance <= timing.doubleClickDistancePoints {
             eligibleFirstTap = nil
+            DriverLoggers.log(.notice, category: .gesture, "Recognized touchscreen double-click.")
             return 2
         }
 
@@ -290,5 +350,41 @@ public final class GestureController {
 
     private func resetDoubleClickSequence() {
         eligibleFirstTap = nil
+        pendingFocusRestore?.cancel()
+        pendingFocusRestore = nil
+    }
+
+    private func isSecondTapCandidate(at point: CGPoint, timestamp: DispatchTime) -> Bool {
+        guard let firstTap = eligibleFirstTap else { return false }
+
+        let interval = max(0, doubleClickIntervalProvider())
+        let maximumNanoseconds = UInt64(interval * 1_000_000_000)
+        guard timestamp.uptimeNanoseconds >= firstTap.timestamp.uptimeNanoseconds else {
+            return false
+        }
+        let elapsed = timestamp.uptimeNanoseconds - firstTap.timestamp.uptimeNanoseconds
+        let distance = hypot(point.x - firstTap.point.x, point.y - firstTap.point.y)
+        return elapsed <= maximumNanoseconds && distance <= timing.doubleClickDistancePoints
+    }
+
+    private func scheduleTapSequenceFocusRestore() {
+        pendingFocusRestore?.cancel()
+        let delayMilliseconds = Int(ceil(max(0, doubleClickIntervalProvider()) * 1_000))
+        pendingFocusRestore = schedule(after: delayMilliseconds) { [weak self] in
+            guard let self, self.eligibleFirstTap != nil else { return }
+            self.pendingFocusRestore = nil
+            self.finalizeTapSequenceFocus()
+        }
+    }
+
+    private func finalizeTapSequenceFocus() {
+        resetDoubleClickSequence()
+        finalizeCapturedFocus()
+    }
+
+    private func finalizeCapturedFocus() {
+        guard hasCapturedFocus else { return }
+        hasCapturedFocus = false
+        focusRestorer.restoreCapturedWindow()
     }
 }

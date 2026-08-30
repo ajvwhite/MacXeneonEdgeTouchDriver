@@ -188,7 +188,8 @@ final class GestureControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .idle)
     }
 
-    func testSingleTapCapturesAndRestoresFocusedWindow() {
+    func testSingleTapDefersFocusUntilDoubleClickWindowExpires() {
+        let queue = DispatchQueue(label: "MacXeneonEdgeTouchDriverTests.single-tap-focus")
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
         let focus = RecordingFocusRestorer()
@@ -198,18 +199,94 @@ final class GestureControllerTests: XCTestCase {
                 cleanupOrder.append("cursorReturn")
             }
         }
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            focus: focus,
+            doubleClickIntervalProvider: { 0.05 },
+            schedulingQueue: queue
+        )
+        let focusRestored = expectation(description: "single tap focus restored after double-click interval")
         focus.onCall = { call in
             if case .restoreCapturedWindow = call {
                 cleanupOrder.append("focusRestore")
+                focusRestored.fulfill()
             }
         }
-        let controller = makeController(input: input, cursor: cursor, focus: focus)
 
         controller.handle(event(.down, rawX: 0, rawY: 0))
         controller.handle(event(.up, rawX: 0, rawY: 0))
 
+        XCTAssertEqual(focus.calls, [.captureFocusedWindow])
+        XCTAssertEqual(cleanupOrder, ["cursorReturn"])
+
+        wait(for: [focusRestored], timeout: 1)
         XCTAssertEqual(focus.calls, [.captureFocusedWindow, .restoreCapturedWindow])
         XCTAssertEqual(cleanupOrder, ["cursorReturn", "focusRestore"])
+    }
+
+    func testDoubleClickRestoresFocusOnceAfterSecondClick() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let focus = RecordingFocusRestorer()
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            focus: focus,
+            doubleClickIntervalProvider: { 0.5 }
+        )
+
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_000_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_050_000_000))
+
+        XCTAssertEqual(input.mouseClickCounts, [1, 1])
+        XCTAssertEqual(focus.calls, [.captureFocusedWindow])
+
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_200_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_250_000_000))
+
+        XCTAssertEqual(input.mouseClickCounts, [1, 1, 2, 2])
+        XCTAssertEqual(focus.calls, [.captureFocusedWindow, .restoreCapturedWindow])
+    }
+
+    func testFastSecondTouchCompletesFirstCleanupAndBypassesTapDebounce() {
+        let queue = DispatchQueue(label: "MacXeneonEdgeTouchDriverTests.fast-double-click")
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let focus = RecordingFocusRestorer()
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            focus: focus,
+            timing: GestureTiming(
+                warpToClickDelayMs: 0,
+                downToUpDelayMs: 50,
+                clickToWarpBackDelayMs: 50,
+                tapDebounceMs: 50
+            ),
+            doubleClickIntervalProvider: { 0.5 },
+            schedulingQueue: queue
+        )
+        let cleanupSettled = expectation(description: "fast double-click cleanup settled")
+
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_000_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_010_000_000))
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_020_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_040_000_000))
+        queue.asyncAfter(deadline: .now() + .milliseconds(150)) {
+            cleanupSettled.fulfill()
+        }
+
+        wait(for: [cleanupSettled], timeout: 1)
+        XCTAssertEqual(input.mouseClickCounts, [1, 1, 2, 2])
+        XCTAssertEqual(cursor.calls, [
+            .borrow(CGPoint(x: 100, y: 200)),
+            .returnToOrigin,
+            .borrow(CGPoint(x: 100, y: 200)),
+            .returnToOrigin
+        ])
+        XCTAssertEqual(focus.calls, [.captureFocusedWindow, .restoreCapturedWindow])
+        XCTAssertEqual(controller.state, .idle)
     }
 
     func testForceCancelRestoresFocusedWindow() {

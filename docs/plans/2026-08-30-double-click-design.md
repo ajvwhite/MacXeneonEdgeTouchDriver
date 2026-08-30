@@ -45,7 +45,7 @@ A distant or incompatible next gesture closes the previous focus transaction bef
 
 ## Verification
 
-Tests cover:
+Automated tests cover:
 
 - a successful ordinary double-click with click counts `1` then `2`;
 - a fast second down during first-click cleanup;
@@ -54,9 +54,9 @@ Tests cover:
 - one deferred focus restoration after a single click;
 - one post-sequence focus restoration after a double-click;
 - no focus restoration between the two clicks;
-- no synthetic mouse event from the focus restorer;
-- exact application/window activation and verification failures that log without clicking;
 - taps outside the time or distance tolerance and resets after click two or non-tap gestures.
+
+A source audit verifies that the focus restorer contains no synthetic mouse event or coordinate-based title-bar logic. Local signed acceptance verifies exact application/window activation and confirms that failures log without clicking.
 
 Existing tap, scrolling, hold-to-drag, routing, persistence, and startup tests must continue to pass with warnings treated as errors, followed by a release build and local signed reinstall. Manual acceptance covers Spotify track playback and a browser double-click target; neither receives app-specific code.
 

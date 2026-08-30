@@ -13,7 +13,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
     private let gestureQueue = DispatchQueue(label: "\(DriverLoggers.subsystem).gesture-queue")
     private let inputSink: SyntheticInputSink
     private let cursorController: CursorController
-    private let focusRestorer: FocusRestorer
+    private let focusRestorerProvider: () -> FocusRestorer
 
     private lazy var hidMonitor = HIDDeviceMonitor(
         eventQueue: gestureQueue,
@@ -44,7 +44,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
             displayResolver: DisplayResolver(configuration: configuration.display),
             inputSink: CGEventInputSink(),
             cursorController: CGCursorController(),
-            focusRestorer: AXFocusRestorer(),
+            focusRestorerProvider: { AXFocusRestorer() },
             pairingStore: PairingStore(),
             pairingOverlay: PairingOverlayController()
         )
@@ -55,7 +55,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
         displayResolver: DisplayResolver,
         inputSink: SyntheticInputSink,
         cursorController: CursorController,
-        focusRestorer: FocusRestorer = NoOpFocusRestorer(),
+        focusRestorerProvider: @escaping () -> FocusRestorer = { NoOpFocusRestorer() },
         pairingStore: PairingStore = PairingStore(),
         pairingOverlay: PairingOverlayPresenting = PairingOverlayController()
     ) {
@@ -63,7 +63,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
         self.displayResolver = displayResolver
         self.inputSink = inputSink
         self.cursorController = cursorController
-        self.focusRestorer = focusRestorer
+        self.focusRestorerProvider = focusRestorerProvider
         self.pairingStore = pairingStore
         self.pairingOverlay = pairingOverlay
     }
@@ -201,7 +201,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
             mapperProvider: { [mapperStore] in mapperStore.currentMapper },
             inputSink: inputSink,
             cursorController: cursorController,
-            focusRestorer: focusRestorer,
+            focusRestorer: focusRestorerProvider(),
             timing: GestureTiming(configuration: configuration.timing, gesture: configuration.gesture),
             doubleClickIntervalProvider: { NSEvent.doubleClickInterval },
             schedulingQueue: gestureQueue

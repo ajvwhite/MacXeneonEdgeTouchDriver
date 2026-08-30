@@ -3,6 +3,30 @@ import CoreGraphics
 import XCTest
 
 final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
+    func testEachControllerGetsIndependentFocusRestorer() {
+        let left = display(id: 41, runtimeIdentifier: "LEFT", x: 0)
+        let right = display(id: 42, runtimeIdentifier: "RIGHT", x: 2_000)
+        let resolver = DisplayResolver(activeDisplayProvider: { [left, right] })
+        var focusRestorerCount = 0
+        let application = MacXeneonEdgeTouchDriverApplication(
+            configuration: immediateConfiguration(),
+            displayResolver: resolver,
+            inputSink: ApplicationRecordingInputSink(),
+            cursorController: ApplicationRecordingCursorController(),
+            focusRestorerProvider: {
+                focusRestorerCount += 1
+                return NoOpFocusRestorer()
+            },
+            pairingStore: pairingStore(),
+            pairingOverlay: ApplicationRecordingPairingOverlay()
+        )
+
+        application.handleDeviceMatched(TouchDeviceIdentity(locationID: 1))
+        application.handleDeviceMatched(TouchDeviceIdentity(locationID: 2))
+
+        XCTAssertEqual(focusRestorerCount, 2)
+    }
+
     func testTwoPersistedControllersRouteToDifferentDisplays() throws {
         let left = display(id: 41, runtimeIdentifier: "LEFT", x: 0)
         let right = display(id: 42, runtimeIdentifier: "RIGHT", x: 2_000)

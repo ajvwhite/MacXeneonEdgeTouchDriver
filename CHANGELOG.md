@@ -8,6 +8,8 @@
 - Debounces HID and display changes, follows live display bounds, and retries calibration presentation while AppKit finishes login-time display enumeration.
 - Migrates version-one runtime UUID pairings safely to an atomic version-two pairing file.
 - Lets local installers supply a stable signing identity so macOS privacy approval can survive executable upgrades.
+- Recognizes a fast second tap even when it arrives during the first click's delayed cleanup and emits the macOS click-count sequence `1`, then `2`.
+- Restores the previously focused application and exact window with documented activation and Accessibility APIs, without a synthetic title-bar click.
 
 ## 1.0.0 - 2026-05-03
 

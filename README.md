@@ -125,6 +125,8 @@ Gesture behavior:
 - Move immediately: pixel-precise scroll.
 - Hold still for `holdToDragMs`, then move: mouse drag.
 
+The driver keeps focus on the touched application while a second tap remains possible. After a single- or double-click sequence, it restores the previously focused application and exact window through AppKit and Accessibility—without generating another mouse click on the original display.
+
 No controller location IDs, display IDs, serials, screen positions, or machine-specific routes are built into the driver. Matching devices are discovered at runtime, compatible displays are selected from the display configuration, and the pairing overlay creates the local one-to-one assignments.
 
 ## Acknowledgements and Provenance
