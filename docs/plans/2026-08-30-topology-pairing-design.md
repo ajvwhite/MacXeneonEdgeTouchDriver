@@ -50,4 +50,4 @@ Tests must cover:
 - hot removal and reattachment affecting only the relevant pairing;
 - safe version-one migration and atomic version-two persistence.
 
-The full existing gesture, focus, display, configuration, and logging test suite remains part of acceptance. Installation is local only unless the user separately approves a PR update.
+The full existing gesture, focus, display, configuration, and logging test suite remains part of acceptance.

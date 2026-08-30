@@ -127,7 +127,7 @@ Gesture behavior:
 
 The driver keeps focus on the touched application while a second tap remains possible. After a single- or double-click sequence, it restores the previously focused application and exact window through AppKit and Accessibility—without generating another mouse click on the original display.
 
-No controller location IDs, display IDs, serials, screen positions, or machine-specific routes are built into the driver. Matching devices are discovered at runtime, compatible displays are selected from the display configuration, and the pairing overlay creates the local one-to-one assignments.
+Matching devices and compatible displays are discovered at runtime. The pairing overlay creates the one-to-one assignments for the attached hardware and live display arrangement.
 
 ## Acknowledgements and Provenance
 

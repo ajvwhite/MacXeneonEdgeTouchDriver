@@ -59,7 +59,3 @@ Automated tests cover:
 A source audit verifies that the focus restorer contains no synthetic mouse event or coordinate-based title-bar logic. Local signed acceptance verifies exact application/window activation and confirms that failures log without clicking.
 
 Existing tap, scrolling, hold-to-drag, routing, persistence, and startup tests must continue to pass with warnings treated as errors, followed by a release build and local signed reinstall. Manual acceptance covers Spotify track playback and a browser double-click target; neither receives app-specific code.
-
-## Release Boundary
-
-This change remains local and unpushed. PR #3 is not modified without separate explicit approval.
