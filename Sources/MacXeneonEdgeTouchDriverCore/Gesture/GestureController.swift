@@ -119,16 +119,6 @@ public final class GestureController {
             hasCapturedFocus = true
         }
 
-        guard cursorController.borrow(warpingTo: point) else {
-            if continuesTapSequence {
-                finalizeTapSequenceFocus()
-            } else {
-                focusRestorer.discardCapturedWindow()
-                hasCapturedFocus = false
-            }
-            return
-        }
-
         state = .singleTouch(SingleTouchContext(
             contactID: event.contactID,
             startPoint: point,
@@ -172,6 +162,7 @@ public final class GestureController {
             pendingHold?.cancel()
             pendingHold = nil
             resetDoubleClickSequence()
+            guard borrowCursor(at: context.startPoint) else { return }
             updated.phase = .scrolling
             state = .singleTouch(updated)
             inputSink.postScroll(
@@ -207,6 +198,7 @@ public final class GestureController {
 
         switch context.phase {
         case .pending:
+            guard borrowCursor(at: context.startPoint) else { return }
             let clickCount = clickCountForTap(at: context.startPoint, timestamp: event.timestamp)
             updated.phase = .finishingTap
             updated.lastPoint = context.startPoint
@@ -239,12 +231,13 @@ public final class GestureController {
                   case .singleTouch(var context) = self.state,
                   context.contactID == contactID,
                   context.phase == .pending else { return }
+            self.pendingHold = nil
+            guard self.borrowCursor(at: context.startPoint) else { return }
             context.phase = .dragging
             context.clickCount = 1
             self.state = .singleTouch(context)
             self.resetDoubleClickSequence()
             self.inputSink.postMouseDown(at: context.startPoint, clickCount: 1)
-            self.pendingHold = nil
         }
     }
 
@@ -290,6 +283,20 @@ public final class GestureController {
     private func transitionToIdle() {
         state = .idle
         onBecameIdle?()
+    }
+
+    private func borrowCursor(at point: CGPoint) -> Bool {
+        guard cursorController.borrow(warpingTo: point) else {
+            if eligibleFirstTap != nil {
+                finalizeTapSequenceFocus()
+            } else {
+                focusRestorer.discardCapturedWindow()
+                hasCapturedFocus = false
+            }
+            transitionToIdle()
+            return false
+        }
+        return true
     }
 
     private func cancelPendingWork() {

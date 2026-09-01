@@ -3,6 +3,21 @@ import MacXeneonEdgeTouchDriverCore
 import XCTest
 
 final class GestureControllerTests: XCTestCase {
+    func testTouchDownDoesNotBorrowOrMoveCursorBeforeGestureClassification() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(input: input, cursor: cursor)
+
+        controller.handle(event(.down, rawX: 0, rawY: 0))
+
+        XCTAssertTrue(cursor.calls.isEmpty)
+        XCTAssertTrue(input.calls.isEmpty)
+        guard case .singleTouch(let context) = controller.state else {
+            return XCTFail("Expected a pending touch")
+        }
+        XCTAssertEqual(context.phase, .pending)
+    }
+
     func testSingleTapBorrowsClicksAndReturnsCursor() {
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
@@ -173,7 +188,7 @@ final class GestureControllerTests: XCTestCase {
         XCTAssertEqual(input.mouseClickCounts, [1, 1, 1, 1])
     }
 
-    func testBorrowFailureDropsTouchDown() {
+    func testBorrowFailureDropsTapBeforeSyntheticInput() {
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
         let focus = RecordingFocusRestorer()
@@ -181,6 +196,7 @@ final class GestureControllerTests: XCTestCase {
         let controller = makeController(input: input, cursor: cursor, focus: focus)
 
         controller.handle(event(.down, rawX: 0, rawY: 0))
+        controller.handle(event(.up, rawX: 0, rawY: 0))
 
         XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200))])
         XCTAssertEqual(focus.calls, [.captureFocusedWindow, .discardCapturedWindow])
@@ -423,7 +439,7 @@ final class GestureControllerTests: XCTestCase {
 
         wait(for: [delayedWorkSettled], timeout: 1.0)
         XCTAssertTrue(input.calls.isEmpty)
-        XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200)), .returnToOrigin])
+        XCTAssertEqual(cursor.calls, [.returnToOrigin])
         XCTAssertEqual(controller.state, .idle)
     }
 

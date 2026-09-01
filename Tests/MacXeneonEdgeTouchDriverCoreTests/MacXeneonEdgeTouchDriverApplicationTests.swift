@@ -32,8 +32,8 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
         let right = display(id: 42, runtimeIdentifier: "RIGHT", x: 2_000)
         let resolver = DisplayResolver(activeDisplayProvider: { [left, right] })
         let store = pairingStore()
-        let first = TouchDeviceIdentity(locationID: 0x0014_0000)
-        let second = TouchDeviceIdentity(locationID: 0x0110_0000)
+        let first = TouchDeviceIdentity(locationID: 1)
+        let second = TouchDeviceIdentity(locationID: 2)
         let devices: Set = [first, second]
         try store.assign(device: first, to: left, connectedDevices: devices, displays: [left, right])
         try store.assign(device: second, to: right, connectedDevices: devices, displays: [left, right])
@@ -63,12 +63,72 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
         ])
     }
 
+    func testStormOnOneControllerProducesNoInputAndDoesNotDisableOtherController() throws {
+        let left = display(id: 41, runtimeIdentifier: "LEFT", x: 0)
+        let right = display(id: 42, runtimeIdentifier: "RIGHT", x: 2_000)
+        let resolver = DisplayResolver(activeDisplayProvider: { [left, right] })
+        let store = pairingStore()
+        let storming = TouchDeviceIdentity(locationID: 11)
+        let healthy = TouchDeviceIdentity(locationID: 12)
+        let devices: Set = [storming, healthy]
+        try store.assign(device: storming, to: left, connectedDevices: devices, displays: [left, right])
+        try store.assign(device: healthy, to: right, connectedDevices: devices, displays: [left, right])
+        let input = ApplicationRecordingInputSink()
+        let application = MacXeneonEdgeTouchDriverApplication(
+            configuration: immediateConfiguration(),
+            displayResolver: resolver,
+            inputSink: input,
+            cursorController: ApplicationRecordingCursorController(),
+            pairingStore: store,
+            pairingOverlay: ApplicationRecordingPairingOverlay()
+        )
+
+        application.handleDeviceMatched(storming)
+        application.handleDeviceMatched(healthy)
+        application.handleTouchEvent(deviceEvent(
+            storming,
+            .down,
+            rawX: 10_410,
+            rawY: 6_120,
+            timestampNanoseconds: 1_000_000_000
+        ))
+        application.handleTouchEvent(deviceEvent(
+            storming,
+            .move,
+            rawX: 11_264,
+            rawY: 4_533,
+            timestampNanoseconds: 1_008_000_000
+        ))
+
+        XCTAssertTrue(input.calls.isEmpty)
+
+        application.handleTouchEvent(deviceEvent(
+            healthy,
+            .down,
+            rawX: 0,
+            rawY: 0,
+            timestampNanoseconds: 2_000_000_000
+        ))
+        application.handleTouchEvent(deviceEvent(
+            healthy,
+            .up,
+            rawX: 0,
+            rawY: 0,
+            timestampNanoseconds: 2_100_000_000
+        ))
+
+        XCTAssertEqual(input.calls, [
+            .mouseDown(CGPoint(x: 2_000, y: 200)),
+            .mouseUp(CGPoint(x: 2_000, y: 200))
+        ])
+    }
+
     func testRawTouchPairsControllerToDisplayedTargetAndSuppressesThatContact() {
         let target = display(id: 41, runtimeIdentifier: "TARGET", x: 100)
         let resolver = DisplayResolver(activeDisplayProvider: { [target] })
         let store = pairingStore()
         let overlay = ApplicationRecordingPairingOverlay()
-        let device = TouchDeviceIdentity(locationID: 0x0014_0000)
+        let device = TouchDeviceIdentity(locationID: 1)
         let input = ApplicationRecordingInputSink()
         let application = MacXeneonEdgeTouchDriverApplication(
             configuration: immediateConfiguration(),
@@ -345,11 +405,18 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
         _ device: TouchDeviceIdentity,
         _ kind: TouchEvent.Kind,
         rawX: Int,
-        rawY: Int
+        rawY: Int,
+        timestampNanoseconds: UInt64? = nil
     ) -> DeviceTouchEvent {
         DeviceTouchEvent(
             device: device,
-            touch: TouchEvent(kind: kind, contactID: 0, rawX: rawX, rawY: rawY, timestamp: .now())
+            touch: TouchEvent(
+                kind: kind,
+                contactID: 0,
+                rawX: rawX,
+                rawY: rawY,
+                timestamp: timestampNanoseconds.map(DispatchTime.init(uptimeNanoseconds:)) ?? .now()
+            )
         )
     }
 

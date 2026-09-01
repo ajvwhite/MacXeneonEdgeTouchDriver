@@ -6,12 +6,9 @@ Keep calibration overlays and touch mappings attached to the intended compatible
 
 ## Observed failure
 
-After replacing the connected display topology without rebooting, CoreGraphics reported:
+After replacing the connected display topology without rebooting, CoreGraphics reported one non-touch main display and two compatible touch displays with newly assigned runtime IDs.
 
-- the Samsung main display as display ID 5;
-- two compatible `12.3FHD` touch displays as display IDs 3 and 4.
-
-The driver correctly chose compatible display ID 4 as the next pairing target, but its AppKit overlay window appeared at the main display origin. A fresh process saw the correct `NSScreen` geometry while the long-running driver window remained on the Samsung. The pairing file also retained an older same-boot record in which display ID 5 described a touch panel, proving that numeric display IDs can be reused during one boot after a topology replacement.
+The driver correctly chose a compatible touch display as the next pairing target, but its AppKit overlay window appeared at the main-display origin. A fresh process saw the correct `NSScreen` geometry while the long-running driver retained stale geometry. The pairing file also retained an older same-boot record in which the current main-display ID had described a touch panel, proving that numeric display IDs can be reused during one boot after a topology replacement.
 
 Installation testing exposed a related persistence defect: deriving boot time from wall clock minus `ProcessInfo.systemUptime` changed after sleep because that uptime does not include the full sleeping interval on this Mac. The documented Darwin `sysctlbyname` interface exposes `KERN_BOOTTIME` as a `timeval`; that kernel value becomes the boot-session authority. If it is unavailable, the driver uses a namespaced conservative fallback that may request extra calibration but cannot match a kernel-backed marker accidentally.
 
@@ -87,7 +84,7 @@ Automated tests cover:
 - preventing touch from pairing while presentation is unverified;
 - all existing routing, gesture, focus, startup, persistence, and configuration behavior.
 
-Acceptance finishes with warnings-as-errors tests, a release build, signed local installation, and live verification with the Samsung main display plus both `12.3FHD` touch panels. The overlay must appear only on the requested touch panel after a topology change.
+Acceptance finishes with warnings-as-errors tests, a release build, signed local installation, and live verification with a non-touch main display plus two matching touch panels. The overlay must appear only on the requested touch panel after a topology change.
 
 ## Release boundary
 

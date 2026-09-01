@@ -14,6 +14,8 @@
 - Invalidates ambiguous runtime pairings on hardware membership changes while preserving mappings across bounds-only rearrangement.
 - Verifies AppKit screen identity and geometry before showing calibration, retrying instead of placing the overlay on another display.
 - Uses the documented kernel boot time for same-boot persistence so sleep does not invalidate pairings, and prunes expired runtime records on load.
+- Rejects physically implausible per-controller touch storms before they can move the cursor or produce clicks, scrolling, or dragging, without disabling other attached touchscreens.
+- Extends `HIDDump` with wall-clock timestamps and dynamic controller location IDs for evidence-based multi-controller diagnostics.
 
 ## 1.0.0 - 2026-05-03
 

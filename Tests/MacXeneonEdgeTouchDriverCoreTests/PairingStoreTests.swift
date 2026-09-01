@@ -6,7 +6,7 @@ import XCTest
 final class PairingStoreTests: XCTestCase {
     func testRuntimeAssignmentPersistsAcrossProcessRestartInSameBoot() throws {
         let url = temporaryURL()
-        let device = TouchDeviceIdentity(locationID: 0x0110_0000)
+        let device = TouchDeviceIdentity(locationID: 1)
         let display = makeDisplay(id: 41, serial: 0)
         let first = PairingStore(url: url, bootSessionIdentifier: "BOOT-A")
 

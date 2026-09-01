@@ -184,6 +184,31 @@ public final class MacXeneonEdgeTouchDriverApplication {
     }
 
     func handleTouchEvent(_ event: DeviceTouchEvent) {
+        if !connectedDevices.contains(event.device) {
+            connectedDevices.insert(event.device)
+            ensureSession(for: event.device)
+        }
+        guard let session = sessions[event.device] else { return }
+
+        let validation = session.validator.process(event.touch)
+        if validation.rejectedStream {
+            suppressedUntilUp.remove(event.device)
+            DriverLoggers.log(
+                .warning,
+                category: .gesture,
+                "Suppressed physically implausible touch stream from \(event.device.hexadecimalLocationID)."
+            )
+            session.gesture.forceCancel()
+            if activeGestureDevice == event.device { activeGestureDevice = nil }
+            cancelStuckGestureTimer()
+        }
+
+        for touch in validation.events {
+            routeValidatedTouchEvent(DeviceTouchEvent(device: event.device, touch: touch))
+        }
+    }
+
+    private func routeValidatedTouchEvent(_ event: DeviceTouchEvent) {
         if suppressedUntilUp.contains(event.device) {
             if event.touch.kind == .up {
                 suppressedUntilUp.remove(event.device)
@@ -194,16 +219,6 @@ public final class MacXeneonEdgeTouchDriverApplication {
         if pairingTarget != nil {
             handlePairingTouch(event)
             return
-        }
-
-        if !connectedDevices.contains(event.device) {
-            connectedDevices.insert(event.device)
-            ensureSession(for: event.device)
-            refreshDisplayMappings(reason: "touch from newly observed controller")
-            if pairingTarget != nil {
-                handlePairingTouch(event)
-                return
-            }
         }
 
         if sessions[event.device]?.mapperStore.currentMapper == nil {
@@ -250,7 +265,11 @@ public final class MacXeneonEdgeTouchDriverApplication {
             if self.activeGestureDevice == device { self.activeGestureDevice = nil }
             self.cancelStuckGestureTimer()
         }
-        sessions[device] = DeviceTouchSession(mapperStore: mapperStore, gesture: gesture)
+        sessions[device] = DeviceTouchSession(
+            mapperStore: mapperStore,
+            gesture: gesture,
+            validator: TouchStreamValidator()
+        )
     }
 
     func refreshDisplayMappings(reason: String) {
@@ -289,6 +308,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
             let mapper = display.map { CoordinateMapper(displayBounds: $0.bounds) }
             if mapper == nil, sessions[device]?.mapperStore.currentMapper != nil {
                 sessions[device]?.gesture.forceCancel()
+                sessions[device]?.validator.reset()
                 if activeGestureDevice == device { activeGestureDevice = nil }
             }
             sessions[device]?.mapperStore.currentMapper = mapper
@@ -512,10 +532,12 @@ public final class MacXeneonEdgeTouchDriverApplication {
 private final class DeviceTouchSession {
     let mapperStore: CoordinateMapperStore
     let gesture: GestureController
+    let validator: TouchStreamValidator
 
-    init(mapperStore: CoordinateMapperStore, gesture: GestureController) {
+    init(mapperStore: CoordinateMapperStore, gesture: GestureController, validator: TouchStreamValidator) {
         self.mapperStore = mapperStore
         self.gesture = gesture
+        self.validator = validator
     }
 }
 

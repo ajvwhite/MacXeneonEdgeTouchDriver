@@ -11,10 +11,14 @@ private final class ReportRegistration {
     let device: IOHIDDevice
     let buffer: UnsafeMutablePointer<UInt8>
     let length: CFIndex
+    let locationID: UInt32?
+    unowned let application: HIDDumpApplication
 
-    init(device: IOHIDDevice, length: Int) {
+    init(device: IOHIDDevice, length: Int, locationID: UInt32?, application: HIDDumpApplication) {
         self.device = device
         self.length = CFIndex(length)
+        self.locationID = locationID
+        self.application = application
         self.buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: length)
         self.buffer.initialize(repeating: 0, count: length)
     }
@@ -26,6 +30,21 @@ private final class ReportRegistration {
 
     func matches(_ otherDevice: IOHIDDevice) -> Bool {
         CFEqual(device, otherDevice)
+    }
+
+    func handleInputReport(
+        type: IOHIDReportType,
+        reportID: UInt32,
+        report: UnsafeMutablePointer<UInt8>,
+        reportLength: CFIndex
+    ) {
+        application.handleInputReport(
+            locationID: locationID,
+            type: type,
+            reportID: reportID,
+            report: report,
+            reportLength: reportLength
+        )
     }
 }
 
@@ -80,7 +99,9 @@ private final class HIDDumpApplication {
 
         let registration = ReportRegistration(
             device: device,
-            length: maxInputReportLength(for: device)
+            length: maxInputReportLength(for: device),
+            locationID: deviceLocationID(device),
+            application: self
         )
         reportRegistrations.append(registration)
 
@@ -89,10 +110,11 @@ private final class HIDDumpApplication {
             registration.buffer,
             registration.length,
             inputReportCallback,
-            UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+            UnsafeMutableRawPointer(Unmanaged.passUnretained(registration).toOpaque())
         )
 
         print("Device matched:")
+        print("  locationID: \(formatLocationID(registration.locationID))")
         print("  manufacturer: \(deviceProperty(device, key: kIOHIDManufacturerKey) ?? "Unknown")")
         print("  product: \(deviceProperty(device, key: kIOHIDProductKey) ?? "Unknown")")
         print("  transport: \(deviceProperty(device, key: kIOHIDTransportKey) ?? "Unknown")")
@@ -133,6 +155,7 @@ private final class HIDDumpApplication {
     }
 
     fileprivate func handleInputReport(
+        locationID: UInt32?,
         type: IOHIDReportType,
         reportID: UInt32,
         report: UnsafeMutablePointer<UInt8>,
@@ -146,6 +169,8 @@ private final class HIDDumpApplication {
         print(
             [
                 "raw #\(rawReportCount)",
+                "wallTime=\(ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime, .withFractionalSeconds]))",
+                "locationID=\(formatLocationID(locationID))",
                 "type=\(reportTypeName(type))",
                 "reportID=\(reportID)",
                 "length=\(reportLength)",
@@ -169,6 +194,10 @@ private final class HIDDumpApplication {
         let property = IOHIDDeviceGetProperty(device, kIOHIDMaxInputReportSizeKey as CFString)
         let propertyValue = (property as? NSNumber)?.intValue ?? defaultReportBufferLength
         return max(propertyValue, defaultReportBufferLength)
+    }
+
+    private func deviceLocationID(_ device: IOHIDDevice) -> UInt32? {
+        (IOHIDDeviceGetProperty(device, kIOHIDLocationIDKey as CFString) as? NSNumber)?.uint32Value
     }
 
     private func deviceProperty(_ device: IOHIDDevice, key: String) -> String? {
@@ -216,8 +245,8 @@ private let inputReportCallback: IOHIDReportCallback = { context, _, _, type, re
         return
     }
 
-    let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
-    application.handleInputReport(type: type, reportID: reportID, report: report, reportLength: reportLength)
+    let registration = Unmanaged<ReportRegistration>.fromOpaque(context).takeUnretainedValue()
+    registration.handleInputReport(type: type, reportID: reportID, report: report, reportLength: reportLength)
 }
 
 private func usagePageName(_ page: UInt32) -> String {
@@ -283,6 +312,11 @@ private func hex<T: FixedWidthInteger>(_ value: T) -> String {
 
 private func formatIOReturn(_ value: IOReturn) -> String {
     String(format: "0x%08X", UInt32(bitPattern: value))
+}
+
+private func formatLocationID(_ value: UInt32?) -> String {
+    guard let value else { return "unknown" }
+    return String(format: "0x%08X", value)
 }
 
 exit(HIDDumpApplication().run())

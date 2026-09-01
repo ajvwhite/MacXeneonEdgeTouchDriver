@@ -127,6 +127,10 @@ Gesture behavior:
 - Move immediately: pixel-precise scroll.
 - Hold still for `holdToDragMs`, then move: mouse drag.
 
+Each controller also has an independent touch-stream validator. It briefly holds initial movement and accepts stable taps plus spatially continuous swipes, while rejecting coordinate jumps and incoherent report bursts that cannot represent plausible finger motion. A rejected controller waits for a short quiet interval before accepting another contact; the other attached touchscreens continue working normally.
+
+This protection was added after a panel controller was captured emitting a raw HID touch storm while the production driver was stopped. The reports contained genuine touch bits but rapidly changing coordinates at the controller's report rate, so they originated upstream of synthetic event generation and could not be distinguished by checking the button byte alone. See [Touch Storm Protection Design](docs/plans/2026-09-01-touch-storm-protection-design.md) for the evidence, referenced hardware documentation, limits, and resulting filter.
+
 The driver keeps focus on the touched application while a second tap remains possible. After a single- or double-click sequence, it restores the previously focused application and exact window through AppKit and Accessibility—without generating another mouse click on the original display.
 
 Matching devices and compatible displays are discovered at runtime. The pairing overlay creates the one-to-one assignments for the attached hardware and live display arrangement.
