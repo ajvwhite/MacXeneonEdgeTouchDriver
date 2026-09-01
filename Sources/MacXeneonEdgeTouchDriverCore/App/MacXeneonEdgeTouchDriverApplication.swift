@@ -18,7 +18,9 @@ public final class MacXeneonEdgeTouchDriverApplication {
     private lazy var hidMonitor = HIDDeviceMonitor(
         eventQueue: gestureQueue,
         seizeDevice: true,
-        touchEventHandler: { [weak self] event in self?.handleTouchEvent(event) },
+        touchReportHandler: { [weak self] device, timestamp, event in
+            self?.handleHIDReport(device: device, timestamp: timestamp, event: event)
+        },
         deviceRemovalHandler: { [weak self] device in self?.handleDeviceRemoval(device) },
         deviceMatchedHandler: { [weak self] device in self?.handleDeviceMatched(device) }
     )
@@ -109,7 +111,10 @@ public final class MacXeneonEdgeTouchDriverApplication {
             cancelStuckGestureTimer()
             pairingAdvanceWork?.cancel()
             reconciliationWork?.cancel()
-            sessions.values.forEach { $0.gesture.forceCancel() }
+            sessions.values.forEach {
+                $0.cancelStormRecoveryTimer()
+                $0.gesture.forceCancel()
+            }
             sessions.removeAll()
             activeGestureDevice = nil
         }
@@ -165,6 +170,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
     func handleDeviceRemoval(_ device: TouchDeviceIdentity) {
         connectedDevices.remove(device)
         suppressedUntilUp.remove(device)
+        sessions[device]?.cancelStormRecoveryTimer()
         if activeGestureDevice == device {
             sessions[device]?.gesture.forceCancel()
             activeGestureDevice = nil
@@ -183,6 +189,22 @@ public final class MacXeneonEdgeTouchDriverApplication {
         scheduleDisplayReconciliation(reason: "HID device removal at \(device.hexadecimalLocationID)")
     }
 
+    func handleHIDReport(
+        device: TouchDeviceIdentity,
+        timestamp: DispatchTime,
+        event: TouchEvent?
+    ) {
+        if let event {
+            handleTouchEvent(DeviceTouchEvent(device: device, touch: event))
+            return
+        }
+        if !connectedDevices.contains(device) {
+            connectedDevices.insert(device)
+            ensureSession(for: device)
+        }
+        sessions[device]?.validator.recordRawReport(at: timestamp)
+    }
+
     func handleTouchEvent(_ event: DeviceTouchEvent) {
         if !connectedDevices.contains(event.device) {
             connectedDevices.insert(event.device)
@@ -191,13 +213,17 @@ public final class MacXeneonEdgeTouchDriverApplication {
         guard let session = sessions[event.device] else { return }
 
         let validation = session.validator.process(event.touch)
-        if validation.rejectedStream {
+        if let trigger = validation.stormStarted {
             suppressedUntilUp.remove(event.device)
             DriverLoggers.log(
                 .warning,
                 category: .gesture,
-                "Suppressed physically implausible touch stream from \(event.device.hexadecimalLocationID)."
+                "Touch storm detected on \(event.device.hexadecimalLocationID): \(trigger.rawValue). Entering confidence-tracking mode."
             )
+            startStormRecoveryTimer(for: event.device)
+        }
+
+        if validation.cancelActiveGesture || validation.rejectedStream {
             session.gesture.forceCancel()
             if activeGestureDevice == event.device { activeGestureDevice = nil }
             cancelStuckGestureTimer()
@@ -309,6 +335,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
             if mapper == nil, sessions[device]?.mapperStore.currentMapper != nil {
                 sessions[device]?.gesture.forceCancel()
                 sessions[device]?.validator.reset()
+                sessions[device]?.cancelStormRecoveryTimer()
                 if activeGestureDevice == device { activeGestureDevice = nil }
             }
             sessions[device]?.mapperStore.currentMapper = mapper
@@ -415,6 +442,78 @@ public final class MacXeneonEdgeTouchDriverApplication {
         stuckGestureTimer?.setEventHandler {}
         stuckGestureTimer?.cancel()
         stuckGestureTimer = nil
+    }
+
+    private func startStormRecoveryTimer(for device: TouchDeviceIdentity) {
+        guard let session = sessions[device], session.stormRecoveryTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: gestureQueue)
+        timer.schedule(
+            deadline: .now() + .seconds(1),
+            repeating: .seconds(1),
+            leeway: .milliseconds(100)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.handleStormRecoveryTick(for: device, at: .now())
+        }
+        session.stormRecoveryTimer = timer
+        session.stormSummaryTickCount = 0
+        timer.resume()
+    }
+
+    func handleStormRecoveryTick(for device: TouchDeviceIdentity, at timestamp: DispatchTime) {
+        guard let session = sessions[device], session.validator.isStormActive else {
+            sessions[device]?.cancelStormRecoveryTimer()
+            return
+        }
+
+        if let recovery = session.validator.recoverIfQuiet(at: timestamp) {
+            session.cancelStormRecoveryTimer()
+            if recovery.cancelActiveGesture {
+                session.gesture.forceCancel()
+                if activeGestureDevice == device { activeGestureDevice = nil }
+                cancelStuckGestureTimer()
+            }
+            let duration = Double(
+                recovery.snapshot.lastReportAtNanoseconds - recovery.snapshot.startedAtNanoseconds
+            ) / 1_000_000_000
+            DriverLoggers.log(
+                .notice,
+                category: .gesture,
+                String(
+                    format: "Touch storm ended on %@ after %.2fs: reports=%d, accepted=%d, dropped=%d, recoveredContacts=%d. Returning to normal mode.",
+                    device.hexadecimalLocationID,
+                    duration,
+                    recovery.snapshot.totalReports,
+                    recovery.snapshot.acceptedSamples,
+                    recovery.snapshot.droppedSamples,
+                    recovery.snapshot.recoveredContacts
+                )
+            )
+            return
+        }
+
+        session.stormSummaryTickCount += 1
+        guard session.stormSummaryTickCount.isMultiple(of: 5),
+              let snapshot = session.validator.stormSnapshot() else { return }
+        let duration = Double(timestamp.uptimeNanoseconds - snapshot.startedAtNanoseconds) / 1_000_000_000
+        DriverLoggers.log(
+            .notice,
+            category: .gesture,
+            String(
+                format: "Touch storm active on %@ for %.2fs: reports=%d, accepted=%d, dropped=%d, recoveredContacts=%d, tracking=%@.",
+                device.hexadecimalLocationID,
+                duration,
+                snapshot.totalReports,
+                snapshot.acceptedSamples,
+                snapshot.droppedSamples,
+                snapshot.recoveredContacts,
+                snapshot.hasAcquiredTrack ? "yes" : "no"
+            )
+        )
+    }
+
+    func hasStormRecoveryTimer(for device: TouchDeviceIdentity) -> Bool {
+        sessions[device]?.stormRecoveryTimer != nil
     }
 
     private func registerDisplayReconfigurationCallback() {
@@ -533,11 +632,24 @@ private final class DeviceTouchSession {
     let mapperStore: CoordinateMapperStore
     let gesture: GestureController
     let validator: TouchStreamValidator
+    var stormRecoveryTimer: DispatchSourceTimer?
+    var stormSummaryTickCount = 0
 
     init(mapperStore: CoordinateMapperStore, gesture: GestureController, validator: TouchStreamValidator) {
         self.mapperStore = mapperStore
         self.gesture = gesture
         self.validator = validator
+    }
+
+    deinit {
+        cancelStormRecoveryTimer()
+    }
+
+    func cancelStormRecoveryTimer() {
+        stormRecoveryTimer?.setEventHandler {}
+        stormRecoveryTimer?.cancel()
+        stormRecoveryTimer = nil
+        stormSummaryTickCount = 0
     }
 }
 

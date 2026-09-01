@@ -3,8 +3,6 @@ import Foundation
 /// Parses the Xeneon Edge's observed single-touch input report format.
 public final class HIDValueParser {
     private var isTouching = false
-    private var lastRawX: Int?
-    private var lastRawY: Int?
 
     /// Creates a parser with no active touch state.
     public init() {}
@@ -12,8 +10,6 @@ public final class HIDValueParser {
     /// Resets parser state, treating the next report as a fresh stream.
     public func reset() {
         isTouching = false
-        lastRawX = nil
-        lastRawY = nil
     }
 
     /// Parses one raw HID input report into zero or one normalized touch events.
@@ -36,11 +32,9 @@ public final class HIDValueParser {
             event = TouchEvent(kind: .down, contactID: 0, rawX: rawX, rawY: rawY, timestamp: timestamp)
 
         case (true, true):
-            if rawX != lastRawX || rawY != lastRawY {
-                event = TouchEvent(kind: .move, contactID: 0, rawX: rawX, rawY: rawY, timestamp: timestamp)
-            } else {
-                event = nil
-            }
+            // Preserve stationary samples for storm-mode confidence tracking. The
+            // validator removes redundant movement before gesture synthesis.
+            event = TouchEvent(kind: .move, contactID: 0, rawX: rawX, rawY: rawY, timestamp: timestamp)
 
         case (true, false):
             event = TouchEvent(kind: .up, contactID: 0, rawX: rawX, rawY: rawY, timestamp: timestamp)
@@ -50,8 +44,6 @@ public final class HIDValueParser {
         }
 
         isTouching = isDown
-        lastRawX = rawX
-        lastRawY = rawY
         return event
     }
 }

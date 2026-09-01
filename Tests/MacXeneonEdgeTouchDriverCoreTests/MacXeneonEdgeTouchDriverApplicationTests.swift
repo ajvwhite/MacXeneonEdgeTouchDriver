@@ -101,6 +101,7 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
         ))
 
         XCTAssertTrue(input.calls.isEmpty)
+        XCTAssertTrue(application.hasStormRecoveryTimer(for: storming))
 
         application.handleTouchEvent(deviceEvent(
             healthy,
@@ -121,6 +122,61 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
             .mouseDown(CGPoint(x: 2_000, y: 200)),
             .mouseUp(CGPoint(x: 2_000, y: 200))
         ])
+
+        application.handleStormRecoveryTick(
+            for: storming,
+            at: DispatchTime(uptimeNanoseconds: 2_100_000_000)
+        )
+        XCTAssertFalse(application.hasStormRecoveryTimer(for: storming))
+    }
+
+    func testStormingControllerRoutesAConfidentTapAndDropsInterleavedOutliers() throws {
+        let target = display(id: 41, runtimeIdentifier: "TARGET", x: 0)
+        let resolver = DisplayResolver(activeDisplayProvider: { [target] })
+        let store = pairingStore()
+        let device = TouchDeviceIdentity(locationID: 11)
+        try store.assign(device: device, to: target, connectedDevices: [device], displays: [target])
+        let input = ApplicationRecordingInputSink()
+        let application = MacXeneonEdgeTouchDriverApplication(
+            configuration: immediateConfiguration(),
+            displayResolver: resolver,
+            inputSink: input,
+            cursorController: ApplicationRecordingCursorController(),
+            pairingStore: store,
+            pairingOverlay: ApplicationRecordingPairingOverlay()
+        )
+        application.handleDeviceMatched(device)
+
+        let reports: [(TouchEvent.Kind, Int, Int, UInt64)] = [
+            (.down, 10_410, 6_120, 1_000_000_000),
+            (.move, 11_264, 4_533, 1_008_000_000),
+            (.down, 8_000, 4_000, 1_020_000_000),
+            (.move, 200, 9_000, 1_028_000_000),
+            (.move, 8_010, 4_005, 1_036_000_000),
+            (.move, 15_000, 300, 1_044_000_000),
+            (.move, 8_020, 4_010, 1_052_000_000),
+            (.move, 8_030, 4_015, 1_068_000_000),
+            (.up, 8_032, 4_015, 1_084_000_000)
+        ]
+        for report in reports {
+            application.handleTouchEvent(deviceEvent(
+                device,
+                report.0,
+                rawX: report.1,
+                rawY: report.2,
+                timestampNanoseconds: report.3
+            ))
+        }
+
+        XCTAssertEqual(input.calls.count, 2)
+        guard case .mouseDown(let downPoint) = input.calls[0],
+              case .mouseUp(let upPoint) = input.calls[1] else {
+            return XCTFail("Expected one recovered click")
+        }
+        XCTAssertEqual(downPoint.x, upPoint.x, accuracy: 0.001)
+        let expectedX = target.bounds.minX + target.bounds.width * 8_000 / 16_383
+        XCTAssertEqual(downPoint.x, expectedX, accuracy: 0.001)
+        application.handleDeviceRemoval(device)
     }
 
     func testRawTouchPairsControllerToDisplayedTargetAndSuppressesThatContact() {
@@ -359,6 +415,7 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
         application.refreshDisplayMappings(reason: "test initial screen readiness")
         waitForAsyncWork(milliseconds: 1_100)
         application.handleTouchEvent(deviceEvent(device, .down, rawX: 0, rawY: 0))
+        application.handleTouchEvent(deviceEvent(device, .up, rawX: 0, rawY: 0))
 
         XCTAssertEqual(overlay.calls.filter {
             if case .show = $0 { return true }

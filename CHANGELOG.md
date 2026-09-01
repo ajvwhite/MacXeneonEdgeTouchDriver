@@ -15,6 +15,9 @@
 - Verifies AppKit screen identity and geometry before showing calibration, retrying instead of placing the overlay on another display.
 - Uses the documented kernel boot time for same-boot persistence so sleep does not invalidate pairings, and prunes expired runtime records on load.
 - Rejects physically implausible per-controller touch storms before they can move the cursor or produce clicks, scrolling, or dragging, without disabling other attached touchscreens.
+- Switches only a confirmed storming controller into bounded confidence tracking so coherent intentional taps and movement can be recovered from interleaved outliers.
+- Logs storm entry, periodic aggregate activity, and automatic recovery after one second of raw-report silence using a storm-only one-second GCD interval.
+- Holds unconfirmed normal contacts outside gesture synthesis, preventing the hold-to-drag timer from turning an initial storm report into a click.
 - Extends `HIDDump` with wall-clock timestamps and dynamic controller location IDs for evidence-based multi-controller diagnostics.
 
 ## 1.0.0 - 2026-05-03

@@ -17,8 +17,8 @@ public enum HIDDeviceMonitorError: Error, LocalizedError, Equatable {
 
 /// Monitors the Xeneon Edge HID device and emits parsed single-touch events.
 public final class HIDDeviceMonitor {
-    /// Receives parsed touch events on the configured event queue.
-    public typealias TouchEventHandler = (DeviceTouchEvent) -> Void
+    /// Receives every valid raw touch report plus its optional lifecycle event.
+    public typealias TouchReportHandler = (TouchDeviceIdentity, DispatchTime, TouchEvent?) -> Void
 
     /// Receives device match events on the configured event queue.
     public typealias DeviceMatchedHandler = (TouchDeviceIdentity) -> Void
@@ -30,7 +30,7 @@ public final class HIDDeviceMonitor {
 
     private let manager: IOHIDManager
     private let eventQueue: DispatchQueue
-    private let touchEventHandler: TouchEventHandler
+    private let touchReportHandler: TouchReportHandler
     private let deviceMatchedHandler: DeviceMatchedHandler
     private let deviceRemovalHandler: DeviceRemovalHandler
     private let openOptions: IOOptionBits
@@ -48,13 +48,13 @@ public final class HIDDeviceMonitor {
     public init(
         eventQueue: DispatchQueue,
         seizeDevice: Bool = true,
-        touchEventHandler: @escaping TouchEventHandler,
+        touchReportHandler: @escaping TouchReportHandler,
         deviceRemovalHandler: @escaping DeviceRemovalHandler,
         deviceMatchedHandler: @escaping DeviceMatchedHandler = { _ in }
     ) {
         self.manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         self.eventQueue = eventQueue
-        self.touchEventHandler = touchEventHandler
+        self.touchReportHandler = touchReportHandler
         self.deviceMatchedHandler = deviceMatchedHandler
         self.deviceRemovalHandler = deviceRemovalHandler
         self.openOptions = seizeDevice
@@ -168,8 +168,14 @@ public final class HIDDeviceMonitor {
         }
     }
 
-    fileprivate func emit(_ event: DeviceTouchEvent) {
-        eventQueue.async { [touchEventHandler] in touchEventHandler(event) }
+    fileprivate func emitReport(
+        device: TouchDeviceIdentity,
+        timestamp: DispatchTime,
+        event: TouchEvent?
+    ) {
+        eventQueue.async { [touchReportHandler] in
+            touchReportHandler(device, timestamp, event)
+        }
     }
 
     private func registerCurrentlyMatchedDevices() {
@@ -244,14 +250,20 @@ private final class HIDReportRegistration {
             return
         }
         let bytes = Array(UnsafeBufferPointer(start: report, count: Int(reportLength)))
+        let timestamp = DispatchTime.now()
+        guard Int(reportID) == XeneonEdgeDevice.touchReportID,
+              bytes.count >= XeneonEdgeDevice.touchReportLength else {
+            return
+        }
         guard let touch = parser.parseReport(
             reportID: Int(reportID),
             bytes: bytes,
-            timestamp: .now()
+            timestamp: timestamp
         ) else {
+            monitor?.emitReport(device: identity, timestamp: timestamp, event: nil)
             return
         }
-        monitor?.emit(DeviceTouchEvent(device: identity, touch: touch))
+        monitor?.emitReport(device: identity, timestamp: timestamp, event: touch)
     }
 }
 

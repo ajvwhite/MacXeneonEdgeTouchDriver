@@ -40,9 +40,11 @@ The validator:
 3. Releases coherent buffered movement in order, preserving normal pixel scrolling and fast continuous swipes.
 4. Rejects severe coordinate jumps, repeated implausibly fast segments, and chaotic paths before they reach gesture synthesis.
 5. Cancels an already accepted gesture safely if an impossible jump appears later.
-6. Suppresses that controller until the raw stream has been quiet for a bounded interval, then automatically accepts new input.
+6. Originally suppressed that controller until the raw stream had been quiet for a bounded interval.
 
 Cursor borrowing is now lazy: a tap borrows the cursor only when it is released, scrolling borrows it only after motion passes validation, and dragging borrows it only after the hold threshold. A rejected initial burst therefore cannot move the cursor or emit synthetic input.
+
+Live testing later showed that whole-controller suppression also hid intentional input while a storm remained active. The follow-up [Active Storm Confidence Tracking Design](2026-09-02-active-storm-confidence-tracking-design.md) replaces that recovery boundary with a per-controller storm mode that extracts coherent finger paths from interleaved outliers and returns to normal after raw-report silence.
 
 ## Boundary and limitations
 
