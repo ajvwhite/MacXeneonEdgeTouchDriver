@@ -4,95 +4,90 @@ import CoreGraphics
 import Darwin
 import Foundation
 
-/// Production application wiring for the Xeneon Edge single-touch driver.
+/// Production wiring for independent, persisted touchscreen-to-display sessions.
 public final class MacXeneonEdgeTouchDriverApplication {
     private let configuration: DriverConfiguration
     private let displayResolver: DisplayResolver
-    private let mapperStore = CoordinateMapperStore()
+    private let pairingStore: PairingStore
+    private let pairingOverlay: PairingOverlayPresenting
     private let gestureQueue = DispatchQueue(label: "\(DriverLoggers.subsystem).gesture-queue")
     private let inputSink: SyntheticInputSink
     private let cursorController: CursorController
-    private let focusRestorer: FocusRestorer
-
-    private lazy var gestureController = GestureController(
-        mapperProvider: { [mapperStore] in
-            mapperStore.currentMapper
-        },
-        inputSink: inputSink,
-        cursorController: cursorController,
-        focusRestorer: focusRestorer,
-        timing: GestureTiming(configuration: configuration.timing),
-        schedulingQueue: gestureQueue
-    )
+    private let focusRestorerProvider: () -> FocusRestorer
 
     private lazy var hidMonitor = HIDDeviceMonitor(
         eventQueue: gestureQueue,
         seizeDevice: true,
-        touchEventHandler: { [weak self] event in
-            self?.handleTouchEvent(event)
+        touchReportHandler: { [weak self] device, timestamp, event in
+            self?.handleHIDReport(device: device, timestamp: timestamp, event: event)
         },
-        deviceRemovalHandler: { [weak self] in
-            self?.handleDeviceRemoval()
-        },
-        deviceMatchedHandler: { [weak self] in
-            self?.handleDeviceMatched()
-        }
+        deviceRemovalHandler: { [weak self] device in self?.handleDeviceRemoval(device) },
+        deviceMatchedHandler: { [weak self] device in self?.handleDeviceMatched(device) }
     )
 
+    private var connectedDevices: Set<TouchDeviceIdentity> = []
+    private var suppressedUntilUp: Set<TouchDeviceIdentity> = []
+    private var sessions: [TouchDeviceIdentity: DeviceTouchSession] = [:]
+    private var compatibleDisplays: [DisplaySnapshot] = []
+    private var pairingTarget: DisplaySnapshot?
+    private var pairingAdvanceWork: DispatchWorkItem?
+    private var reconciliationWork: DispatchWorkItem?
+    private var screenParametersObserver: NSObjectProtocol?
+    private var overlayPresentationAttempt = 0
+    private var activeGestureDevice: TouchDeviceIdentity?
     private var stuckGestureTimer: DispatchSourceTimer?
     private var signalSources: [DispatchSourceSignal] = []
     private var didRegisterDisplayCallback = false
     private var isRunning = false
 
-    /// Creates a production application with CoreGraphics side effects.
     public convenience init(configuration: DriverConfiguration = .defaults) {
         self.init(
             configuration: configuration,
             displayResolver: DisplayResolver(configuration: configuration.display),
             inputSink: CGEventInputSink(),
             cursorController: CGCursorController(),
-            focusRestorer: AXFocusRestorer()
+            focusRestorerProvider: { AXFocusRestorer() },
+            pairingStore: PairingStore(),
+            pairingOverlay: PairingOverlayController()
         )
     }
 
-    /// Creates an application with injectable side-effect dependencies.
     public init(
         configuration: DriverConfiguration,
         displayResolver: DisplayResolver,
         inputSink: SyntheticInputSink,
         cursorController: CursorController,
-        focusRestorer: FocusRestorer = NoOpFocusRestorer()
+        focusRestorerProvider: @escaping () -> FocusRestorer = { NoOpFocusRestorer() },
+        pairingStore: PairingStore = PairingStore(),
+        pairingOverlay: PairingOverlayPresenting = PairingOverlayController()
     ) {
         self.configuration = configuration
         self.displayResolver = displayResolver
         self.inputSink = inputSink
         self.cursorController = cursorController
-        self.focusRestorer = focusRestorer
+        self.focusRestorerProvider = focusRestorerProvider
+        self.pairingStore = pairingStore
+        self.pairingOverlay = pairingOverlay
     }
 
-    deinit {
-        stop()
-    }
+    deinit { stop() }
 
-    /// Starts the driver and runs the main CFRunLoop until stopped.
     public func run() -> Int32 {
-        guard !isRunning else {
-            return EXIT_SUCCESS
-        }
-
+        guard !isRunning else { return EXIT_SUCCESS }
         isRunning = true
-        DriverLoggers.log(.notice, category: .lifecycle, "Starting Mac Xeneon Edge Touch Driver in single-touch mode.")
-        gestureController.onBecameIdle = { [weak self] in
-            self?.cancelStuckGestureTimer()
-        }
+
+        _ = NSApplication.shared
+        NSApp.setActivationPolicy(.accessory)
+        NSApp.finishLaunching()
+        DriverLoggers.log(.notice, category: .lifecycle, "Starting independent multi-display touch driver.")
 
         guard verifySyntheticEventPermission() else {
             stop()
             return EXIT_FAILURE
         }
 
-        refreshDisplayMapping(reason: "startup")
         registerDisplayReconfigurationCallback()
+        registerScreenParametersObserver()
         installSignalHandlers()
 
         do {
@@ -103,88 +98,341 @@ public final class MacXeneonEdgeTouchDriverApplication {
             return EXIT_FAILURE
         }
 
+        scheduleDisplayReconciliation(reason: "startup", delay: .milliseconds(500))
+
         CFRunLoopRun()
         return EXIT_SUCCESS
     }
 
-    /// Stops monitoring and restores cursor/input state.
     public func stop() {
-        guard isRunning else {
-            return
-        }
-
+        guard isRunning else { return }
         hidMonitor.stop()
         gestureQueue.sync {
             cancelStuckGestureTimer()
-            gestureController.forceCancel()
+            pairingAdvanceWork?.cancel()
+            reconciliationWork?.cancel()
+            sessions.values.forEach {
+                $0.cancelStormRecoveryTimer()
+                $0.gesture.forceCancel()
+            }
+            sessions.removeAll()
+            activeGestureDevice = nil
         }
+        pairingOverlay.hide()
         unregisterDisplayReconfigurationCallback()
+        unregisterScreenParametersObserver()
         signalSources.removeAll()
         isRunning = false
-
-        DriverLoggers.log(.notice, category: .lifecycle, "Stopped Mac Xeneon Edge Touch Driver.")
+        DriverLoggers.log(.notice, category: .lifecycle, "Stopped multi-display touch driver.")
         CFRunLoopStop(CFRunLoopGetMain())
     }
 
-    fileprivate func handleDisplayReconfiguration() {
+    func handleDisplayReconfiguration(
+        displayID: CGDirectDisplayID,
+        flags: CGDisplayChangeSummaryFlags
+    ) {
         gestureQueue.async { [weak self] in
-            self?.refreshDisplayMapping(reason: "display reconfiguration")
+            guard let self else { return }
+            self.cancelPairingPresentation()
+
+            if flags.contains(.beginConfigurationFlag) {
+                return
+            }
+
+            let changesMembership = flags.contains(.addFlag) ||
+                flags.contains(.removeFlag) ||
+                flags.contains(.enabledFlag) ||
+                flags.contains(.disabledFlag)
+            if changesMembership {
+                do {
+                    try self.pairingStore.invalidateBootSessionPairing(forDisplayID: displayID)
+                } catch {
+                    DriverLoggers.log(
+                        .error,
+                        category: .display,
+                        "Could not invalidate pairing after display membership changed: \(error.localizedDescription)"
+                    )
+                }
+            }
+
+            self.scheduleDisplayReconciliation(
+                reason: "display reconfiguration for ID \(displayID), flags \(flags.rawValue)"
+            )
         }
     }
 
-    private func refreshDisplayMapping(reason: String) {
-        displayResolver.refresh()
-        mapperStore.currentMapper = displayResolver.currentMapper
+    func handleDeviceMatched(_ device: TouchDeviceIdentity) {
+        connectedDevices.insert(device)
+        ensureSession(for: device)
+        scheduleDisplayReconciliation(reason: "HID device match at \(device.hexadecimalLocationID)")
+    }
 
-        if let bounds = displayResolver.currentBounds {
+    func handleDeviceRemoval(_ device: TouchDeviceIdentity) {
+        connectedDevices.remove(device)
+        suppressedUntilUp.remove(device)
+        sessions[device]?.cancelStormRecoveryTimer()
+        if activeGestureDevice == device {
+            sessions[device]?.gesture.forceCancel()
+            activeGestureDevice = nil
+            cancelStuckGestureTimer()
+        }
+        sessions.removeValue(forKey: device)
+        do {
+            try pairingStore.invalidateBootSessionPairing(for: device)
+        } catch {
             DriverLoggers.log(
-                .notice,
+                .error,
                 category: .display,
-                "Resolved Xeneon Edge display after \(reason): x=\(bounds.origin.x), y=\(bounds.origin.y), width=\(bounds.width), height=\(bounds.height)."
+                "Could not invalidate pairing after controller removal: \(error.localizedDescription)"
             )
-        } else {
-            DriverLoggers.log(.error, category: .display, "Could not resolve Xeneon Edge display after \(reason). Touch events will be dropped.")
-            gestureQueue.async { [weak self] in
-                self?.cancelStuckGestureTimer()
-                self?.gestureController.forceCancel()
+        }
+        scheduleDisplayReconciliation(reason: "HID device removal at \(device.hexadecimalLocationID)")
+    }
+
+    func handleHIDReport(
+        device: TouchDeviceIdentity,
+        timestamp: DispatchTime,
+        event: TouchEvent?
+    ) {
+        if let event {
+            handleTouchEvent(DeviceTouchEvent(device: device, touch: event))
+            return
+        }
+        if !connectedDevices.contains(device) {
+            connectedDevices.insert(device)
+            ensureSession(for: device)
+        }
+        sessions[device]?.validator.recordRawReport(at: timestamp)
+    }
+
+    func handleTouchEvent(_ event: DeviceTouchEvent) {
+        if !connectedDevices.contains(event.device) {
+            connectedDevices.insert(event.device)
+            ensureSession(for: event.device)
+        }
+        guard let session = sessions[event.device] else { return }
+
+        let validation = session.validator.process(event.touch)
+        if let trigger = validation.stormStarted {
+            suppressedUntilUp.remove(event.device)
+            DriverLoggers.log(
+                .warning,
+                category: .gesture,
+                "Touch storm detected on \(event.device.hexadecimalLocationID): \(trigger.rawValue). Entering confidence-tracking mode."
+            )
+            startStormRecoveryTimer(for: event.device)
+        }
+
+        if validation.cancelActiveGesture || validation.rejectedStream {
+            session.gesture.forceCancel()
+            if activeGestureDevice == event.device { activeGestureDevice = nil }
+            cancelStuckGestureTimer()
+        }
+
+        for touch in validation.events {
+            routeValidatedTouchEvent(DeviceTouchEvent(device: event.device, touch: touch))
+        }
+    }
+
+    private func routeValidatedTouchEvent(_ event: DeviceTouchEvent) {
+        if suppressedUntilUp.contains(event.device) {
+            if event.touch.kind == .up {
+                suppressedUntilUp.remove(event.device)
+            }
+            return
+        }
+
+        if pairingTarget != nil {
+            handlePairingTouch(event)
+            return
+        }
+
+        if sessions[event.device]?.mapperStore.currentMapper == nil {
+            refreshDisplayMappings(reason: "touch without an active paired display")
+            if pairingTarget != nil {
+                handlePairingTouch(event)
+                return
             }
         }
-    }
 
-    func handleTouchEvent(_ event: TouchEvent) {
-        if mapperStore.currentMapper == nil {
-            refreshDisplayMapping(reason: "touch event without display mapper")
+        guard let session = sessions[event.device], session.mapperStore.currentMapper != nil else { return }
+
+        if let activeGestureDevice, activeGestureDevice != event.device {
+            DriverLoggers.log(.debug, category: .gesture, "Ignoring simultaneous contact from \(event.device.hexadecimalLocationID).")
+            return
+        }
+        if event.touch.kind == .down {
+            activeGestureDevice = event.device
         }
 
-        gestureController.handle(event)
-
-        switch gestureController.state {
-        case .idle:
+        session.gesture.handle(event.touch)
+        if case .idle = session.gesture.state {
+            if activeGestureDevice == event.device { activeGestureDevice = nil }
             cancelStuckGestureTimer()
-
-        case .singleTouch:
-            scheduleStuckGestureTimer()
+        } else {
+            scheduleStuckGestureTimer(for: event.device)
         }
     }
 
-    func handleDeviceMatched() {
-        refreshDisplayMapping(reason: "HID device match")
+    private func ensureSession(for device: TouchDeviceIdentity) {
+        guard sessions[device] == nil else { return }
+        let mapperStore = CoordinateMapperStore()
+        let gesture = GestureController(
+            mapperProvider: { [mapperStore] in mapperStore.currentMapper },
+            inputSink: inputSink,
+            cursorController: cursorController,
+            focusRestorer: focusRestorerProvider(),
+            timing: GestureTiming(configuration: configuration.timing, gesture: configuration.gesture),
+            doubleClickIntervalProvider: { NSEvent.doubleClickInterval },
+            schedulingQueue: gestureQueue
+        )
+        gesture.onBecameIdle = { [weak self] in
+            guard let self else { return }
+            if self.activeGestureDevice == device { self.activeGestureDevice = nil }
+            self.cancelStuckGestureTimer()
+        }
+        sessions[device] = DeviceTouchSession(
+            mapperStore: mapperStore,
+            gesture: gesture,
+            validator: TouchStreamValidator()
+        )
     }
 
-    private func handleDeviceRemoval() {
-        cancelStuckGestureTimer()
-        gestureController.forceCancel()
+    func refreshDisplayMappings(reason: String) {
+        let activeDisplays = displayResolver.activeDisplays()
+        do {
+            let removedCount = try pairingStore.reconcileRuntimeDescriptors(
+                connectedDevices: connectedDevices,
+                displays: activeDisplays
+            )
+            if removedCount > 0 {
+                DriverLoggers.log(
+                    .notice,
+                    category: .display,
+                    "Removed \(removedCount) stale runtime pairing(s) after \(reason)."
+                )
+            }
+        } catch {
+            DriverLoggers.log(
+                .error,
+                category: .display,
+                "Could not persist runtime pairing reconciliation: \(error.localizedDescription)"
+            )
+        }
+        compatibleDisplays = displayResolver.matchingDisplays(from: activeDisplays)
+        let resolvedDisplays = Dictionary(uniqueKeysWithValues: connectedDevices.compactMap { device in
+            pairingStore.resolveDisplay(
+                for: device,
+                connectedDevices: connectedDevices,
+                displays: compatibleDisplays
+            ).map { (device, $0) }
+        })
+
+        for device in connectedDevices {
+            ensureSession(for: device)
+            let display = resolvedDisplays[device]
+            let mapper = display.map { CoordinateMapper(displayBounds: $0.bounds) }
+            if mapper == nil, sessions[device]?.mapperStore.currentMapper != nil {
+                sessions[device]?.gesture.forceCancel()
+                sessions[device]?.validator.reset()
+                sessions[device]?.cancelStormRecoveryTimer()
+                if activeGestureDevice == device { activeGestureDevice = nil }
+            }
+            sessions[device]?.mapperStore.currentMapper = mapper
+        }
+
+        DriverLoggers.log(
+            .notice,
+            category: .display,
+            "Display refresh after \(reason): \(compatibleDisplays.count) compatible display(s), \(connectedDevices.count) controller(s), \(resolvedDisplays.count) active pairing(s)."
+        )
+        beginPairingIfNeeded(resolvedDisplays: resolvedDisplays)
     }
 
-    private func scheduleStuckGestureTimer() {
-        cancelStuckGestureTimer()
+    private func beginPairingIfNeeded(resolvedDisplays: [TouchDeviceIdentity: DisplaySnapshot]? = nil) {
+        let resolved = resolvedDisplays ?? Dictionary(uniqueKeysWithValues: connectedDevices.compactMap { device in
+            pairingStore.resolveDisplay(
+                for: device,
+                connectedDevices: connectedDevices,
+                displays: compatibleDisplays
+            ).map { (device, $0) }
+        })
+        let unresolved = connectedDevices
+            .filter { resolved[$0] == nil }
+            .sorted { $0.locationID < $1.locationID }
 
+        let usedDisplayIDs = Set(resolved.values.map(\.displayID))
+        let candidates = compatibleDisplays.filter { !usedDisplayIDs.contains($0.displayID) }
+
+        guard !unresolved.isEmpty, let target = candidates.first else {
+            pairingTarget = nil
+            overlayPresentationAttempt = 0
+            pairingOverlay.hide()
+            return
+        }
+
+        let total = min(connectedDevices.count, compatibleDisplays.count)
+        let step = min(resolved.count + 1, total)
+        guard pairingOverlay.show(on: target, step: step, total: total) else {
+            pairingTarget = nil
+            schedulePairingOverlayRetry()
+            return
+        }
+
+        overlayPresentationAttempt = 0
+        pairingTarget = target
+        DriverLoggers.log(.notice, category: .display, "Waiting for a raw touch on display ID \(target.displayID).")
+    }
+
+    private func handlePairingTouch(_ event: DeviceTouchEvent) {
+        guard event.touch.kind == .down, let target = pairingTarget else { return }
+
+        let existingDisplayIsActive = pairingStore.resolveDisplay(
+            for: event.device,
+            connectedDevices: connectedDevices,
+            displays: compatibleDisplays
+        ) != nil
+        guard !existingDisplayIsActive else {
+            DriverLoggers.log(.debug, category: .display, "Ignoring pairing touch from an already resolved controller.")
+            return
+        }
+
+        do {
+            try pairingStore.assign(
+                device: event.device,
+                to: target,
+                connectedDevices: connectedDevices,
+                displays: compatibleDisplays
+            )
+            suppressedUntilUp.insert(event.device)
+            pairingTarget = nil
+            pairingOverlay.showConfirmation(on: target)
+            DriverLoggers.log(.notice, category: .display, "Paired controller \(event.device.hexadecimalLocationID) to display ID \(target.displayID).")
+            refreshSessionMapper(for: event.device, display: target)
+
+            pairingAdvanceWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.beginPairingIfNeeded() }
+            pairingAdvanceWork = work
+            gestureQueue.asyncAfter(deadline: .now() + .milliseconds(650), execute: work)
+        } catch {
+            DriverLoggers.log(.fault, category: .display, "Could not persist touch pairing: \(error.localizedDescription)")
+        }
+    }
+
+    private func refreshSessionMapper(for device: TouchDeviceIdentity, display: DisplaySnapshot) {
+        ensureSession(for: device)
+        sessions[device]?.mapperStore.currentMapper = CoordinateMapper(displayBounds: display.bounds)
+    }
+
+    private func scheduleStuckGestureTimer(for device: TouchDeviceIdentity) {
+        cancelStuckGestureTimer()
         let timer = DispatchSource.makeTimerSource(queue: gestureQueue)
         timer.schedule(deadline: .now() + .milliseconds(configuration.timing.stuckGestureTimeoutMs))
         timer.setEventHandler { [weak self] in
-            DriverLoggers.log(.warning, category: .gesture, "Touch gesture timed out without an up event; forcing cleanup.")
-            self?.gestureController.handleIdleTimeout()
-            self?.stuckGestureTimer = nil
+            guard let self else { return }
+            DriverLoggers.log(.warning, category: .gesture, "Touch gesture timed out; forcing cleanup.")
+            self.sessions[device]?.gesture.handleIdleTimeout()
+            self.stuckGestureTimer = nil
         }
         timer.resume()
         stuckGestureTimer = timer
@@ -196,84 +444,179 @@ public final class MacXeneonEdgeTouchDriverApplication {
         stuckGestureTimer = nil
     }
 
-    private func registerDisplayReconfigurationCallback() {
-        guard !didRegisterDisplayCallback else {
+    private func startStormRecoveryTimer(for device: TouchDeviceIdentity) {
+        guard let session = sessions[device], session.stormRecoveryTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: gestureQueue)
+        timer.schedule(
+            deadline: .now() + .seconds(1),
+            repeating: .seconds(1),
+            leeway: .milliseconds(100)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.handleStormRecoveryTick(for: device, at: .now())
+        }
+        session.stormRecoveryTimer = timer
+        session.stormSummaryTickCount = 0
+        timer.resume()
+    }
+
+    func handleStormRecoveryTick(for device: TouchDeviceIdentity, at timestamp: DispatchTime) {
+        guard let session = sessions[device], session.validator.isStormActive else {
+            sessions[device]?.cancelStormRecoveryTimer()
             return
         }
 
+        if let recovery = session.validator.recoverIfQuiet(at: timestamp) {
+            session.cancelStormRecoveryTimer()
+            if recovery.cancelActiveGesture {
+                session.gesture.forceCancel()
+                if activeGestureDevice == device { activeGestureDevice = nil }
+                cancelStuckGestureTimer()
+            }
+            let duration = Double(
+                recovery.snapshot.lastReportAtNanoseconds - recovery.snapshot.startedAtNanoseconds
+            ) / 1_000_000_000
+            DriverLoggers.log(
+                .notice,
+                category: .gesture,
+                String(
+                    format: "Touch storm ended on %@ after %.2fs: reports=%d, accepted=%d, dropped=%d, recoveredContacts=%d. Returning to normal mode.",
+                    device.hexadecimalLocationID,
+                    duration,
+                    recovery.snapshot.totalReports,
+                    recovery.snapshot.acceptedSamples,
+                    recovery.snapshot.droppedSamples,
+                    recovery.snapshot.recoveredContacts
+                )
+            )
+            return
+        }
+
+        session.stormSummaryTickCount += 1
+        guard session.stormSummaryTickCount.isMultiple(of: 5),
+              let snapshot = session.validator.stormSnapshot() else { return }
+        let duration = Double(timestamp.uptimeNanoseconds - snapshot.startedAtNanoseconds) / 1_000_000_000
+        DriverLoggers.log(
+            .notice,
+            category: .gesture,
+            String(
+                format: "Touch storm active on %@ for %.2fs: reports=%d, accepted=%d, dropped=%d, recoveredContacts=%d, tracking=%@.",
+                device.hexadecimalLocationID,
+                duration,
+                snapshot.totalReports,
+                snapshot.acceptedSamples,
+                snapshot.droppedSamples,
+                snapshot.recoveredContacts,
+                snapshot.hasAcquiredTrack ? "yes" : "no"
+            )
+        )
+    }
+
+    func hasStormRecoveryTimer(for device: TouchDeviceIdentity) -> Bool {
+        sessions[device]?.stormRecoveryTimer != nil
+    }
+
+    private func registerDisplayReconfigurationCallback() {
+        guard !didRegisterDisplayCallback else { return }
         let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         let result = CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, context)
-
-        if result == .success {
-            didRegisterDisplayCallback = true
-        } else {
+        didRegisterDisplayCallback = result == .success
+        if result != .success {
             DriverLoggers.log(.error, category: .display, "CGDisplayRegisterReconfigurationCallback failed with \(result.rawValue).")
         }
     }
 
     private func unregisterDisplayReconfigurationCallback() {
-        guard didRegisterDisplayCallback else {
+        guard didRegisterDisplayCallback else { return }
+        let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        _ = CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, context)
+        didRegisterDisplayCallback = false
+    }
+
+    private func registerScreenParametersObserver() {
+        guard screenParametersObserver == nil else { return }
+        screenParametersObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.gestureQueue.async { [weak self] in
+                guard let self else { return }
+                self.cancelPairingPresentation()
+                self.scheduleDisplayReconciliation(reason: "AppKit screen parameters changed")
+            }
+        }
+    }
+
+    private func unregisterScreenParametersObserver() {
+        guard let screenParametersObserver else { return }
+        NotificationCenter.default.removeObserver(screenParametersObserver)
+        self.screenParametersObserver = nil
+    }
+
+    private func scheduleDisplayReconciliation(
+        reason: String,
+        delay: DispatchTimeInterval = .milliseconds(250)
+    ) {
+        gestureQueue.async { [weak self] in
+            guard let self else { return }
+            self.overlayPresentationAttempt = 0
+            self.reconciliationWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                self?.refreshDisplayMappings(reason: reason)
+            }
+            self.reconciliationWork = work
+            self.gestureQueue.asyncAfter(deadline: .now() + delay, execute: work)
+        }
+    }
+
+    private func schedulePairingOverlayRetry() {
+        guard overlayPresentationAttempt < 20 else {
+            DriverLoggers.log(.error, category: .display, "Pairing overlay remained unavailable after bounded retries; waiting for the next display or HID event.")
             return
         }
-
-        let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        let result = CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, context)
-
-        if result != .success {
-            DriverLoggers.log(.error, category: .display, "CGDisplayRemoveReconfigurationCallback failed with \(result.rawValue).")
+        overlayPresentationAttempt += 1
+        reconciliationWork?.cancel()
+        let attempt = overlayPresentationAttempt
+        let work = DispatchWorkItem { [weak self] in
+            self?.refreshDisplayMappings(reason: "pairing overlay readiness retry \(attempt)")
         }
-        didRegisterDisplayCallback = false
+        reconciliationWork = work
+        gestureQueue.asyncAfter(deadline: .now() + .milliseconds(500), execute: work)
+    }
+
+    private func cancelPairingPresentation() {
+        pairingTarget = nil
+        pairingAdvanceWork?.cancel()
+        pairingAdvanceWork = nil
+        pairingOverlay.hide()
     }
 
     private func installSignalHandlers() {
         signalSources = [SIGINT, SIGTERM].map { signalNumber in
             ignoreDefaultSignalAction(signalNumber)
-
             let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
-            source.setEventHandler { [weak self] in
-                DriverLoggers.log(.notice, category: .lifecycle, "Received signal \(signalNumber); stopping driver.")
-                self?.stop()
-            }
+            source.setEventHandler { [weak self] in self?.stop() }
             source.resume()
             return source
         }
     }
 
     private func verifySyntheticEventPermission() -> Bool {
-        if CGPreflightPostEventAccess() {
-            DriverLoggers.log(.notice, category: .lifecycle, "CoreGraphics post-event permission is granted.")
-            return true
-        }
-
+        if CGPreflightPostEventAccess() { return true }
         logPermissionIdentity()
-        DriverLoggers.log(.error, category: .lifecycle, "CoreGraphics post-event permission is not granted; requesting permission if macOS will show a prompt.")
-
-        if CGRequestPostEventAccess() {
-            DriverLoggers.log(.notice, category: .lifecycle, "CoreGraphics post-event permission was granted after request.")
-            return true
-        }
-
+        if CGRequestPostEventAccess() { return true }
         let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        let options = [promptKey: true] as CFDictionary
-        let isAXTrusted = AXIsProcessTrustedWithOptions(options)
-        if isAXTrusted || CGPreflightPostEventAccess() {
-            DriverLoggers.log(.notice, category: .lifecycle, "Accessibility trust is granted after prompt.")
-            return true
-        }
-
-        DriverLoggers.log(
-            .fault,
-            category: .lifecycle,
-            "Synthetic mouse event permission is not granted. Grant Accessibility to the executable or to the launcher app named in the previous log line, then restart the driver."
-        )
+        let trusted = AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+        if trusted || CGPreflightPostEventAccess() { return true }
+        DriverLoggers.log(.fault, category: .lifecycle, "Synthetic mouse event permission is not granted. Grant Accessibility and restart the driver.")
         return false
     }
 
     private func logPermissionIdentity() {
-        let executablePath = Bundle.main.executableURL?.path ?? CommandLine.arguments.first ?? "Unknown executable"
-        let launcherPath = NSRunningApplication(processIdentifier: getppid())?.bundleURL?.path ?? "Unknown launcher"
-
-        DriverLoggers.log(.error, category: .lifecycle, "Permission identity: executable=\(executablePath), launcher=\(launcherPath).")
+        let executable = Bundle.main.executableURL?.path ?? CommandLine.arguments.first ?? "Unknown executable"
+        let launcher = NSRunningApplication(processIdentifier: getppid())?.bundleURL?.path ?? "Unknown launcher"
+        DriverLoggers.log(.error, category: .lifecycle, "Permission identity: executable=\(executable), launcher=\(launcher).")
     }
 
     private func ignoreDefaultSignalAction(_ signalNumber: Int32) {
@@ -281,10 +624,32 @@ public final class MacXeneonEdgeTouchDriverApplication {
         action.__sigaction_u.__sa_handler = SIG_IGN
         action.sa_flags = 0
         sigemptyset(&action.sa_mask)
+        _ = sigaction(signalNumber, &action, nil)
+    }
+}
 
-        if sigaction(signalNumber, &action, nil) != 0 {
-            DriverLoggers.log(.error, category: .lifecycle, "sigaction failed for signal \(signalNumber).")
-        }
+private final class DeviceTouchSession {
+    let mapperStore: CoordinateMapperStore
+    let gesture: GestureController
+    let validator: TouchStreamValidator
+    var stormRecoveryTimer: DispatchSourceTimer?
+    var stormSummaryTickCount = 0
+
+    init(mapperStore: CoordinateMapperStore, gesture: GestureController, validator: TouchStreamValidator) {
+        self.mapperStore = mapperStore
+        self.gesture = gesture
+        self.validator = validator
+    }
+
+    deinit {
+        cancelStormRecoveryTimer()
+    }
+
+    func cancelStormRecoveryTimer() {
+        stormRecoveryTimer?.setEventHandler {}
+        stormRecoveryTimer?.cancel()
+        stormRecoveryTimer = nil
+        stormSummaryTickCount = 0
     }
 }
 
@@ -293,24 +658,13 @@ private final class CoordinateMapperStore {
     private var storedMapper: CoordinateMapper?
 
     var currentMapper: CoordinateMapper? {
-        get {
-            lock.lock()
-            defer { lock.unlock() }
-            return storedMapper
-        }
-        set {
-            lock.lock()
-            storedMapper = newValue
-            lock.unlock()
-        }
+        get { lock.lock(); defer { lock.unlock() }; return storedMapper }
+        set { lock.lock(); storedMapper = newValue; lock.unlock() }
     }
 }
 
-private let displayReconfigurationCallback: CGDisplayReconfigurationCallBack = { _, _, context in
-    guard let context else {
-        return
-    }
-
-    let application = Unmanaged<MacXeneonEdgeTouchDriverApplication>.fromOpaque(context).takeUnretainedValue()
-    application.handleDisplayReconfiguration()
+private let displayReconfigurationCallback: CGDisplayReconfigurationCallBack = { displayID, flags, context in
+    guard let context else { return }
+    let app = Unmanaged<MacXeneonEdgeTouchDriverApplication>.fromOpaque(context).takeUnretainedValue()
+    app.handleDisplayReconfiguration(displayID: displayID, flags: flags)
 }

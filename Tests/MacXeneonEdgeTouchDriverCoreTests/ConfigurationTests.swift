@@ -93,6 +93,27 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(result.warnings.count, 1)
     }
 
+    func testDirectTouchGestureSettingsLoad() throws {
+        let url = try writeConfig("""
+        {
+          "gesture": {
+            "holdToDragMs": 450,
+            "movementThresholdPoints": 12,
+            "scrollSensitivity": 1.5,
+            "doubleClickDistancePoints": 16
+          }
+        }
+        """)
+
+        let result = DriverConfiguration.load(from: url)
+
+        XCTAssertEqual(result.configuration.gesture.holdToDragMs, 450)
+        XCTAssertEqual(result.configuration.gesture.movementThresholdPoints, 12)
+        XCTAssertEqual(result.configuration.gesture.scrollSensitivity, 1.5)
+        XCTAssertEqual(result.configuration.gesture.doubleClickDistancePoints, 16)
+        XCTAssertTrue(result.warnings.isEmpty)
+    }
+
     private func writeConfig(_ contents: String) throws -> URL {
         let directory = temporaryDirectory()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

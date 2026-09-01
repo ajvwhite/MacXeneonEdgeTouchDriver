@@ -20,9 +20,9 @@ final class DisplayResolverTests: XCTestCase {
                 vendorNumber: CapturedXeneonDisplay.vendorNumber,
                 modelNumber: CapturedXeneonDisplay.modelNumber,
                 serialNumber: CapturedXeneonDisplay.observedSerialNumber,
-                bounds: CGRect(x: 5_088, y: 1_890, width: 2_560, height: 720),
-                pixelsWide: 2_560,
-                pixelsHigh: 720
+                bounds: CGRect(x: 5_088, y: 1_890, width: 1_280, height: 480),
+                pixelsWide: CapturedXeneonDisplay.expectedWidth,
+                pixelsHigh: CapturedXeneonDisplay.expectedHeight
             )
         ]
 
@@ -48,12 +48,33 @@ final class DisplayResolverTests: XCTestCase {
             modelNumber: CapturedXeneonDisplay.modelNumber,
             serialNumber: 222,
             bounds: .zero,
-            pixelsWide: 2_560,
-            pixelsHigh: 720
+            pixelsWide: CapturedXeneonDisplay.expectedWidth,
+            pixelsHigh: CapturedXeneonDisplay.expectedHeight
         )
 
         let match = resolver.resolve(from: [wrongSize, rightSize])
 
         XCTAssertEqual(match?.displayID, 11)
+    }
+
+    func testReturnsIdenticalDisplaysInStableVisualOrder() {
+        let resolver = DisplayResolver()
+        let right = matchingDisplay(id: 4, runtimeIdentifier: "RIGHT", x: 3_840)
+        let left = matchingDisplay(id: 5, runtimeIdentifier: "LEFT", x: 0)
+
+        XCTAssertEqual(resolver.matchingDisplays(from: [right, left]).map(\.runtimeIdentifier), ["LEFT", "RIGHT"])
+    }
+
+    private func matchingDisplay(id: CGDirectDisplayID, runtimeIdentifier: String, x: CGFloat) -> DisplaySnapshot {
+        DisplaySnapshot(
+            displayID: id,
+            runtimeIdentifier: runtimeIdentifier,
+            vendorNumber: CapturedXeneonDisplay.vendorNumber,
+            modelNumber: CapturedXeneonDisplay.modelNumber,
+            serialNumber: 0,
+            bounds: CGRect(x: x, y: 1_440, width: 1_280, height: 480),
+            pixelsWide: CapturedXeneonDisplay.expectedWidth,
+            pixelsHigh: CapturedXeneonDisplay.expectedHeight
+        )
     }
 }

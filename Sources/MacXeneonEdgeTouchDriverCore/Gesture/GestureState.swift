@@ -9,6 +9,13 @@ public enum GestureState: Equatable {
 
 /// Context kept while one contact is active.
 public struct SingleTouchContext: Equatable {
+    public enum Phase: Equatable {
+        case pending
+        case scrolling
+        case dragging
+        case finishingTap
+    }
+
     /// Contact identifier. Current hardware always uses `0`.
     public let contactID: Int
 
@@ -24,9 +31,9 @@ public struct SingleTouchContext: Equatable {
     /// Last raw Y coordinate.
     public var lastRawY: Int
 
-    /// Whether the synthetic mouse-down event has been posted.
-    public var isMouseDownPosted: Bool
+    /// Current interpretation of the contact.
+    public var phase: Phase
 
-    /// Whether at least one drag event has been posted for this gesture.
-    public var hasMoved: Bool
+    /// Click count used if this contact has emitted a mouse-down event.
+    public var clickCount: Int
 }

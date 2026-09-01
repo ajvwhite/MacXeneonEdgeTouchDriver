@@ -17,26 +17,27 @@ public enum HIDDeviceMonitorError: Error, LocalizedError, Equatable {
 
 /// Monitors the Xeneon Edge HID device and emits parsed single-touch events.
 public final class HIDDeviceMonitor {
-    /// Receives parsed touch events on the configured event queue.
-    public typealias TouchEventHandler = (TouchEvent) -> Void
+    /// Receives every valid raw touch report plus its optional lifecycle event.
+    public typealias TouchReportHandler = (TouchDeviceIdentity, DispatchTime, TouchEvent?) -> Void
 
     /// Receives device match events on the configured event queue.
-    public typealias DeviceMatchedHandler = () -> Void
+    public typealias DeviceMatchedHandler = (TouchDeviceIdentity) -> Void
 
     /// Receives device removal events on the configured event queue.
-    public typealias DeviceRemovalHandler = () -> Void
+    public typealias DeviceRemovalHandler = (TouchDeviceIdentity) -> Void
 
     private static let defaultInputReportBufferLength = 256
 
     private let manager: IOHIDManager
-    private let parser: HIDValueParser
     private let eventQueue: DispatchQueue
-    private let touchEventHandler: TouchEventHandler
+    private let touchReportHandler: TouchReportHandler
     private let deviceMatchedHandler: DeviceMatchedHandler
     private let deviceRemovalHandler: DeviceRemovalHandler
     private let openOptions: IOOptionBits
 
     private var reportRegistrations: [HIDReportRegistration] = []
+    // Removed devices retain their callback contexts until monitor shutdown.
+    private var retiredRegistrations: [HIDReportRegistration] = []
     private var isStarted = false
 
     /// Creates a HID monitor for the Xeneon Edge touchscreen controller.
@@ -45,17 +46,15 @@ public final class HIDDeviceMonitor {
     ///   - seizeDevice: Use `true` for the production driver so macOS does not
     ///     also consume the touchscreen as a generic pointer device.
     public init(
-        parser: HIDValueParser = HIDValueParser(),
         eventQueue: DispatchQueue,
         seizeDevice: Bool = true,
-        touchEventHandler: @escaping TouchEventHandler,
+        touchReportHandler: @escaping TouchReportHandler,
         deviceRemovalHandler: @escaping DeviceRemovalHandler,
-        deviceMatchedHandler: @escaping DeviceMatchedHandler = {}
+        deviceMatchedHandler: @escaping DeviceMatchedHandler = { _ in }
     ) {
         self.manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        self.parser = parser
         self.eventQueue = eventQueue
-        self.touchEventHandler = touchEventHandler
+        self.touchReportHandler = touchReportHandler
         self.deviceMatchedHandler = deviceMatchedHandler
         self.deviceRemovalHandler = deviceRemovalHandler
         self.openOptions = seizeDevice
@@ -75,7 +74,9 @@ public final class HIDDeviceMonitor {
 
         let matching: [String: Any] = [
             kIOHIDVendorIDKey as String: XeneonEdgeDevice.vendorID,
-            kIOHIDProductIDKey as String: XeneonEdgeDevice.productID
+            kIOHIDProductIDKey as String: XeneonEdgeDevice.productID,
+            kIOHIDDeviceUsagePageKey as String: kHIDPage_GenericDesktop,
+            kIOHIDDeviceUsageKey as String: kHIDUsage_GD_Mouse
         ]
         let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
 
@@ -102,8 +103,10 @@ public final class HIDDeviceMonitor {
 
         IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         IOHIDManagerClose(manager, openOptions)
+        reportRegistrations.forEach { $0.invalidate() }
+        retiredRegistrations.forEach { $0.invalidate() }
         reportRegistrations.removeAll()
-        parser.reset()
+        retiredRegistrations.removeAll()
         isStarted = false
     }
 
@@ -112,9 +115,23 @@ public final class HIDDeviceMonitor {
             return
         }
 
+        guard let locationNumber = IOHIDDeviceGetProperty(
+            device,
+            kIOHIDLocationIDKey as CFString
+        ) as? NSNumber else {
+            DriverLoggers.log(.error, category: .hid, "Ignoring matching touch interface without a location ID.")
+            return
+        }
+
+        let identity = TouchDeviceIdentity(
+            locationID: locationNumber.uint32Value,
+            serialNumber: deviceProperty(device, key: kIOHIDSerialNumberKey)
+        )
         let registration = HIDReportRegistration(
             device: device,
-            length: maxInputReportLength(for: device)
+            identity: identity,
+            length: maxInputReportLength(for: device),
+            monitor: self
         )
         reportRegistrations.append(registration)
 
@@ -123,51 +140,41 @@ public final class HIDDeviceMonitor {
             registration.buffer,
             registration.length,
             hidInputReportCallback,
-            UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+            UnsafeMutableRawPointer(Unmanaged.passUnretained(registration).toOpaque())
         )
 
         DriverLoggers.log(
             .notice,
             category: .hid,
-            "Xeneon Edge HID device matched. Manufacturer: \(self.deviceProperty(device, key: kIOHIDManufacturerKey) ?? "Unknown"), product: \(self.deviceProperty(device, key: kIOHIDProductKey) ?? "Unknown"), max input report size: \(registration.length)"
+            "WCH touch mouse interface matched at \(identity.hexadecimalLocationID). Manufacturer: \(self.deviceProperty(device, key: kIOHIDManufacturerKey) ?? "Unknown"), product: \(self.deviceProperty(device, key: kIOHIDProductKey) ?? "Unknown"), max input report size: \(registration.length)"
         )
 
-        eventQueue.async { [deviceMatchedHandler] in
-            deviceMatchedHandler()
+        eventQueue.async { [deviceMatchedHandler, identity] in
+            deviceMatchedHandler(identity)
         }
     }
 
     fileprivate func handleDeviceRemoved(_ device: IOHIDDevice) {
-        reportRegistrations.removeAll { $0.matches(device) }
-        parser.reset()
+        guard let index = reportRegistrations.firstIndex(where: { $0.matches(device) }) else {
+            return
+        }
+        let registration = reportRegistrations.remove(at: index)
+        registration.invalidate()
+        retiredRegistrations.append(registration)
 
-        DriverLoggers.log(.notice, category: .hid, "Xeneon Edge HID device removed; canceling active gesture if needed.")
-        eventQueue.async { [deviceRemovalHandler] in
-            deviceRemovalHandler()
+        DriverLoggers.log(.notice, category: .hid, "WCH touch interface at \(registration.identity.hexadecimalLocationID) removed; canceling only that device session.")
+        eventQueue.async { [deviceRemovalHandler, identity = registration.identity] in
+            deviceRemovalHandler(identity)
         }
     }
 
-    fileprivate func handleInputReport(
-        type: IOHIDReportType,
-        reportID: UInt32,
-        report: UnsafeMutablePointer<UInt8>,
-        reportLength: CFIndex
+    fileprivate func emitReport(
+        device: TouchDeviceIdentity,
+        timestamp: DispatchTime,
+        event: TouchEvent?
     ) {
-        guard type == kIOHIDReportTypeInput else {
-            return
-        }
-
-        let bytes = Array(UnsafeBufferPointer(start: report, count: Int(reportLength)))
-        guard let event = parser.parseReport(
-            reportID: Int(reportID),
-            bytes: bytes,
-            timestamp: .now()
-        ) else {
-            return
-        }
-
-        eventQueue.async { [touchEventHandler] in
-            touchEventHandler(event)
+        eventQueue.async { [touchReportHandler] in
+            touchReportHandler(device, timestamp, event)
         }
     }
 
@@ -197,12 +204,23 @@ public final class HIDDeviceMonitor {
 
 private final class HIDReportRegistration {
     let device: IOHIDDevice
+    let identity: TouchDeviceIdentity
     let buffer: UnsafeMutablePointer<UInt8>
     let length: CFIndex
+    private let parser = HIDValueParser()
+    private weak var monitor: HIDDeviceMonitor?
+    private var isActive = true
 
-    init(device: IOHIDDevice, length: Int) {
+    init(
+        device: IOHIDDevice,
+        identity: TouchDeviceIdentity,
+        length: Int,
+        monitor: HIDDeviceMonitor
+    ) {
         self.device = device
+        self.identity = identity
         self.length = CFIndex(length)
+        self.monitor = monitor
         self.buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: length)
         self.buffer.initialize(repeating: 0, count: length)
     }
@@ -214,6 +232,38 @@ private final class HIDReportRegistration {
 
     func matches(_ otherDevice: IOHIDDevice) -> Bool {
         CFEqual(device, otherDevice)
+    }
+
+    func invalidate() {
+        isActive = false
+        parser.reset()
+        monitor = nil
+    }
+
+    func handleInputReport(
+        type: IOHIDReportType,
+        reportID: UInt32,
+        report: UnsafeMutablePointer<UInt8>,
+        reportLength: CFIndex
+    ) {
+        guard isActive, type == kIOHIDReportTypeInput else {
+            return
+        }
+        let bytes = Array(UnsafeBufferPointer(start: report, count: Int(reportLength)))
+        let timestamp = DispatchTime.now()
+        guard Int(reportID) == XeneonEdgeDevice.touchReportID,
+              bytes.count >= XeneonEdgeDevice.touchReportLength else {
+            return
+        }
+        guard let touch = parser.parseReport(
+            reportID: Int(reportID),
+            bytes: bytes,
+            timestamp: timestamp
+        ) else {
+            monitor?.emitReport(device: identity, timestamp: timestamp, event: nil)
+            return
+        }
+        monitor?.emitReport(device: identity, timestamp: timestamp, event: touch)
     }
 }
 
@@ -240,8 +290,8 @@ private let hidInputReportCallback: IOHIDReportCallback = { context, _, _, type,
         return
     }
 
-    let monitor = Unmanaged<HIDDeviceMonitor>.fromOpaque(context).takeUnretainedValue()
-    monitor.handleInputReport(type: type, reportID: reportID, report: report, reportLength: reportLength)
+    let registration = Unmanaged<HIDReportRegistration>.fromOpaque(context).takeUnretainedValue()
+    registration.handleInputReport(type: type, reportID: reportID, report: report, reportLength: reportLength)
 }
 
 private func formatIOReturn(_ value: IOReturn) -> String {

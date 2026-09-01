@@ -3,6 +3,21 @@ import MacXeneonEdgeTouchDriverCore
 import XCTest
 
 final class GestureControllerTests: XCTestCase {
+    func testTouchDownDoesNotBorrowOrMoveCursorBeforeGestureClassification() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(input: input, cursor: cursor)
+
+        controller.handle(event(.down, rawX: 0, rawY: 0))
+
+        XCTAssertTrue(cursor.calls.isEmpty)
+        XCTAssertTrue(input.calls.isEmpty)
+        guard case .singleTouch(let context) = controller.state else {
+            return XCTFail("Expected a pending touch")
+        }
+        XCTAssertEqual(context.phase, .pending)
+    }
+
     func testSingleTapBorrowsClicksAndReturnsCursor() {
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
@@ -16,7 +31,7 @@ final class GestureControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .idle)
     }
 
-    func testDragUpdatesCursorAndPostsDraggedEvents() {
+    func testImmediateMovementPostsPixelScrollWithoutMouseDown() {
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
         let controller = makeController(input: input, cursor: cursor)
@@ -29,21 +44,36 @@ final class GestureControllerTests: XCTestCase {
             cursor.calls,
             [
                 .borrow(CGPoint(x: 100, y: 200)),
-                .update(CGPoint(x: 2_660, y: 920)),
                 .returnToOrigin
             ]
         )
         XCTAssertEqual(
             input.calls,
             [
-                .mouseDown(CGPoint(x: 100, y: 200)),
-                .mouseDragged(CGPoint(x: 2_660, y: 920)),
-                .mouseUp(CGPoint(x: 2_660, y: 920))
+                .scroll(deltaX: 2_560, deltaY: 720, phase: .began),
+                .scroll(deltaX: 0, deltaY: 0, phase: .ended)
             ]
         )
     }
 
-    func testForceCancelPostsMouseUpAndReturnsCursor() {
+    func testScrollBeginsWithCumulativeMovementPastThreshold() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(input: input, cursor: cursor)
+
+        controller.handle(event(.down, rawX: 0, rawY: 0))
+        controller.handle(event(.move, rawX: 30, rawY: 0))
+        controller.handle(event(.move, rawX: 100, rawY: 0))
+
+        guard case .scroll(let deltaX, let deltaY, let phase) = input.calls.first else {
+            return XCTFail("Expected a scroll event")
+        }
+        XCTAssertEqual(phase, .began)
+        XCTAssertEqual(deltaY, 0)
+        XCTAssertEqual(deltaX, 2_560 * 100 / 16_383, accuracy: 0.001)
+    }
+
+    func testForceCancelEndsScrollAndReturnsCursor() {
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
         let controller = makeController(input: input, cursor: cursor)
@@ -52,7 +82,7 @@ final class GestureControllerTests: XCTestCase {
         controller.handle(event(.move, rawX: 16_383, rawY: 9_599))
         controller.forceCancel()
 
-        XCTAssertEqual(input.calls.last, .mouseUp(CGPoint(x: 2_660, y: 920)))
+        XCTAssertEqual(input.calls.last, .scroll(deltaX: 0, deltaY: 0, phase: .ended))
         XCTAssertEqual(cursor.calls.last, .returnToOrigin)
         XCTAssertEqual(controller.state, .idle)
     }
@@ -65,7 +95,7 @@ final class GestureControllerTests: XCTestCase {
         controller.handle(event(.down, rawX: 0, rawY: 0))
         controller.handleIdleTimeout()
 
-        XCTAssertEqual(input.calls.last, .mouseUp(CGPoint(x: 100, y: 200)))
+        XCTAssertTrue(input.calls.isEmpty)
         XCTAssertEqual(cursor.calls.last, .returnToOrigin)
         XCTAssertEqual(controller.state, .idle)
     }
@@ -93,7 +123,72 @@ final class GestureControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .idle)
     }
 
-    func testBorrowFailureDropsTouchDown() {
+    func testNearbySecondTapWithinSystemIntervalPostsDoubleClick() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            doubleClickIntervalProvider: { 0.5 }
+        )
+
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_000_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_050_000_000))
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_200_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_250_000_000))
+
+        XCTAssertEqual(input.mouseClickCounts, [1, 1, 2, 2])
+    }
+
+    func testThirdTapStartsNewClickSequence() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(input: input, cursor: cursor)
+
+        for timestamp in [1_000_000_000, 1_200_000_000, 1_400_000_000] as [UInt64] {
+            controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: timestamp))
+            controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: timestamp + 50_000_000))
+        }
+
+        XCTAssertEqual(input.mouseClickCounts, [1, 1, 2, 2, 1, 1])
+    }
+
+    func testLateOrDistantSecondTapRemainsSingleClick() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            doubleClickIntervalProvider: { 0.5 }
+        )
+
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_000_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_050_000_000))
+        controller.handle(event(.down, rawX: 100, rawY: 0, timestampNanoseconds: 1_200_000_000))
+        controller.handle(event(.up, rawX: 100, rawY: 0, timestampNanoseconds: 1_250_000_000))
+        controller.handle(event(.down, rawX: 100, rawY: 0, timestampNanoseconds: 2_000_000_000))
+        controller.handle(event(.up, rawX: 100, rawY: 0, timestampNanoseconds: 2_050_000_000))
+
+        XCTAssertEqual(input.mouseClickCounts, [1, 1, 1, 1, 1, 1])
+    }
+
+    func testScrollResetsDoubleClickSequence() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(input: input, cursor: cursor)
+
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_000_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_050_000_000))
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_100_000_000))
+        controller.handle(event(.move, rawX: 1_000, rawY: 0, timestampNanoseconds: 1_150_000_000))
+        controller.handle(event(.up, rawX: 1_000, rawY: 0, timestampNanoseconds: 1_200_000_000))
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_250_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_300_000_000))
+
+        XCTAssertEqual(input.mouseClickCounts, [1, 1, 1, 1])
+    }
+
+    func testBorrowFailureDropsTapBeforeSyntheticInput() {
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
         let focus = RecordingFocusRestorer()
@@ -101,6 +196,7 @@ final class GestureControllerTests: XCTestCase {
         let controller = makeController(input: input, cursor: cursor, focus: focus)
 
         controller.handle(event(.down, rawX: 0, rawY: 0))
+        controller.handle(event(.up, rawX: 0, rawY: 0))
 
         XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200))])
         XCTAssertEqual(focus.calls, [.captureFocusedWindow, .discardCapturedWindow])
@@ -108,7 +204,8 @@ final class GestureControllerTests: XCTestCase {
         XCTAssertEqual(controller.state, .idle)
     }
 
-    func testSingleTapCapturesAndRestoresFocusedWindow() {
+    func testSingleTapDefersFocusUntilDoubleClickWindowExpires() {
+        let queue = DispatchQueue(label: "MacXeneonEdgeTouchDriverTests.single-tap-focus")
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
         let focus = RecordingFocusRestorer()
@@ -118,18 +215,94 @@ final class GestureControllerTests: XCTestCase {
                 cleanupOrder.append("cursorReturn")
             }
         }
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            focus: focus,
+            doubleClickIntervalProvider: { 0.05 },
+            schedulingQueue: queue
+        )
+        let focusRestored = expectation(description: "single tap focus restored after double-click interval")
         focus.onCall = { call in
             if case .restoreCapturedWindow = call {
                 cleanupOrder.append("focusRestore")
+                focusRestored.fulfill()
             }
         }
-        let controller = makeController(input: input, cursor: cursor, focus: focus)
 
         controller.handle(event(.down, rawX: 0, rawY: 0))
         controller.handle(event(.up, rawX: 0, rawY: 0))
 
+        XCTAssertEqual(focus.calls, [.captureFocusedWindow])
+        XCTAssertEqual(cleanupOrder, ["cursorReturn"])
+
+        wait(for: [focusRestored], timeout: 1)
         XCTAssertEqual(focus.calls, [.captureFocusedWindow, .restoreCapturedWindow])
         XCTAssertEqual(cleanupOrder, ["cursorReturn", "focusRestore"])
+    }
+
+    func testDoubleClickRestoresFocusOnceAfterSecondClick() {
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let focus = RecordingFocusRestorer()
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            focus: focus,
+            doubleClickIntervalProvider: { 0.5 }
+        )
+
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_000_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_050_000_000))
+
+        XCTAssertEqual(input.mouseClickCounts, [1, 1])
+        XCTAssertEqual(focus.calls, [.captureFocusedWindow])
+
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_200_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_250_000_000))
+
+        XCTAssertEqual(input.mouseClickCounts, [1, 1, 2, 2])
+        XCTAssertEqual(focus.calls, [.captureFocusedWindow, .restoreCapturedWindow])
+    }
+
+    func testFastSecondTouchCompletesFirstCleanupAndBypassesTapDebounce() {
+        let queue = DispatchQueue(label: "MacXeneonEdgeTouchDriverTests.fast-double-click")
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let focus = RecordingFocusRestorer()
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            focus: focus,
+            timing: GestureTiming(
+                warpToClickDelayMs: 0,
+                downToUpDelayMs: 50,
+                clickToWarpBackDelayMs: 50,
+                tapDebounceMs: 50
+            ),
+            doubleClickIntervalProvider: { 0.5 },
+            schedulingQueue: queue
+        )
+        let cleanupSettled = expectation(description: "fast double-click cleanup settled")
+
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_000_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_010_000_000))
+        controller.handle(event(.down, rawX: 0, rawY: 0, timestampNanoseconds: 1_020_000_000))
+        controller.handle(event(.up, rawX: 0, rawY: 0, timestampNanoseconds: 1_040_000_000))
+        queue.asyncAfter(deadline: .now() + .milliseconds(150)) {
+            cleanupSettled.fulfill()
+        }
+
+        wait(for: [cleanupSettled], timeout: 1)
+        XCTAssertEqual(input.mouseClickCounts, [1, 1, 2, 2])
+        XCTAssertEqual(cursor.calls, [
+            .borrow(CGPoint(x: 100, y: 200)),
+            .returnToOrigin,
+            .borrow(CGPoint(x: 100, y: 200)),
+            .returnToOrigin
+        ])
+        XCTAssertEqual(focus.calls, [.captureFocusedWindow, .restoreCapturedWindow])
+        XCTAssertEqual(controller.state, .idle)
     }
 
     func testForceCancelRestoresFocusedWindow() {
@@ -144,7 +317,7 @@ final class GestureControllerTests: XCTestCase {
         XCTAssertEqual(focus.calls, [.captureFocusedWindow, .restoreCapturedWindow])
     }
 
-    func testMoveBeforeDelayedMouseDownCancelsPendingMouseDown() {
+    func testMoveBeforeHoldCancelsPendingDragAndScrolls() {
         let queue = DispatchQueue(label: "MacXeneonEdgeTouchDriverTests.delayed-move")
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
@@ -171,10 +344,42 @@ final class GestureControllerTests: XCTestCase {
         XCTAssertEqual(
             input.calls,
             [
-                .mouseDown(CGPoint(x: 100, y: 200)),
-                .mouseDragged(CGPoint(x: 2_660, y: 920))
+                .scroll(deltaX: 2_560, deltaY: 720, phase: .began)
             ]
         )
+    }
+
+    func testHoldThenMovePostsMouseDrag() {
+        let queue = DispatchQueue(label: "MacXeneonEdgeTouchDriverTests.hold-drag")
+        let input = RecordingInputSink()
+        let cursor = RecordingCursorController()
+        let controller = makeController(
+            input: input,
+            cursor: cursor,
+            timing: GestureTiming(
+                warpToClickDelayMs: 0,
+                downToUpDelayMs: 0,
+                clickToWarpBackDelayMs: 0,
+                tapDebounceMs: 0,
+                holdToDragMs: 30
+            ),
+            schedulingQueue: queue
+        )
+        let held = expectation(description: "hold classified as drag")
+
+        controller.handle(event(.down, rawX: 0, rawY: 0))
+        queue.asyncAfter(deadline: .now() + .milliseconds(50)) {
+            controller.handle(self.event(.move, rawX: 16_383, rawY: 9_599))
+            controller.handle(self.event(.up, rawX: 16_383, rawY: 9_599))
+            held.fulfill()
+        }
+
+        wait(for: [held], timeout: 1)
+        XCTAssertEqual(input.calls, [
+            .mouseDown(CGPoint(x: 100, y: 200)),
+            .mouseDragged(CGPoint(x: 2_660, y: 920)),
+            .mouseUp(CGPoint(x: 2_660, y: 920))
+        ])
     }
 
     func testDelayedTapSchedulesMouseUpThenCursorReturn() {
@@ -234,7 +439,7 @@ final class GestureControllerTests: XCTestCase {
 
         wait(for: [delayedWorkSettled], timeout: 1.0)
         XCTAssertTrue(input.calls.isEmpty)
-        XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200)), .returnToOrigin])
+        XCTAssertEqual(cursor.calls, [.returnToOrigin])
         XCTAssertEqual(controller.state, .idle)
     }
 
@@ -243,6 +448,7 @@ final class GestureControllerTests: XCTestCase {
         cursor: RecordingCursorController,
         focus: FocusRestorer = NoOpFocusRestorer(),
         timing: GestureTiming = .immediate,
+        doubleClickIntervalProvider: @escaping () -> TimeInterval = { 0.5 },
         schedulingQueue: DispatchQueue? = nil
     ) -> GestureController {
         let mapper = CoordinateMapper(displayBounds: CGRect(x: 100, y: 200, width: 2_560, height: 720))
@@ -252,6 +458,7 @@ final class GestureControllerTests: XCTestCase {
             cursorController: cursor,
             focusRestorer: focus,
             timing: timing,
+            doubleClickIntervalProvider: doubleClickIntervalProvider,
             schedulingQueue: schedulingQueue
         )
     }
@@ -309,10 +516,12 @@ private final class RecordingInputSink: SyntheticInputSink {
         case mouseDown(CGPoint)
         case mouseUp(CGPoint)
         case mouseDragged(CGPoint)
+        case scroll(deltaX: CGFloat, deltaY: CGFloat, phase: SyntheticScrollPhase)
     }
 
     private let lock = NSLock()
     private var recordedCalls: [Call] = []
+    private var recordedMouseClickCounts: [Int] = []
 
     var calls: [Call] {
         lock.lock()
@@ -320,21 +529,34 @@ private final class RecordingInputSink: SyntheticInputSink {
         return recordedCalls
     }
 
-    func postMouseDown(at point: CGPoint) {
-        append(.mouseDown(point))
+    var mouseClickCounts: [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedMouseClickCounts
     }
 
-    func postMouseUp(at point: CGPoint) {
-        append(.mouseUp(point))
+    func postMouseDown(at point: CGPoint, clickCount: Int) {
+        append(.mouseDown(point), clickCount: clickCount)
+    }
+
+    func postMouseUp(at point: CGPoint, clickCount: Int) {
+        append(.mouseUp(point), clickCount: clickCount)
     }
 
     func postMouseDragged(to point: CGPoint) {
         append(.mouseDragged(point))
     }
 
-    private func append(_ call: Call) {
+    func postScroll(deltaX: CGFloat, deltaY: CGFloat, phase: SyntheticScrollPhase) {
+        append(.scroll(deltaX: deltaX, deltaY: deltaY, phase: phase))
+    }
+
+    private func append(_ call: Call, clickCount: Int? = nil) {
         lock.lock()
         recordedCalls.append(call)
+        if let clickCount {
+            recordedMouseClickCounts.append(clickCount)
+        }
         lock.unlock()
     }
 }
