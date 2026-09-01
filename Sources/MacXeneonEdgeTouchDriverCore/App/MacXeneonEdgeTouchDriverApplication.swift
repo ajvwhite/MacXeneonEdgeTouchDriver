@@ -122,8 +122,38 @@ public final class MacXeneonEdgeTouchDriverApplication {
         CFRunLoopStop(CFRunLoopGetMain())
     }
 
-    fileprivate func handleDisplayReconfiguration() {
-        scheduleDisplayReconciliation(reason: "display reconfiguration")
+    func handleDisplayReconfiguration(
+        displayID: CGDirectDisplayID,
+        flags: CGDisplayChangeSummaryFlags
+    ) {
+        gestureQueue.async { [weak self] in
+            guard let self else { return }
+            self.cancelPairingPresentation()
+
+            if flags.contains(.beginConfigurationFlag) {
+                return
+            }
+
+            let changesMembership = flags.contains(.addFlag) ||
+                flags.contains(.removeFlag) ||
+                flags.contains(.enabledFlag) ||
+                flags.contains(.disabledFlag)
+            if changesMembership {
+                do {
+                    try self.pairingStore.invalidateBootSessionPairing(forDisplayID: displayID)
+                } catch {
+                    DriverLoggers.log(
+                        .error,
+                        category: .display,
+                        "Could not invalidate pairing after display membership changed: \(error.localizedDescription)"
+                    )
+                }
+            }
+
+            self.scheduleDisplayReconciliation(
+                reason: "display reconfiguration for ID \(displayID), flags \(flags.rawValue)"
+            )
+        }
     }
 
     func handleDeviceMatched(_ device: TouchDeviceIdentity) {
@@ -141,6 +171,15 @@ public final class MacXeneonEdgeTouchDriverApplication {
             cancelStuckGestureTimer()
         }
         sessions.removeValue(forKey: device)
+        do {
+            try pairingStore.invalidateBootSessionPairing(for: device)
+        } catch {
+            DriverLoggers.log(
+                .error,
+                category: .display,
+                "Could not invalidate pairing after controller removal: \(error.localizedDescription)"
+            )
+        }
         scheduleDisplayReconciliation(reason: "HID device removal at \(device.hexadecimalLocationID)")
     }
 
@@ -215,7 +254,27 @@ public final class MacXeneonEdgeTouchDriverApplication {
     }
 
     func refreshDisplayMappings(reason: String) {
-        compatibleDisplays = displayResolver.matchingDisplays()
+        let activeDisplays = displayResolver.activeDisplays()
+        do {
+            let removedCount = try pairingStore.reconcileRuntimeDescriptors(
+                connectedDevices: connectedDevices,
+                displays: activeDisplays
+            )
+            if removedCount > 0 {
+                DriverLoggers.log(
+                    .notice,
+                    category: .display,
+                    "Removed \(removedCount) stale runtime pairing(s) after \(reason)."
+                )
+            }
+        } catch {
+            DriverLoggers.log(
+                .error,
+                category: .display,
+                "Could not persist runtime pairing reconciliation: \(error.localizedDescription)"
+            )
+        }
+        compatibleDisplays = displayResolver.matchingDisplays(from: activeDisplays)
         let resolvedDisplays = Dictionary(uniqueKeysWithValues: connectedDevices.compactMap { device in
             pairingStore.resolveDisplay(
                 for: device,
@@ -362,7 +421,11 @@ public final class MacXeneonEdgeTouchDriverApplication {
             object: nil,
             queue: nil
         ) { [weak self] _ in
-            self?.scheduleDisplayReconciliation(reason: "AppKit screen parameters changed")
+            self?.gestureQueue.async { [weak self] in
+                guard let self else { return }
+                self.cancelPairingPresentation()
+                self.scheduleDisplayReconciliation(reason: "AppKit screen parameters changed")
+            }
         }
     }
 
@@ -401,6 +464,13 @@ public final class MacXeneonEdgeTouchDriverApplication {
         }
         reconciliationWork = work
         gestureQueue.asyncAfter(deadline: .now() + .milliseconds(500), execute: work)
+    }
+
+    private func cancelPairingPresentation() {
+        pairingTarget = nil
+        pairingAdvanceWork?.cancel()
+        pairingAdvanceWork = nil
+        pairingOverlay.hide()
     }
 
     private func installSignalHandlers() {
@@ -459,8 +529,8 @@ private final class CoordinateMapperStore {
     }
 }
 
-private let displayReconfigurationCallback: CGDisplayReconfigurationCallBack = { _, _, context in
+private let displayReconfigurationCallback: CGDisplayReconfigurationCallBack = { displayID, flags, context in
     guard let context else { return }
     let app = Unmanaged<MacXeneonEdgeTouchDriverApplication>.fromOpaque(context).takeUnretainedValue()
-    app.handleDisplayReconfiguration()
+    app.handleDisplayReconfiguration(displayID: displayID, flags: flags)
 }

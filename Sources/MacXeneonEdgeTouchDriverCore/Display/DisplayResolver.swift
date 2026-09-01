@@ -114,6 +114,11 @@ public final class DisplayResolver {
         matchingDisplays(from: activeDisplayProvider())
     }
 
+    /// Returns a fresh snapshot of every active display, including incompatible displays.
+    public func activeDisplays() -> [DisplaySnapshot] {
+        activeDisplayProvider()
+    }
+
     /// Returns all compatible displays from supplied snapshots.
     public func matchingDisplays(from displays: [DisplaySnapshot]) -> [DisplaySnapshot] {
         let vendorModelMatches = displays.filter { display in

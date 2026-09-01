@@ -38,15 +38,32 @@ public final class PairingOverlayController: PairingOverlayPresenting {
 
     private func present(on display: DisplaySnapshot, title: String, detail: String) -> Bool {
         runOnMainReturning { [weak self] in
-            guard let self, let screen = Self.screen(for: display.displayID) else {
+            let screens = NSScreen.screens
+            guard let self,
+                  let primaryScreen = screens.first,
+                  let screen = Self.screen(for: display.displayID, in: screens) else {
                 DriverLoggers.log(.error, category: .display, "Could not present pairing overlay for display \(display.displayID).")
+                return false
+            }
+
+            let expectedFrame = PairingOverlayGeometry.appKitFrame(
+                for: display.bounds,
+                primaryCoreGraphicsFrame: CGDisplayBounds(CGMainDisplayID()),
+                primaryAppKitFrame: primaryScreen.frame
+            )
+            guard PairingOverlayGeometry.framesMatch(screen.frame, expectedFrame) else {
+                DriverLoggers.log(
+                    .warning,
+                    category: .display,
+                    "AppKit screen geometry is not ready for display \(display.displayID); expected \(expectedFrame), received \(screen.frame)."
+                )
                 return false
             }
 
             self.window?.orderOut(nil)
 
             let window = NSWindow(
-                contentRect: screen.frame,
+                contentRect: .zero,
                 styleMask: .borderless,
                 backing: .buffered,
                 defer: false,
@@ -57,20 +74,38 @@ public final class PairingOverlayController: PairingOverlayPresenting {
             window.isOpaque = true
             window.hasShadow = false
             window.ignoresMouseEvents = true
-            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+            window.collectionBehavior = [.fullScreenAuxiliary, .stationary]
             window.contentView = PairingOverlayView(title: title, detail: detail)
-            window.setFrame(screen.frame, display: true)
+            window.setFrame(expectedFrame, display: true)
             window.orderFrontRegardless()
+
+            guard Self.displayID(for: window.screen) == display.displayID,
+                  PairingOverlayGeometry.framesMatch(window.frame, expectedFrame) else {
+                DriverLoggers.log(
+                    .warning,
+                    category: .display,
+                    "Pairing overlay moved away from target display \(display.displayID); presentation will retry."
+                )
+                window.orderOut(nil)
+                return false
+            }
+
             self.window = window
             return true
         }
     }
 
-    private static func screen(for displayID: CGDirectDisplayID) -> NSScreen? {
-        NSScreen.screens.first { screen in
-            let key = NSDeviceDescriptionKey("NSScreenNumber")
-            return (screen.deviceDescription[key] as? NSNumber)?.uint32Value == displayID
-        }
+    private static func screen(
+        for displayID: CGDirectDisplayID,
+        in screens: [NSScreen]
+    ) -> NSScreen? {
+        screens.first { Self.displayID(for: $0) == displayID }
+    }
+
+    private static func displayID(for screen: NSScreen?) -> CGDirectDisplayID? {
+        guard let screen else { return nil }
+        let key = NSDeviceDescriptionKey("NSScreenNumber")
+        return (screen.deviceDescription[key] as? NSNumber)?.uint32Value
     }
 
     private func runOnMain(_ operation: @escaping () -> Void) {
@@ -86,6 +121,33 @@ public final class PairingOverlayController: PairingOverlayPresenting {
             return operation()
         }
         return DispatchQueue.main.sync(execute: operation)
+    }
+}
+
+/// Pure coordinate conversion and comparison used to validate AppKit readiness.
+enum PairingOverlayGeometry {
+    static func appKitFrame(
+        for coreGraphicsFrame: CGRect,
+        primaryCoreGraphicsFrame: CGRect,
+        primaryAppKitFrame: CGRect
+    ) -> CGRect {
+        CGRect(
+            x: primaryAppKitFrame.minX + coreGraphicsFrame.minX - primaryCoreGraphicsFrame.minX,
+            y: primaryAppKitFrame.maxY - (coreGraphicsFrame.maxY - primaryCoreGraphicsFrame.minY),
+            width: coreGraphicsFrame.width,
+            height: coreGraphicsFrame.height
+        )
+    }
+
+    static func framesMatch(
+        _ lhs: CGRect,
+        _ rhs: CGRect,
+        tolerance: CGFloat = 1
+    ) -> Bool {
+        abs(lhs.minX - rhs.minX) <= tolerance &&
+            abs(lhs.minY - rhs.minY) <= tolerance &&
+            abs(lhs.width - rhs.width) <= tolerance &&
+            abs(lhs.height - rhs.height) <= tolerance
     }
 }
 

@@ -101,8 +101,10 @@ public final class PairingStore {
     ) -> DisplaySnapshot? {
         if let exact = pairings.first(where: {
             $0.bootSessionIdentifier == bootSessionIdentifier &&
-            $0.device.locationID == device.locationID
-        }), let display = displays.first(where: { $0.displayID == exact.displayID }) {
+            runtimeDevice($0.device, matches: device)
+        }), let display = displays.first(where: {
+            $0.displayID == exact.displayID && runtimeDisplay(exact, matches: $0)
+        }) {
             return display
         }
 
@@ -119,6 +121,46 @@ public final class PairingStore {
         }
 
         return displays.first { $0.hardwareKey == displayKey }
+    }
+
+    /// Removes same-boot pairings whose reused runtime identifiers now describe
+    /// different public hardware. Missing endpoints are left for explicit removal
+    /// callbacks so staged login enumeration cannot erase a valid pairing.
+    @discardableResult
+    public func reconcileRuntimeDescriptors(
+        connectedDevices: Set<TouchDeviceIdentity>,
+        displays: [DisplaySnapshot]
+    ) throws -> Int {
+        let originalCount = pairings.count
+        pairings.removeAll { pairing in
+            guard pairing.scope == .bootSession,
+                  pairing.bootSessionIdentifier == bootSessionIdentifier else {
+                return false
+            }
+
+            let deviceWasReused = connectedDevices
+                .first { $0.locationID == pairing.device.locationID }
+                .map { !runtimeDevice(pairing.device, matches: $0) } ?? false
+            let displayWasReused = displays
+                .first { $0.displayID == pairing.displayID }
+                .map { !runtimeDisplay(pairing, matches: $0) } ?? false
+            return deviceWasReused || displayWasReused
+        }
+        let removedCount = originalCount - pairings.count
+        if removedCount > 0 { try save() }
+        return removedCount
+    }
+
+    /// Invalidates ambiguous same-boot authority after a controller disconnects.
+    public func invalidateBootSessionPairing(for device: TouchDeviceIdentity) throws {
+        try removeBootSessionPairings {
+            $0.device.locationID == device.locationID
+        }
+    }
+
+    /// Invalidates ambiguous same-boot authority after display membership changes.
+    public func invalidateBootSessionPairing(forDisplayID displayID: CGDirectDisplayID) throws {
+        try removeBootSessionPairings { $0.displayID == displayID }
     }
 
     /// Assigns a mapping and chooses the strongest scope justified by current public data.
@@ -169,6 +211,36 @@ public final class PairingStore {
             $0.device.locationID == device.locationID
         }
         try save()
+    }
+
+    private func removeBootSessionPairings(
+        where shouldRemove: (TouchDisplayPairing) -> Bool
+    ) throws {
+        let originalCount = pairings.count
+        pairings.removeAll {
+            $0.scope == .bootSession &&
+            $0.bootSessionIdentifier == bootSessionIdentifier &&
+            shouldRemove($0)
+        }
+        if pairings.count != originalCount { try save() }
+    }
+
+    private func runtimeDevice(
+        _ saved: TouchDeviceIdentity,
+        matches current: TouchDeviceIdentity
+    ) -> Bool {
+        saved.locationID == current.locationID &&
+        saved.serialNumber == current.serialNumber
+    }
+
+    private func runtimeDisplay(
+        _ pairing: TouchDisplayPairing,
+        matches display: DisplaySnapshot
+    ) -> Bool {
+        pairing.displayID == display.displayID &&
+        pairing.displayVendorNumber == display.vendorNumber &&
+        pairing.displayModelNumber == display.modelNumber &&
+        pairing.displaySerialNumber == display.serialNumber
     }
 
     private func load() {

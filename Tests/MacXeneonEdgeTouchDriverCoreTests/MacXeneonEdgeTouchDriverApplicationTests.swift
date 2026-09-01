@@ -161,6 +161,77 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
         ])
     }
 
+    func testControllerRemovalInvalidatesBootSessionPairing() throws {
+        let target = display(id: 41, runtimeIdentifier: "TARGET", x: 100)
+        let resolver = DisplayResolver(activeDisplayProvider: { [target] })
+        let store = pairingStore()
+        let device = TouchDeviceIdentity(locationID: 1)
+        try store.assign(device: device, to: target, connectedDevices: [device], displays: [target])
+        let application = MacXeneonEdgeTouchDriverApplication(
+            configuration: immediateConfiguration(),
+            displayResolver: resolver,
+            inputSink: ApplicationRecordingInputSink(),
+            cursorController: ApplicationRecordingCursorController(),
+            pairingStore: store,
+            pairingOverlay: ApplicationRecordingPairingOverlay()
+        )
+
+        application.handleDeviceMatched(device)
+        application.handleDeviceRemoval(device)
+
+        XCTAssertTrue(store.pairings.isEmpty)
+    }
+
+    func testDisplayMembershipChangeInvalidatesBootSessionPairingAndHidesOverlay() throws {
+        let target = display(id: 41, runtimeIdentifier: "TARGET", x: 100)
+        let resolver = DisplayResolver(activeDisplayProvider: { [target] })
+        let store = pairingStore()
+        let overlay = ApplicationRecordingPairingOverlay()
+        let device = TouchDeviceIdentity(locationID: 1)
+        try store.assign(device: device, to: target, connectedDevices: [device], displays: [target])
+        let application = MacXeneonEdgeTouchDriverApplication(
+            configuration: immediateConfiguration(),
+            displayResolver: resolver,
+            inputSink: ApplicationRecordingInputSink(),
+            cursorController: ApplicationRecordingCursorController(),
+            pairingStore: store,
+            pairingOverlay: overlay
+        )
+
+        application.handleDeviceMatched(device)
+        application.handleDisplayReconfiguration(displayID: target.displayID, flags: .removeFlag)
+        waitForAsyncWork(milliseconds: 100)
+
+        XCTAssertTrue(store.pairings.isEmpty)
+        XCTAssertTrue(overlay.calls.contains(.hide))
+    }
+
+    func testBoundsOnlyDisplayChangePreservesBootSessionPairing() throws {
+        let target = display(id: 41, runtimeIdentifier: "TARGET", x: 100)
+        let resolver = DisplayResolver(activeDisplayProvider: { [target] })
+        let store = pairingStore()
+        let device = TouchDeviceIdentity(locationID: 1)
+        try store.assign(device: device, to: target, connectedDevices: [device], displays: [target])
+        let application = MacXeneonEdgeTouchDriverApplication(
+            configuration: immediateConfiguration(),
+            displayResolver: resolver,
+            inputSink: ApplicationRecordingInputSink(),
+            cursorController: ApplicationRecordingCursorController(),
+            pairingStore: store,
+            pairingOverlay: ApplicationRecordingPairingOverlay()
+        )
+
+        application.handleDeviceMatched(device)
+        application.handleDisplayReconfiguration(displayID: target.displayID, flags: .movedFlag)
+        waitForAsyncWork(milliseconds: 100)
+
+        XCTAssertEqual(store.pairings.count, 1)
+        XCTAssertEqual(
+            store.resolveDisplay(for: device, connectedDevices: [device], displays: [target]),
+            target
+        )
+    }
+
     func testUnavailableOverlayDoesNotAuthorizeTouchRouting() {
         let target = display(id: 41, runtimeIdentifier: "TARGET", x: 100)
         let resolver = DisplayResolver(activeDisplayProvider: { [target] })

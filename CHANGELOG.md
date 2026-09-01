@@ -10,6 +10,9 @@
 - Lets local installers supply a stable signing identity so macOS privacy approval can survive executable upgrades.
 - Recognizes a fast second tap even when it arrives during the first click's delayed cleanup and emits the macOS click-count sequence `1`, then `2`.
 - Restores the previously focused application and exact window with documented activation and Accessibility APIs, without a synthetic title-bar click.
+- Rejects same-boot controller or display IDs when their current public descriptors no longer match the saved pairing.
+- Invalidates ambiguous runtime pairings on hardware membership changes while preserving mappings across bounds-only rearrangement.
+- Verifies AppKit screen identity and geometry before showing calibration, retrying instead of placing the overlay on another display.
 
 ## 1.0.0 - 2026-05-03
 

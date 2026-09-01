@@ -116,7 +116,9 @@ When a controller has no valid saved assignment, the driver covers one compatibl
 
 Repeat for each overlay. Pairings survive driver restarts during the same boot. They survive a Mac restart only when both the touch controller and display report public hardware serials that are unique among the attached devices. Identical controllers with duplicate serials and displays with a zero EDID serial—such as the tested Prechen panels—deliberately request pairing once after each reboot because macOS exposes no supported durable association between their USB and video endpoints.
 
-Display position is never used as identity. CoreGraphics and AppKit display-change notifications trigger a debounced refresh of live display bounds, so rearrangement, resolution changes, and ordinary hotplug update the global click destination without recalibrating an otherwise valid current-boot pairing. If AppKit is not ready to place the calibration window during login, the driver retries for a bounded period and listens for the next supported display-change event.
+Display position is never used as identity. CoreGraphics and AppKit display-change notifications trigger a debounced refresh of live display bounds, so rearrangement and resolution changes update the global click destination without recalibrating an otherwise valid current-boot pairing. If AppKit is not ready to place the calibration window during login, the driver retries for a bounded period and listens for the next supported display-change event.
+
+When display membership changes, the driver rejects runtime IDs whose current public descriptors no longer match the saved device or display. Ambiguous same-boot pairings are invalidated after the relevant controller or display is removed and require another physical touch. Bounds-only rearrangement keeps the pairing and updates its mapper. The calibration overlay is shown only after the target `NSScreen` identity and frame agree with the current CoreGraphics display snapshot; geometry that is still settling causes a retry instead of placing the prompt on another display.
 
 Gesture behavior:
 
