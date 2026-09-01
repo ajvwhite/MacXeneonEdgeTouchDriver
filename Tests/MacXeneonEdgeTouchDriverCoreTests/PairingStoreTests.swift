@@ -1,6 +1,6 @@
 import CoreGraphics
 import Foundation
-import MacXeneonEdgeTouchDriverCore
+@testable import MacXeneonEdgeTouchDriverCore
 import XCTest
 
 final class PairingStoreTests: XCTestCase {
@@ -150,6 +150,20 @@ final class PairingStoreTests: XCTestCase {
         XCTAssertTrue(reloaded.pairings.isEmpty)
     }
 
+    func testExpiredBootSessionRecordsArePrunedFromPersistence() throws {
+        let url = temporaryURL()
+        let device = TouchDeviceIdentity(locationID: 1)
+        let display = makeDisplay(id: 41, serial: 0)
+        let firstBoot = PairingStore(url: url, bootSessionIdentifier: "BOOT-A")
+        try firstBoot.assign(device: device, to: display, connectedDevices: [device], displays: [display])
+
+        let secondBoot = PairingStore(url: url, bootSessionIdentifier: "BOOT-B")
+        XCTAssertTrue(secondBoot.pairings.isEmpty)
+
+        let oldBootReloaded = PairingStore(url: url, bootSessionIdentifier: "BOOT-A")
+        XCTAssertTrue(oldBootReloaded.pairings.isEmpty)
+    }
+
     func testUniquePublicHardwareIdentitiesRestoreAcrossBootAndRuntimeIDChanges() throws {
         let url = temporaryURL()
         let oldDevice = TouchDeviceIdentity(locationID: 1, serialNumber: "TOUCH-A")
@@ -247,19 +261,35 @@ final class PairingStoreTests: XCTestCase {
         XCTAssertTrue(store.pairings.isEmpty)
     }
 
-    func testBootSessionIdentifierUsesBootTimeRatherThanProcessStart() {
+    func testBootSessionIdentifierUsesKernelBootTimeAcrossProcessTimes() {
         let now = Date(timeIntervalSince1970: 10_000)
 
         XCTAssertEqual(
-            PairingStore.currentBootSessionIdentifier(now: now, systemUptime: 1_000),
-            "boot-9000"
+            PairingStore.currentBootSessionIdentifier(
+                kernelBootTimeSeconds: 8_765,
+                now: now,
+                systemUptime: 1_000
+            ),
+            "boot-8765"
         )
         XCTAssertEqual(
             PairingStore.currentBootSessionIdentifier(
+                kernelBootTimeSeconds: 8_765,
                 now: now.addingTimeInterval(20),
                 systemUptime: 1_020
             ),
-            "boot-9000"
+            "boot-8765"
+        )
+    }
+
+    func testBootSessionIdentifierFallbackCannotMatchKernelMarker() {
+        XCTAssertEqual(
+            PairingStore.currentBootSessionIdentifier(
+                kernelBootTimeSeconds: nil,
+                now: Date(timeIntervalSince1970: 10_000),
+                systemUptime: 1_000
+            ),
+            "fallback-boot-9000"
         )
     }
 

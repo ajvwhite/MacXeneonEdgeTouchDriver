@@ -13,6 +13,8 @@ After replacing the connected display topology without rebooting, CoreGraphics r
 
 The driver correctly chose compatible display ID 4 as the next pairing target, but its AppKit overlay window appeared at the main display origin. A fresh process saw the correct `NSScreen` geometry while the long-running driver window remained on the Samsung. The pairing file also retained an older same-boot record in which display ID 5 described a touch panel, proving that numeric display IDs can be reused during one boot after a topology replacement.
 
+Installation testing exposed a related persistence defect: deriving boot time from wall clock minus `ProcessInfo.systemUptime` changed after sleep because that uptime does not include the full sleeping interval on this Mac. The documented Darwin `sysctlbyname` interface exposes `KERN_BOOTTIME` as a `timeval`; that kernel value becomes the boot-session authority. If it is unavailable, the driver uses a namespaced conservative fallback that may request extra calibration but cannot match a kernel-backed marker accidentally.
+
 ## Considered approaches
 
 ### Restart after every topology change
@@ -37,6 +39,8 @@ A same-boot runtime pairing is valid only when all of the following remain true:
 - the current display vendor, model, and serial agree with the saved descriptor.
 
 Invalid same-boot pairings are removed atomically. Hardware-scoped pairings continue to resolve across runtime-ID changes only under the existing uniqueness rules.
+
+Loading persistence also prunes records from older boot sessions and rewrites the file. This prevents ignored runtime IDs from accumulating or becoming visible as apparently current state. The kernel boot time, not process uptime, defines the current boot session.
 
 An explicit HID removal invalidates that controller's boot-session pairing. A CoreGraphics add, remove, enable, or disable event ends the current calibration presentation and schedules reconciliation after the display transaction. Bounds-only movement, main-display changes, and mode changes retain pairings and update the mapper from live bounds.
 
@@ -73,6 +77,8 @@ Automated tests cover:
 
 - same-boot display-ID reuse with a different vendor/model/serial;
 - same-boot controller-location reuse with a different public serial;
+- stable kernel boot identity across sleep and a conservative fallback when it is unavailable;
+- physical pruning of records from expired boot sessions;
 - pruning obsolete compatible-display records;
 - preserving a pairing across a bounds-only rearrangement;
 - invalidating boot-session authority after controller removal;

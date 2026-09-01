@@ -13,6 +13,7 @@
 - Rejects same-boot controller or display IDs when their current public descriptors no longer match the saved pairing.
 - Invalidates ambiguous runtime pairings on hardware membership changes while preserving mappings across bounds-only rearrangement.
 - Verifies AppKit screen identity and geometry before showing calibration, retrying instead of placing the overlay on another display.
+- Uses the documented kernel boot time for same-boot persistence so sleep does not invalidate pairings, and prunes expired runtime records on load.
 
 ## 1.0.0 - 2026-05-03
 

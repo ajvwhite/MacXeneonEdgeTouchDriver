@@ -1,4 +1,5 @@
 import CoreGraphics
+import Darwin
 import Foundation
 
 /// Lifetime of a persisted pairing.
@@ -80,17 +81,26 @@ public final class PairingStore {
             .appendingPathComponent("pairings.json", isDirectory: false)
     }
 
-    /// A supported, conservative marker for the current boot.
-    ///
-    /// Wall clock minus Foundation system uptime estimates the boot date. Rounding
-    /// makes the value stable across process restarts. Clock corrections may cause
-    /// a safe extra calibration but can never authorize an incorrect stale mapping.
-    public static func currentBootSessionIdentifier(
+    /// A supported marker backed by the kernel-reported system boot time.
+    public static func currentBootSessionIdentifier() -> String {
+        currentBootSessionIdentifier(
+            kernelBootTimeSeconds: kernelBootTimeSeconds(),
+            now: Date(),
+            systemUptime: ProcessInfo.processInfo.systemUptime
+        )
+    }
+
+    static func currentBootSessionIdentifier(
+        kernelBootTimeSeconds: Int64?,
         now: Date = Date(),
         systemUptime: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) -> String {
+        if let kernelBootTimeSeconds {
+            return "boot-\(kernelBootTimeSeconds)"
+        }
+
         let bootEpochSeconds = Int64((now.timeIntervalSince1970 - systemUptime).rounded())
-        return "boot-\(bootEpochSeconds)"
+        return "fallback-boot-\(bootEpochSeconds)"
     }
 
     /// Resolves a controller to a current display without using display bounds as identity.
@@ -255,8 +265,20 @@ public final class PairingStore {
                 return
             }
             let decoded = try JSONDecoder().decode(PairingFile.self, from: data)
-            pairings = decoded.pairings.filter {
+            let retainedPairings = decoded.pairings.filter {
                 $0.scope == .hardware || $0.bootSessionIdentifier == bootSessionIdentifier
+            }
+            pairings = retainedPairings
+            if retainedPairings.count != decoded.pairings.count {
+                do {
+                    try save()
+                } catch {
+                    DriverLoggers.log(
+                        .error,
+                        category: .display,
+                        "Could not prune expired runtime pairings: \(error.localizedDescription)"
+                    )
+                }
             }
         } catch {
             DriverLoggers.log(.error, category: .display, "Could not load pairing file at \(url.path): \(error.localizedDescription)")
@@ -272,5 +294,13 @@ public final class PairingStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(PairingFile(pairings: pairings))
         try data.write(to: url, options: .atomic)
+    }
+
+    private static func kernelBootTimeSeconds() -> Int64? {
+        var bootTime = timeval()
+        var size = MemoryLayout<timeval>.size
+        let result = sysctlbyname("kern.boottime", &bootTime, &size, nil, 0)
+        guard result == 0, size == MemoryLayout<timeval>.size else { return nil }
+        return Int64(bootTime.tv_sec)
     }
 }

@@ -114,7 +114,7 @@ When a controller has no valid saved assignment, the driver covers one compatibl
 ~/Library/Application Support/MacXeneonEdgeTouchDriver/pairings.json
 ```
 
-Repeat for each overlay. Pairings survive driver restarts during the same boot. They survive a Mac restart only when both the touch controller and display report public hardware serials that are unique among the attached devices. Identical controllers with duplicate serials and displays with a zero EDID serial—such as the tested Prechen panels—deliberately request pairing once after each reboot because macOS exposes no supported durable association between their USB and video endpoints.
+Repeat for each overlay. Pairings survive driver restarts and sleep during the same boot, using the kernel-reported boot time as the session boundary. They survive a Mac restart only when both the touch controller and display report public hardware serials that are unique among the attached devices. Identical controllers with duplicate serials and displays with a zero EDID serial—such as the tested Prechen panels—deliberately request pairing once after each reboot because macOS exposes no supported durable association between their USB and video endpoints.
 
 Display position is never used as identity. CoreGraphics and AppKit display-change notifications trigger a debounced refresh of live display bounds, so rearrangement and resolution changes update the global click destination without recalibrating an otherwise valid current-boot pairing. If AppKit is not ready to place the calibration window during login, the driver retries for a bounded period and listens for the next supported display-change event.
 
