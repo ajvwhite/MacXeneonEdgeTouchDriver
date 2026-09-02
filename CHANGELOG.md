@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Re-resolves the Xeneon Edge display bounds on each touch-down so taps stay accurate after the display is rearranged in System Settings, even when no display reconfiguration callback is delivered to the background LaunchAgent. The last-known mapping is kept if the panel is momentarily absent.
+- `install.sh` honours `CODESIGN_IDENTITY` so rebuilt binaries keep their Accessibility and Input Monitoring grants.
+
 ## 1.0.0 - 2026-05-03
 
 - Initial release of the single-touch Mac Xeneon Edge Touch Driver.
