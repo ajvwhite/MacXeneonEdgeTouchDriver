@@ -34,6 +34,15 @@ swift build -c release --package-path "$package_root"
 
 mkdir -p "$bin_dir" "$log_dir" "$launch_agents_dir"
 install -m 755 "${package_root}/.build/release/${binary_name}" "$installed_binary"
+
+# Optional stable signing identity. SwiftPM leaves the binary ad-hoc (linker) signed, so every
+# rebuild changes its code hash and macOS silently drops the Accessibility / Input Monitoring
+# grants. Signing with a persistent identity (Developer ID or a local self-signed cert) keeps the
+# TCC grants across rebuilds.
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+  echo "Signing installed binary with identity: ${CODESIGN_IDENTITY}"
+  codesign --force --sign "$CODESIGN_IDENTITY" "$installed_binary"
+fi
 touch "${log_dir}/stdout.log" "${log_dir}/stderr.log" "$driver_log_path"
 
 if [ ! -f "$config_path" ]; then

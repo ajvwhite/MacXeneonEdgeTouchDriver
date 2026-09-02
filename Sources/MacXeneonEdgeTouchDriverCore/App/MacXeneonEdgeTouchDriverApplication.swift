@@ -154,6 +154,8 @@ public final class MacXeneonEdgeTouchDriverApplication {
     func handleTouchEvent(_ event: TouchEvent) {
         if mapperStore.currentMapper == nil {
             refreshDisplayMapping(reason: "touch event without display mapper")
+        } else if event.kind == .down, displayLayoutChanged() {
+            refreshDisplayMapping(reason: "touch down following display layout change")
         }
 
         gestureController.handle(event)
@@ -165,6 +167,20 @@ public final class MacXeneonEdgeTouchDriverApplication {
         case .singleTouch:
             scheduleStuckGestureTimer()
         }
+    }
+
+    /// Reports whether the Xeneon display currently resolves to different bounds than the active mapper.
+    ///
+    /// `CGDisplayRegisterReconfigurationCallback` has been observed never firing for this background
+    /// LaunchAgent, which left taps mapped to a stale position after the user rearranged displays in
+    /// System Settings. Checking on every touch-down is a handful of CoreGraphics calls and keeps the
+    /// mapping current per gesture. A failed resolve (e.g. the panel briefly absent around sleep/wake)
+    /// deliberately keeps the last-known mapping.
+    private func displayLayoutChanged() -> Bool {
+        guard let match = displayResolver.resolve() else {
+            return false
+        }
+        return match.bounds != displayResolver.currentBounds
     }
 
     func handleDeviceMatched() {
