@@ -38,6 +38,17 @@ public final class AXFocusRestorer: FocusRestorer {
         }
         self.capturedWindow = nil
 
+        // If AX still reports the captured app/window as focused, no restore is currently
+        // needed (typically because the touched surface is a non-activating, never-key panel
+        // that never took focus). Skipping matters: the restore below ends in a synthetic click
+        // on the captured window's title bar, and macOS treats a click on an already-active
+        // window's title bar as a real click (rename popover in document apps, a window drag if
+        // the gesture continues). When focus did move, the restore path runs unchanged.
+        if isWindowFocused(capturedWindow) {
+            DriverLoggers.log(.debug, category: .focus, "Focused window unchanged after touch gesture; skipping restore.")
+            return
+        }
+
         // Do not use app-level AXFrontmost here; it raises sibling windows from the same application.
         let focusedWindowResult = AXUIElementSetAttributeValue(
             capturedWindow.application,
