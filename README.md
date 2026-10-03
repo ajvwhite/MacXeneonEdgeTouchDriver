@@ -62,7 +62,7 @@ swift build --configuration debug
 swift build --configuration release
 ```
 
-The unit tests use fake input, cursor, and focus dependencies. Delayed gesture tests advance a virtual clock instead of waiting for real time. These checks do not install or run the driver, require attached hardware, or request macOS permissions. GitHub Actions runs the same checks on macOS for pushes and pull requests.
+The unit tests use fake input, cursor, focus, permissions, request workers, signals, run loops, and HID startup dependencies. Delayed gesture tests advance a virtual clock instead of waiting for real time. These checks do not install or run the driver, require attached hardware, or request macOS permissions. GitHub Actions runs the same checks on macOS for pushes and pull requests.
 
 ## Configuration
 
@@ -104,6 +104,14 @@ All fields are optional. Missing or malformed config falls back to defaults and 
 
 `gesture.multiTouchEnabled` is always forced to `false` as the hardware only exposes single touch information, if this ever changes we will look to see how to support multi-touch gestures.
 
+## Permission startup
+
+If synthetic event access is missing, the driver stays alive and waits before opening HID or starting gestures. It installs signal handlers first, makes at most one initial permission request sequence per process, and checks readiness without prompting every two seconds with 500 ms of timer leeway. Grant access to the executable or launcher identified in the log; startup continues automatically. SIGINT, SIGTERM, and normal stop cancel the wait and exit successfully. Cancellation cannot dismiss a dialog macOS has already shown.
+
+CoreGraphics post-event access and Accessibility trust remain separate checks. The existing compatibility rule accepts either; it does not prove that events reach another application. A missing focused window does not prevent touch startup. Apple's [Accessibility API documentation](https://developer.apple.com/documentation/applicationservices/1459186-axisprocesstrustedwithoptions) specifies that its prompt is asynchronous and does not change the immediate return value. The [CoreGraphics request](https://developer.apple.com/documentation/coregraphics/cgrequestposteventaccess()) runs on a separate worker so a blocked request cannot hold up shutdown. Only state changes are logged while waiting.
+
+This wait addresses the synthetic-permission restart loop reported in [issue #1](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/issues/1). Input Monitoring and HID open errors remain separate startup failures, reported with the IOKit error code. Opening HID can itself request Input Monitoring access; denial or another process holding exclusive device access can still cause a failed launch. The driver does not retry HID open on each permission poll. No persistent prompt marker or permission settings are added.
+
 ## Known Caveats
 
 - If the physical mouse is moved during a touch gesture, the cursor will return to the position captured when the touch began.
@@ -112,7 +120,7 @@ All fields are optional. Missing or malformed config falls back to defaults and 
 
 ## Troubleshooting
 
-- If the driver exits immediately, check Accessibility permission for the exact binary location as provided by the install script.
+- If the driver is waiting for synthetic event permission, grant Accessibility to the exact executable or launcher shown in the log. It will continue without a restart.
 - If HID open fails, check Input Monitoring permission and confirm no other process has seized the same VID/PID device.
 - If taps land on the wrong display, run `swift run DisplayInfo` and adjust the optional display config override.
 - For HID investigation, use `swift run HIDDump`; it intentionally runs in non-seize mode and is separate from the production daemon.

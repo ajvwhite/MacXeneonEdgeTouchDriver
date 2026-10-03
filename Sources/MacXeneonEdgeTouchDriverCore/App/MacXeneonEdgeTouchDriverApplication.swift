@@ -1,8 +1,12 @@
-import ApplicationServices
-import AppKit
 import CoreGraphics
 import Darwin
 import Foundation
+
+/// Overrides external monitoring only for deterministic application tests.
+struct DriverMonitoringHooks {
+    let start: () throws -> Void
+    let stop: () -> Void
+}
 
 /// Production application wiring for the Xeneon Edge single-touch driver.
 public final class MacXeneonEdgeTouchDriverApplication {
@@ -40,9 +44,10 @@ public final class MacXeneonEdgeTouchDriverApplication {
     )
 
     private var stuckGestureTimer: DispatchSourceTimer?
-    private var signalSources: [DispatchSourceSignal] = []
     private var didRegisterDisplayCallback = false
-    private var isRunning = false
+    private let startupDependencies: DriverStartupDependencies
+    private let monitoringOverride: DriverMonitoringHooks?
+    private var startupCoordinator: DriverStartupCoordinator?
 
     /// Creates a production application with CoreGraphics side effects.
     public convenience init(configuration: DriverConfiguration = .defaults) {
@@ -56,13 +61,35 @@ public final class MacXeneonEdgeTouchDriverApplication {
     }
 
     /// Creates an application with injectable side-effect dependencies.
-    public init(
+    public convenience init(
         configuration: DriverConfiguration,
         displayResolver: DisplayResolver,
         inputSink: SyntheticInputSink,
         cursorController: CursorController,
         focusRestorer: FocusRestorer = NoOpFocusRestorer()
     ) {
+        self.init(
+            configuration: configuration,
+            displayResolver: displayResolver,
+            inputSink: inputSink,
+            cursorController: cursorController,
+            focusRestorer: focusRestorer,
+            startupDependencies: .live,
+            monitoringOverride: nil
+        )
+    }
+
+    init(
+        configuration: DriverConfiguration,
+        displayResolver: DisplayResolver,
+        inputSink: SyntheticInputSink,
+        cursorController: CursorController,
+        focusRestorer: FocusRestorer = NoOpFocusRestorer(),
+        startupDependencies: DriverStartupDependencies,
+        monitoringOverride: DriverMonitoringHooks?
+    ) {
+        self.startupDependencies = startupDependencies
+        self.monitoringOverride = monitoringOverride
         self.configuration = configuration
         self.displayResolver = displayResolver
         self.inputSink = inputSink
@@ -74,56 +101,53 @@ public final class MacXeneonEdgeTouchDriverApplication {
         stop()
     }
 
-    /// Starts the driver and runs the main CFRunLoop until stopped.
+    /// Starts one driver lifecycle on the main thread, waiting for permission if needed.
     public func run() -> Int32 {
-        guard !isRunning else {
-            return EXIT_SUCCESS
+        precondition(Thread.isMainThread, "Driver lifecycle must run on the main thread.")
+        if startupCoordinator == nil {
+            DriverLoggers.log(.notice, category: .lifecycle, "Starting Mac Xeneon Edge Touch Driver in single-touch mode.")
+            startupCoordinator = DriverStartupCoordinator(
+                dependencies: startupDependencies,
+                startHardware: { [weak self] in try self?.startMonitoring() },
+                stopHardware: { [weak self] in self?.stopMonitoring() }
+            )
         }
+        return startupCoordinator!.run()
+    }
 
-        isRunning = true
-        DriverLoggers.log(.notice, category: .lifecycle, "Starting Mac Xeneon Edge Touch Driver in single-touch mode.")
+    /// Stops the lifecycle on the main thread. Waiting callbacks are invalidated before teardown.
+    public func stop() {
+        guard let startupCoordinator else { return }
+        precondition(Thread.isMainThread, "Driver lifecycle must stop on the main thread.")
+        startupCoordinator.stop()
+    }
+
+    private func startMonitoring() throws {
         gestureController.onBecameIdle = { [weak self] in
             self?.cancelStuckGestureTimer()
         }
-
-        guard verifySyntheticEventPermission() else {
-            stop()
-            return EXIT_FAILURE
-        }
-
-        refreshDisplayMapping(reason: "startup")
-        registerDisplayReconfigurationCallback()
-        installSignalHandlers()
-
-        do {
-            try hidMonitor.start()
-        } catch {
-            DriverLoggers.log(.fault, category: .lifecycle, "Could not start HID monitor: \(error.localizedDescription)")
-            stop()
-            return EXIT_FAILURE
-        }
-
-        CFRunLoopRun()
-        return EXIT_SUCCESS
-    }
-
-    /// Stops monitoring and restores cursor/input state.
-    public func stop() {
-        guard isRunning else {
+        if let monitoringOverride {
+            try monitoringOverride.start()
             return
         }
+        refreshDisplayMapping(reason: "startup")
+        registerDisplayReconfigurationCallback()
+        try hidMonitor.start()
+    }
 
-        hidMonitor.stop()
+    private func stopMonitoring() {
+        if let monitoringOverride {
+            monitoringOverride.stop()
+        } else {
+            hidMonitor.stop()
+        }
         gestureQueue.sync {
             cancelStuckGestureTimer()
             gestureController.forceCancel()
         }
-        unregisterDisplayReconfigurationCallback()
-        signalSources.removeAll()
-        isRunning = false
-
-        DriverLoggers.log(.notice, category: .lifecycle, "Stopped Mac Xeneon Edge Touch Driver.")
-        CFRunLoopStop(CFRunLoopGetMain())
+        if monitoringOverride == nil {
+            unregisterDisplayReconfigurationCallback()
+        }
     }
 
     fileprivate func handleDisplayReconfiguration() {
@@ -223,68 +247,6 @@ public final class MacXeneonEdgeTouchDriverApplication {
             DriverLoggers.log(.error, category: .display, "CGDisplayRemoveReconfigurationCallback failed with \(result.rawValue).")
         }
         didRegisterDisplayCallback = false
-    }
-
-    private func installSignalHandlers() {
-        signalSources = [SIGINT, SIGTERM].map { signalNumber in
-            ignoreDefaultSignalAction(signalNumber)
-
-            let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
-            source.setEventHandler { [weak self] in
-                DriverLoggers.log(.notice, category: .lifecycle, "Received signal \(signalNumber); stopping driver.")
-                self?.stop()
-            }
-            source.resume()
-            return source
-        }
-    }
-
-    private func verifySyntheticEventPermission() -> Bool {
-        if CGPreflightPostEventAccess() {
-            DriverLoggers.log(.notice, category: .lifecycle, "CoreGraphics post-event permission is granted.")
-            return true
-        }
-
-        logPermissionIdentity()
-        DriverLoggers.log(.error, category: .lifecycle, "CoreGraphics post-event permission is not granted; requesting permission if macOS will show a prompt.")
-
-        if CGRequestPostEventAccess() {
-            DriverLoggers.log(.notice, category: .lifecycle, "CoreGraphics post-event permission was granted after request.")
-            return true
-        }
-
-        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        let options = [promptKey: true] as CFDictionary
-        let isAXTrusted = AXIsProcessTrustedWithOptions(options)
-        if isAXTrusted || CGPreflightPostEventAccess() {
-            DriverLoggers.log(.notice, category: .lifecycle, "Accessibility trust is granted after prompt.")
-            return true
-        }
-
-        DriverLoggers.log(
-            .fault,
-            category: .lifecycle,
-            "Synthetic mouse event permission is not granted. Grant Accessibility to the executable or to the launcher app named in the previous log line, then restart the driver."
-        )
-        return false
-    }
-
-    private func logPermissionIdentity() {
-        let executablePath = Bundle.main.executableURL?.path ?? CommandLine.arguments.first ?? "Unknown executable"
-        let launcherPath = NSRunningApplication(processIdentifier: getppid())?.bundleURL?.path ?? "Unknown launcher"
-
-        DriverLoggers.log(.error, category: .lifecycle, "Permission identity: executable=\(executablePath), launcher=\(launcherPath).")
-    }
-
-    private func ignoreDefaultSignalAction(_ signalNumber: Int32) {
-        var action = sigaction()
-        action.__sigaction_u.__sa_handler = SIG_IGN
-        action.sa_flags = 0
-        sigemptyset(&action.sa_mask)
-
-        if sigaction(signalNumber, &action, nil) != 0 {
-            DriverLoggers.log(.error, category: .lifecycle, "sigaction failed for signal \(signalNumber).")
-        }
     }
 }
 
