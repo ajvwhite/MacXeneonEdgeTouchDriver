@@ -92,6 +92,9 @@ All fields are optional. Missing or malformed config falls back to defaults and 
     "expectedWidth": 2560,
     "expectedHeight": 720
   },
+  "focus": {
+    "restorePreviousWindow": true
+  },
   "gesture": {
     "multiTouchEnabled": false
   },
@@ -101,6 +104,8 @@ All fields are optional. Missing or malformed config falls back to defaults and 
   }
 }
 ```
+
+`focus.restorePreviousWindow` defaults to `true`: the driver captures the focused window before each touch and attempts to restore it afterward. Set it to `false` to skip focus capture and restoration, allowing the touched app to keep focus. Cursor return, mouse-button cleanup, and gesture timing are unchanged. Restart the driver after changing the configuration.
 
 `gesture.multiTouchEnabled` is always forced to `false` as the hardware only exposes single touch information, if this ever changes we will look to see how to support multi-touch gestures.
 

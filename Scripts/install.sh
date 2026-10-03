@@ -54,6 +54,9 @@ if [ ! -f "$config_path" ]; then
     "expectedWidth": 2560,
     "expectedHeight": 720
   },
+  "focus": {
+    "restorePreviousWindow": true
+  },
   "gesture": {
     "multiTouchEnabled": false
   },

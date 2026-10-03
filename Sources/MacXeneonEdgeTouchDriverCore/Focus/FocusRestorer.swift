@@ -12,7 +12,7 @@ public protocol FocusRestorer: AnyObject {
     func discardCapturedWindow()
 }
 
-/// Focus restorer used by tests and non-production wiring.
+/// Focus restorer used when restoration is disabled or side effects are unwanted.
 public final class NoOpFocusRestorer: FocusRestorer {
     public init() {}
 

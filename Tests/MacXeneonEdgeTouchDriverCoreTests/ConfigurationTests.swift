@@ -3,6 +3,75 @@ import MacXeneonEdgeTouchDriverCore
 import XCTest
 
 final class ConfigurationTests: XCTestCase {
+    func testFocusRestorationIsEnabledByDefault() {
+        XCTAssertTrue(DriverConfiguration.defaults.focus.restorePreviousWindow)
+    }
+
+    func testFocusRestorationCanBeEnabledOrDisabled() throws {
+        for enabled in [true, false] {
+            let url = try writeConfig("""
+            {
+              "logLevel": "debug",
+              "focus": { "restorePreviousWindow": \(enabled) }
+            }
+            """)
+
+            let result = DriverConfiguration.load(from: url)
+
+            XCTAssertEqual(result.configuration.focus.restorePreviousWindow, enabled)
+            XCTAssertEqual(result.configuration.logLevel, "debug")
+            XCTAssertTrue(result.warnings.isEmpty)
+        }
+    }
+
+    func testMissingOrNullFocusOptionsKeepRestorationEnabled() throws {
+        for contents in [
+            #"{"logLevel":"debug"}"#,
+            #"{"focus":{}}"#,
+            #"{"focus":null}"#,
+            #"{"focus":{"restorePreviousWindow":null}}"#
+        ] {
+            let result = DriverConfiguration.load(from: try writeConfig(contents))
+
+            XCTAssertTrue(result.configuration.focus.restorePreviousWindow, contents)
+            XCTAssertTrue(result.warnings.isEmpty, contents)
+        }
+    }
+
+    func testMalformedFocusOptionsUseDefaultsWithWarning() throws {
+        for contents in [
+            #"{"focus":{"restorePreviousWindow":"false"}}"#,
+            #"{"focus":{"restorePreviousWindow":0}}"#,
+            #"{"focus":false}"#
+        ] {
+            let result = DriverConfiguration.load(from: try writeConfig(contents))
+
+            XCTAssertEqual(result.configuration, .defaults, contents)
+            XCTAssertEqual(result.warnings.count, 1, contents)
+        }
+    }
+
+    func testDisabledFocusRestorationSurvivesCodableRoundTrip() throws {
+        var configuration = DriverConfiguration.defaults
+        configuration.focus.restorePreviousWindow = false
+
+        let encoded = try JSONEncoder().encode(configuration)
+        let decoded = try JSONDecoder().decode(DriverConfiguration.self, from: encoded)
+
+        XCTAssertEqual(decoded, configuration)
+    }
+
+    func testLegacyCompleteConfigurationDecodesWithRestorationEnabled() throws {
+        let encoded = try JSONEncoder().encode(DriverConfiguration.defaults)
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        legacy.removeValue(forKey: "focus")
+
+        let data = try JSONSerialization.data(withJSONObject: legacy)
+        let decoded = try JSONDecoder().decode(DriverConfiguration.self, from: data)
+
+        XCTAssertEqual(decoded, .defaults)
+    }
+
     func testMissingFileUsesDefaultsWithWarning() {
         let url = temporaryDirectory().appendingPathComponent("missing.json")
 

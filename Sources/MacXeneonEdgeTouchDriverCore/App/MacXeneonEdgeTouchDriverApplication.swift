@@ -67,7 +67,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
         self.displayResolver = displayResolver
         self.inputSink = inputSink
         self.cursorController = cursorController
-        self.focusRestorer = focusRestorer
+        self.focusRestorer = configuration.focus.restorePreviousWindow ? focusRestorer : NoOpFocusRestorer()
     }
 
     deinit {

@@ -11,6 +11,9 @@ public struct DriverConfiguration: Codable, Equatable {
     /// Display matching options.
     public var display: Display
 
+    /// Window focus behavior after a touch gesture.
+    public var focus: Focus
+
     /// Gesture feature options.
     public var gesture: Gesture
 
@@ -34,6 +37,7 @@ public struct DriverConfiguration: Codable, Equatable {
             expectedWidth: CapturedXeneonDisplay.expectedWidth,
             expectedHeight: CapturedXeneonDisplay.expectedHeight
         ),
+        focus: Focus(restorePreviousWindow: true),
         gesture: Gesture(
             multiTouchEnabled: XeneonEdgeDevice.supportsMultiTouch,
             pinchHysteresisPx: 5,
@@ -136,6 +140,10 @@ public struct DriverConfiguration: Codable, Equatable {
             }
         }
 
+        if let restorePreviousWindow = partial.focus?.restorePreviousWindow {
+            configuration.focus.restorePreviousWindow = restorePreviousWindow
+        }
+
         if let gesture = partial.gesture {
             if let value = gesture.multiTouchEnabled {
                 configuration.gesture.multiTouchEnabled = value && XeneonEdgeDevice.supportsMultiTouch
@@ -176,6 +184,19 @@ public struct DriverConfiguration: Codable, Equatable {
 }
 
 public extension DriverConfiguration {
+    /// Decodes complete configurations written before the focus option was added.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            logLevel: try values.decode(String.self, forKey: .logLevel),
+            timing: try values.decode(Timing.self, forKey: .timing),
+            display: try values.decode(Display.self, forKey: .display),
+            focus: try values.decodeIfPresent(Focus.self, forKey: .focus) ?? Focus(restorePreviousWindow: true),
+            gesture: try values.decode(Gesture.self, forKey: .gesture),
+            diagnostics: try values.decode(Diagnostics.self, forKey: .diagnostics)
+        )
+    }
+
     /// Timing values in milliseconds.
     struct Timing: Codable, Equatable {
         public var warpToClickDelayMs: Int
@@ -192,6 +213,11 @@ public extension DriverConfiguration {
         public var serialNumber: UInt32?
         public var expectedWidth: Int
         public var expectedHeight: Int
+    }
+
+    /// Window focus configuration.
+    struct Focus: Codable, Equatable {
+        public var restorePreviousWindow: Bool
     }
 
     /// Gesture configuration.
@@ -228,6 +254,7 @@ private struct PartialConfiguration: Decodable {
     var logLevel: String?
     var timing: PartialTiming?
     var display: PartialDisplay?
+    var focus: PartialFocus?
     var gesture: PartialGesture?
     var diagnostics: PartialDiagnostics?
 }
@@ -246,6 +273,10 @@ private struct PartialDisplay: Decodable {
     var serialNumber: UInt32?
     var expectedWidth: Int?
     var expectedHeight: Int?
+}
+
+private struct PartialFocus: Decodable {
+    var restorePreviousWindow: Bool?
 }
 
 private struct PartialGesture: Decodable {
