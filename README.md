@@ -95,6 +95,9 @@ All fields are optional. Missing or malformed config falls back to defaults and 
   "focus": {
     "restorePreviousWindow": true
   },
+  "cursor": {
+    "returnToPreviousPosition": true
+  },
   "gesture": {
     "multiTouchEnabled": false
   },
@@ -105,13 +108,24 @@ All fields are optional. Missing or malformed config falls back to defaults and 
 }
 ```
 
-`focus.restorePreviousWindow` defaults to `true`: the driver captures the focused window before each touch and attempts to restore it afterward. Set it to `false` to skip focus capture and restoration, allowing the touched app to keep focus. Cursor return, mouse-button cleanup, and gesture timing are unchanged. Restart the driver after changing the configuration.
+`focus.restorePreviousWindow` defaults to `true`: the driver captures the focused window before each touch and attempts to restore it afterward. Set it to `false` to skip focus capture and restoration and leave focus to normal window behavior. If focus cannot be captured, the touch still proceeds.
+
+`cursor.returnToPreviousPosition` also defaults to `true`. Set it to `false` to skip the return to the pre-touch cursor position. Cleanup still releases the mouse button, restores cursor visibility and mouse association, and clears the borrowed state. This applies to normal completion, cancellation, device removal, and shutdown. Touch and focus restoration can still move the shared system cursor.
+
+| Restore previous window | Return cursor | End of gesture |
+| --- | --- | --- |
+| `true` | `true` | Return the cursor and attempt to restore the previous window (default). |
+| `false` | `true` | Return the cursor; leave focus to normal window behavior. |
+| `true` | `false` | Release the cursor at its current position and attempt to restore the previous window. |
+| `false` | `false` | Release the cursor at its current position; leave focus to normal window behavior. |
+
+Both settings preserve the existing gesture timing. Restart the driver after changing the configuration.
 
 `gesture.multiTouchEnabled` is always forced to `false` as the hardware only exposes single touch information, if this ever changes we will look to see how to support multi-touch gestures.
 
 ## Known Caveats
 
-- If the physical mouse is moved during a touch gesture, the cursor will return to the position captured when the touch began.
+- With cursor return enabled, physical mouse movement during a touch does not change the saved return position. With it disabled, cleanup leaves the cursor at its current position rather than warping to an assumed final touch point.
 - Multi-contact gestures are not supported as the hardware doesn't report this information back.
 - If the process is killed with `SIGKILL`, normal shutdown cleanup cannot run. Relaunching the driver or moving the physical mouse after cursor association is restored may be needed.
 

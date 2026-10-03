@@ -15,6 +15,7 @@ public final class GestureController {
     private let inputSink: SyntheticInputSink
     private let cursorController: CursorController
     private let focusRestorer: FocusRestorer
+    private let returnCursorToPreviousPosition: Bool
     private var pendingMouseDown: GestureScheduledTask?
     private var pendingMouseUp: GestureScheduledTask?
     private var pendingCursorReturn: GestureScheduledTask?
@@ -26,6 +27,7 @@ public final class GestureController {
         inputSink: SyntheticInputSink,
         cursorController: CursorController,
         focusRestorer: FocusRestorer = NoOpFocusRestorer(),
+        returnCursorToPreviousPosition: Bool = true,
         timing: GestureTiming = .immediate,
         schedulingQueue: DispatchQueue? = nil
     ) {
@@ -34,6 +36,7 @@ public final class GestureController {
             inputSink: inputSink,
             cursorController: cursorController,
             focusRestorer: focusRestorer,
+            returnCursorToPreviousPosition: returnCursorToPreviousPosition,
             timing: timing,
             scheduler: DispatchGestureScheduler(queue: schedulingQueue)
         )
@@ -44,6 +47,7 @@ public final class GestureController {
         inputSink: SyntheticInputSink,
         cursorController: CursorController,
         focusRestorer: FocusRestorer = NoOpFocusRestorer(),
+        returnCursorToPreviousPosition: Bool = true,
         timing: GestureTiming = .immediate,
         scheduler: GestureScheduler
     ) {
@@ -51,6 +55,7 @@ public final class GestureController {
         self.inputSink = inputSink
         self.cursorController = cursorController
         self.focusRestorer = focusRestorer
+        self.returnCursorToPreviousPosition = returnCursorToPreviousPosition
         self.timing = timing
         self.scheduler = scheduler
     }
@@ -159,7 +164,7 @@ public final class GestureController {
             if context.isMouseDownPosted {
                 inputSink.postMouseUp(at: context.lastPoint)
             }
-            cursorController.returnToOrigin()
+            cursorController.releaseBorrow(returnToPreviousPosition: returnCursorToPreviousPosition)
             focusRestorer.restoreCapturedWindow()
             transitionToIdle()
         }
@@ -219,7 +224,7 @@ public final class GestureController {
             return
         }
 
-        cursorController.returnToOrigin()
+        cursorController.releaseBorrow(returnToPreviousPosition: returnCursorToPreviousPosition)
         focusRestorer.restoreCapturedWindow()
         pendingCursorReturn = nil
         transitionToIdle()

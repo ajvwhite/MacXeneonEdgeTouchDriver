@@ -57,6 +57,9 @@ if [ ! -f "$config_path" ]; then
   "focus": {
     "restorePreviousWindow": true
   },
+  "cursor": {
+    "returnToPreviousPosition": true
+  },
   "gesture": {
     "multiTouchEnabled": false
   },

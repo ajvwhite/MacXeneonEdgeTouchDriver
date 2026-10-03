@@ -21,6 +21,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
         inputSink: inputSink,
         cursorController: cursorController,
         focusRestorer: focusRestorer,
+        returnCursorToPreviousPosition: configuration.cursor.returnToPreviousPosition,
         timing: GestureTiming(configuration: configuration.timing),
         schedulingQueue: gestureQueue
     )

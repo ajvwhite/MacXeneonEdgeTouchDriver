@@ -44,31 +44,34 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
         XCTAssertEqual(input.calls, [.mouseDown(CGPoint(x: 100, y: 200)), .mouseUp(CGPoint(x: 100, y: 200))])
     }
 
-    func testDefaultAndConfiguredFocusRestorationPreserveTapInput() {
-        for enabled: Bool? in [nil, true, false] {
-            var configuration = immediateConfiguration()
-            if let enabled {
-                configuration.focus.restorePreviousWindow = enabled
-            }
-            let fixture = makeFocusFixture(configuration: configuration)
-            let mode = enabled.map { "explicit \($0)" } ?? "default"
+    func testFocusAndCursorOptionsIndependentlyPreserveTapInput() {
+        for option in restorationOptions {
+            let fixture = makeRestorationFixture(focus: option.focus, cursor: option.cursor)
+            let restoreFocus = option.focus ?? true
+            let returnCursor = option.cursor ?? true
+            let mode = "focus=\(String(describing: option.focus)), cursor=\(String(describing: option.cursor))"
             let point = CGPoint(x: 100, y: 200)
 
             fixture.application.handleTouchEvent(touchEvent(.down, rawX: 0, rawY: 0))
             fixture.application.handleTouchEvent(touchEvent(.up, rawX: 0, rawY: 0))
 
             XCTAssertEqual(fixture.input.calls, [.mouseDown(point), .mouseUp(point)], mode)
-            XCTAssertEqual(fixture.cursor.calls, [.borrow(point), .returnToOrigin], mode)
-            XCTAssertEqual(fixture.focus.calls, enabled == false ? [] : [.capture, .restore], mode)
+            XCTAssertEqual(fixture.cursor.calls, [.borrow(point), returnCursor ? .returnToOrigin : .forceShow], mode)
+            XCTAssertEqual(fixture.focus.calls, restoreFocus ? [.capture, .restore] : [], mode)
+            let expectedOrder: [ApplicationInteractionRecorder.Call] =
+                (restoreFocus ? [.capture] : []) +
+                [.borrow, .mouseDown, .mouseUp, returnCursor ? .returnToOrigin : .forceShow] +
+                (restoreFocus ? [.restore] : [])
+            XCTAssertEqual(fixture.interactions.calls, expectedOrder, mode)
         }
     }
 
-    func testFocusOptionPreservesImmediateDragAndCursorReturn() {
-        for enabled in [true, false] {
-            var configuration = immediateConfiguration()
-            configuration.focus.restorePreviousWindow = enabled
-            let fixture = makeFocusFixture(configuration: configuration)
-            let mode = "restorePreviousWindow=\(enabled)"
+    func testFocusAndCursorOptionsIndependentlyPreserveImmediateDrag() {
+        for option in restorationOptions {
+            let fixture = makeRestorationFixture(focus: option.focus, cursor: option.cursor)
+            let restoreFocus = option.focus ?? true
+            let returnCursor = option.cursor ?? true
+            let mode = "focus=\(String(describing: option.focus)), cursor=\(String(describing: option.cursor))"
             let start = CGPoint(x: 100, y: 200)
             let end = CGPoint(x: 2_660, y: 920)
 
@@ -79,32 +82,50 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
                 rawX: XeneonEdgeDevice.rawXRange.upperBound, rawY: XeneonEdgeDevice.rawYRange.upperBound))
 
             XCTAssertEqual(fixture.input.calls, [.mouseDown(start), .mouseDragged(end), .mouseUp(end)], mode)
-            XCTAssertEqual(fixture.cursor.calls, [.borrow(start), .update(end), .returnToOrigin], mode)
-            XCTAssertEqual(fixture.focus.calls, enabled ? [.capture, .restore] : [], mode)
+            XCTAssertEqual(fixture.cursor.calls, [.borrow(start), .update(end), returnCursor ? .returnToOrigin : .forceShow], mode)
+            XCTAssertEqual(fixture.focus.calls, restoreFocus ? [.capture, .restore] : [], mode)
+            let expectedOrder: [ApplicationInteractionRecorder.Call] =
+                (restoreFocus ? [.capture] : []) +
+                [.borrow, .mouseDown, .update, .mouseDragged, .mouseUp, returnCursor ? .returnToOrigin : .forceShow] +
+                (restoreFocus ? [.restore] : [])
+            XCTAssertEqual(fixture.interactions.calls, expectedOrder, mode)
         }
     }
 
-    func testDisabledFocusOptionSkipsCaptureAndDiscardWhenCursorBorrowFails() {
-        for enabled in [true, false] {
-            var configuration = immediateConfiguration()
-            configuration.focus.restorePreviousWindow = enabled
-            let fixture = makeFocusFixture(configuration: configuration, borrowSucceeds: false)
-            let mode = "restorePreviousWindow=\(enabled)"
+    func testFocusAndCursorOptionsPreserveFailedBorrowCleanup() {
+        for option in restorationOptions {
+            let fixture = makeRestorationFixture(focus: option.focus, cursor: option.cursor, borrowSucceeds: false)
+            let restoreFocus = option.focus ?? true
+            let mode = "focus=\(String(describing: option.focus)), cursor=\(String(describing: option.cursor))"
 
             fixture.application.handleTouchEvent(touchEvent(.down, rawX: 0, rawY: 0))
             fixture.application.handleTouchEvent(touchEvent(.up, rawX: 0, rawY: 0))
 
             XCTAssertEqual(fixture.input.calls, [], mode)
             XCTAssertEqual(fixture.cursor.calls, [.borrow(CGPoint(x: 100, y: 200))], mode)
-            XCTAssertEqual(fixture.focus.calls, enabled ? [.capture, .discard] : [], mode)
+            XCTAssertEqual(fixture.focus.calls, restoreFocus ? [.capture, .discard] : [], mode)
+            XCTAssertEqual(fixture.interactions.calls, restoreFocus ? [.capture, .borrow, .discard] : [.borrow], mode)
         }
     }
 
-    private func makeFocusFixture(configuration: DriverConfiguration, borrowSucceeds: Bool = true) -> FocusConfigurationFixture {
+    private let restorationOptions: [(focus: Bool?, cursor: Bool?)] = [
+        (nil, nil), (true, true), (true, false), (false, true), (false, false)
+    ]
+
+    private func makeRestorationFixture(focus restoreFocus: Bool?, cursor returnCursor: Bool?,
+                                        borrowSucceeds: Bool = true) -> RestorationConfigurationFixture {
+        var configuration = immediateConfiguration()
+        if let restoreFocus {
+            configuration.focus.restorePreviousWindow = restoreFocus
+        }
+        if let returnCursor {
+            configuration.cursor.returnToPreviousPosition = returnCursor
+        }
         let displays = [xeneonDisplay()]
-        let input = ApplicationRecordingInputSink()
-        let cursor = ApplicationRecordingCursorController(borrowSucceeds: borrowSucceeds)
-        let focus = ApplicationFocusCallRecorder()
+        let interactions = ApplicationInteractionRecorder()
+        let input = ApplicationRecordingInputSink(interactions: interactions)
+        let cursor = ApplicationRecordingCursorController(borrowSucceeds: borrowSucceeds, interactions: interactions)
+        let focus = ApplicationFocusCallRecorder(interactions: interactions)
         let application = MacXeneonEdgeTouchDriverApplication(
             configuration: configuration,
             displayResolver: DisplayResolver(activeDisplayProvider: { displays }),
@@ -112,7 +133,8 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
             cursorController: cursor,
             focusRestorer: focus
         )
-        return FocusConfigurationFixture(application: application, input: input, cursor: cursor, focus: focus)
+        return RestorationConfigurationFixture(application: application, input: input, cursor: cursor,
+                                               focus: focus, interactions: interactions)
     }
 
     private func immediateConfiguration() -> DriverConfiguration {
@@ -142,11 +164,21 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
     }
 }
 
-private struct FocusConfigurationFixture {
+private struct RestorationConfigurationFixture {
     let application: MacXeneonEdgeTouchDriverApplication
     let input: ApplicationRecordingInputSink
     let cursor: ApplicationRecordingCursorController
     let focus: ApplicationFocusCallRecorder
+    let interactions: ApplicationInteractionRecorder
+}
+
+private final class ApplicationInteractionRecorder {
+    enum Call: Equatable {
+        case capture, borrow, mouseDown, update, mouseDragged, mouseUp
+        case returnToOrigin, forceShow, restore, discard
+    }
+
+    var calls: [Call] = []
 }
 
 private final class ApplicationFocusCallRecorder: FocusRestorer {
@@ -157,10 +189,26 @@ private final class ApplicationFocusCallRecorder: FocusRestorer {
     }
 
     private(set) var calls: [Call] = []
+    private let interactions: ApplicationInteractionRecorder?
 
-    func captureFocusedWindow() { calls.append(.capture) }
-    func restoreCapturedWindow() { calls.append(.restore) }
-    func discardCapturedWindow() { calls.append(.discard) }
+    init(interactions: ApplicationInteractionRecorder? = nil) {
+        self.interactions = interactions
+    }
+
+    func captureFocusedWindow() {
+        calls.append(.capture)
+        interactions?.calls.append(.capture)
+    }
+
+    func restoreCapturedWindow() {
+        calls.append(.restore)
+        interactions?.calls.append(.restore)
+    }
+
+    func discardCapturedWindow() {
+        calls.append(.discard)
+        interactions?.calls.append(.discard)
+    }
 }
 
 private final class ApplicationRecordingInputSink: SyntheticInputSink {
@@ -171,17 +219,25 @@ private final class ApplicationRecordingInputSink: SyntheticInputSink {
     }
 
     private(set) var calls: [Call] = []
+    private let interactions: ApplicationInteractionRecorder?
+
+    init(interactions: ApplicationInteractionRecorder? = nil) {
+        self.interactions = interactions
+    }
 
     func postMouseDown(at point: CGPoint) {
         calls.append(.mouseDown(point))
+        interactions?.calls.append(.mouseDown)
     }
 
     func postMouseUp(at point: CGPoint) {
         calls.append(.mouseUp(point))
+        interactions?.calls.append(.mouseUp)
     }
 
     func postMouseDragged(to point: CGPoint) {
         calls.append(.mouseDragged(point))
+        interactions?.calls.append(.mouseDragged)
     }
 }
 
@@ -195,25 +251,31 @@ private final class ApplicationRecordingCursorController: CursorController {
 
     private(set) var calls: [Call] = []
     private let borrowSucceeds: Bool
+    private let interactions: ApplicationInteractionRecorder?
 
-    init(borrowSucceeds: Bool = true) {
+    init(borrowSucceeds: Bool = true, interactions: ApplicationInteractionRecorder? = nil) {
         self.borrowSucceeds = borrowSucceeds
+        self.interactions = interactions
     }
 
     func borrow(warpingTo point: CGPoint) -> Bool {
         calls.append(.borrow(point))
+        interactions?.calls.append(.borrow)
         return borrowSucceeds
     }
 
     func updatePosition(_ point: CGPoint) {
         calls.append(.update(point))
+        interactions?.calls.append(.update)
     }
 
     func returnToOrigin() {
         calls.append(.returnToOrigin)
+        interactions?.calls.append(.returnToOrigin)
     }
 
     func forceShow() {
         calls.append(.forceShow)
+        interactions?.calls.append(.forceShow)
     }
 }

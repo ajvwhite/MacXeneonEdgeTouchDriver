@@ -3,23 +3,30 @@ import MacXeneonEdgeTouchDriverCore
 import XCTest
 
 final class ConfigurationTests: XCTestCase {
-    func testFocusRestorationIsEnabledByDefault() {
+    func testFocusAndCursorRestorationAreEnabledByDefault() {
         XCTAssertTrue(DriverConfiguration.defaults.focus.restorePreviousWindow)
+        XCTAssertTrue(DriverConfiguration.defaults.cursor.returnToPreviousPosition)
     }
 
-    func testFocusRestorationCanBeEnabledOrDisabled() throws {
-        for enabled in [true, false] {
+    func testFocusAndCursorRestorationCanBeConfiguredIndependently() throws {
+        for (restoreFocus, returnCursor) in [(true, true), (true, false), (false, true), (false, false)] {
             let url = try writeConfig("""
             {
               "logLevel": "debug",
-              "focus": { "restorePreviousWindow": \(enabled) }
+              "timing": { "tapDebounceMs": 75 },
+              "focus": { "restorePreviousWindow": \(restoreFocus) },
+              "cursor": { "returnToPreviousPosition": \(returnCursor) }
             }
             """)
 
             let result = DriverConfiguration.load(from: url)
+            var expected = DriverConfiguration.defaults
+            expected.logLevel = "debug"
+            expected.timing.tapDebounceMs = 75
+            expected.focus.restorePreviousWindow = restoreFocus
+            expected.cursor.returnToPreviousPosition = returnCursor
 
-            XCTAssertEqual(result.configuration.focus.restorePreviousWindow, enabled)
-            XCTAssertEqual(result.configuration.logLevel, "debug")
+            XCTAssertEqual(result.configuration, expected)
             XCTAssertTrue(result.warnings.isEmpty)
         }
     }
@@ -38,6 +45,23 @@ final class ConfigurationTests: XCTestCase {
         }
     }
 
+    func testMissingOrNullCursorOptionsKeepReturnEnabledAndPreserveDisabledFocus() throws {
+        for contents in [
+            #"{"logLevel":"debug","focus":{"restorePreviousWindow":false}}"#,
+            #"{"logLevel":"debug","focus":{"restorePreviousWindow":false},"cursor":{}}"#,
+            #"{"logLevel":"debug","focus":{"restorePreviousWindow":false},"cursor":null}"#,
+            #"{"logLevel":"debug","focus":{"restorePreviousWindow":false},"cursor":{"returnToPreviousPosition":null}}"#
+        ] {
+            let result = DriverConfiguration.load(from: try writeConfig(contents))
+            var expected = DriverConfiguration.defaults
+            expected.logLevel = "debug"
+            expected.focus.restorePreviousWindow = false
+
+            XCTAssertEqual(result.configuration, expected, contents)
+            XCTAssertTrue(result.warnings.isEmpty, contents)
+        }
+    }
+
     func testMalformedFocusOptionsUseDefaultsWithWarning() throws {
         for contents in [
             #"{"focus":{"restorePreviousWindow":"false"}}"#,
@@ -51,20 +75,95 @@ final class ConfigurationTests: XCTestCase {
         }
     }
 
-    func testDisabledFocusRestorationSurvivesCodableRoundTrip() throws {
-        var configuration = DriverConfiguration.defaults
-        configuration.focus.restorePreviousWindow = false
+    func testMalformedCursorOptionsUseWholeConfigurationDefaultsWithWarning() throws {
+        for cursor in [
+            #"{"returnToPreviousPosition":"false"}"#,
+            #"{"returnToPreviousPosition":0}"#,
+            #"{"returnToPreviousPosition":[]}"#,
+            #"false"#,
+            #""disabled""#,
+            #"[]"#
+        ] {
+            let contents = """
+            {
+              "logLevel": "debug",
+              "focus": { "restorePreviousWindow": false },
+              "cursor": \(cursor)
+            }
+            """
+            let result = DriverConfiguration.load(from: try writeConfig(contents))
 
+            XCTAssertEqual(result.configuration, .defaults, contents)
+            XCTAssertEqual(result.warnings.count, 1, contents)
+        }
+    }
+
+    func testFocusAndCursorRestorationCombinationsSurviveCodableRoundTrip() throws {
+        for (restoreFocus, returnCursor) in [(true, true), (true, false), (false, true), (false, false)] {
+            var configuration = DriverConfiguration.defaults
+            configuration.logLevel = "debug"
+            configuration.timing.tapDebounceMs = 75
+            configuration.focus.restorePreviousWindow = restoreFocus
+            configuration.cursor.returnToPreviousPosition = returnCursor
+
+            let encoded = try JSONEncoder().encode(configuration)
+            let decoded = try JSONDecoder().decode(DriverConfiguration.self, from: encoded)
+
+            XCTAssertEqual(decoded, configuration)
+        }
+    }
+
+    func testMissingOrNullRestorationOptionsDecodeWithDefaultsFromCompleteConfiguration() throws {
+        var configuration = DriverConfiguration.defaults
+        configuration.logLevel = "debug"
+        configuration.focus.restorePreviousWindow = false
+        configuration.cursor.returnToPreviousPosition = false
         let encoded = try JSONEncoder().encode(configuration)
-        let decoded = try JSONDecoder().decode(DriverConfiguration.self, from: encoded)
+        let complete = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+
+        for (section, field) in [("focus", "restorePreviousWindow"), ("cursor", "returnToPreviousPosition")] {
+            let variants: [(String, Any?)] = [
+                ("absent section", nil),
+                ("null section", NSNull()),
+                ("absent field", [String: Any]()),
+                ("null field", [field: NSNull()])
+            ]
+            for (description, value) in variants {
+                var object = complete
+                object[section] = value
+                let data = try JSONSerialization.data(withJSONObject: object)
+                let decoded = try JSONDecoder().decode(DriverConfiguration.self, from: data)
+                var expected = configuration
+                if section == "focus" {
+                    expected.focus.restorePreviousWindow = true
+                } else {
+                    expected.cursor.returnToPreviousPosition = true
+                }
+
+                XCTAssertEqual(decoded, expected, "\(section): \(description)")
+            }
+        }
+    }
+
+    func testLegacyCompleteConfigurationWithoutCursorPreservesDisabledFocus() throws {
+        var configuration = DriverConfiguration.defaults
+        configuration.logLevel = "debug"
+        configuration.focus.restorePreviousWindow = false
+        let encoded = try JSONEncoder().encode(configuration)
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        legacy.removeValue(forKey: "cursor")
+
+        let data = try JSONSerialization.data(withJSONObject: legacy)
+        let decoded = try JSONDecoder().decode(DriverConfiguration.self, from: data)
 
         XCTAssertEqual(decoded, configuration)
     }
 
-    func testLegacyCompleteConfigurationDecodesWithRestorationEnabled() throws {
+    func testLegacyCompleteConfigurationWithoutFocusOrCursorEnablesBoth() throws {
         let encoded = try JSONEncoder().encode(DriverConfiguration.defaults)
         var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         legacy.removeValue(forKey: "focus")
+        legacy.removeValue(forKey: "cursor")
 
         let data = try JSONSerialization.data(withJSONObject: legacy)
         let decoded = try JSONDecoder().decode(DriverConfiguration.self, from: data)
