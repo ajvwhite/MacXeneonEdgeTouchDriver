@@ -19,7 +19,8 @@ final class FocusPreparationSchedulingTests: XCTestCase {
                     focusRestorer: focus,
                     returnCursorToPreviousPosition: returnCursor,
                     timing: .immediate,
-                    schedulingQueue: queue
+                    scheduler: TracedDispatchGestureScheduler(queue: queue, trace: trace,
+                                                              tracePreparationDeadline: restoreFocus)
                 )
                 controller.onBecameIdle = { idle.fulfill() }
                 queue.async {
@@ -33,7 +34,21 @@ final class FocusPreparationSchedulingTests: XCTestCase {
                 let result = trace.snapshot()
                 XCTAssertEqual(result.events, ["borrow", "down", "up", "release:\(returnCursor)"])
                 XCTAssertNotNil(result.downMilliseconds)
-                print("Preparation input latency: focus=\(restoreFocus), cursor=\(returnCursor), ms=\(result.downMilliseconds ?? -1)")
+                if restoreFocus {
+                    XCTAssertNotNil(result.timerDelayMilliseconds)
+                    XCTAssertNotNil(result.timerScheduledMilliseconds)
+                    XCTAssertNotNil(result.timerCallbackMilliseconds)
+                } else {
+                    XCTAssertNil(result.timerDelayMilliseconds, "Disabled focus preparation should complete inline.")
+                }
+                let continuation = result.timerCallbackMilliseconds.flatMap { callback in
+                    result.downMilliseconds.map { $0 - callback }
+                }
+                print("Preparation input latency: focus=\(restoreFocus), cursor=\(returnCursor), "
+                    + "ms=\(result.downMilliseconds ?? -1), requestedTimerMs=\(result.timerDelayMilliseconds ?? -1), "
+                    + "timerScheduledAtMs=\(result.timerScheduledMilliseconds ?? -1), "
+                    + "timerCallbackAtMs=\(result.timerCallbackMilliseconds ?? -1), "
+                    + "callbackToDownMs=\(continuation ?? -1)")
             }
         }
     }
@@ -44,6 +59,9 @@ private final class SchedulingTrace {
     private var started: UInt64 = 0
     private var events: [String] = []
     private var downMilliseconds: Double?
+    private var timerDelayMilliseconds: Int?
+    private var timerScheduledMilliseconds: Double?
+    private var timerCallbackMilliseconds: Double?
 
     func start() {
         lock.lock()
@@ -60,10 +78,54 @@ private final class SchedulingTrace {
         lock.unlock()
     }
 
-    func snapshot() -> (events: [String], downMilliseconds: Double?) {
+    func timerScheduled(afterMilliseconds milliseconds: Int) {
+        lock.lock()
+        timerDelayMilliseconds = milliseconds
+        timerScheduledMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+        lock.unlock()
+    }
+
+    func timerCallbackEntered() {
+        lock.lock()
+        timerCallbackMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+        lock.unlock()
+    }
+
+    func snapshot() -> (events: [String], downMilliseconds: Double?, timerDelayMilliseconds: Int?,
+                        timerScheduledMilliseconds: Double?, timerCallbackMilliseconds: Double?) {
         lock.lock()
         defer { lock.unlock() }
-        return (events, downMilliseconds)
+        return (events, downMilliseconds, timerDelayMilliseconds, timerScheduledMilliseconds, timerCallbackMilliseconds)
+    }
+}
+
+/// Adds observations around the real scheduler without changing its queue or QoS.
+private final class TracedDispatchGestureScheduler: GestureScheduler {
+    private let scheduler: DispatchGestureScheduler
+    private let trace: SchedulingTrace
+    private var traceNextSchedule: Bool
+
+    init(queue: DispatchQueue, trace: SchedulingTrace, tracePreparationDeadline: Bool) {
+        scheduler = DispatchGestureScheduler(queue: queue)
+        self.trace = trace
+        traceNextSchedule = tracePreparationDeadline
+    }
+
+    var now: DispatchTime { scheduler.now }
+
+    @discardableResult
+    func schedule(afterMilliseconds milliseconds: Int, action: @escaping () -> Void) -> GestureScheduledTask {
+        // The unfinished preparer's first scheduled action is its deadline.
+        // Record even zero remaining time if the process was descheduled first.
+        guard traceNextSchedule else {
+            return scheduler.schedule(afterMilliseconds: milliseconds, action: action)
+        }
+        traceNextSchedule = false
+        trace.timerScheduled(afterMilliseconds: milliseconds)
+        return scheduler.schedule(afterMilliseconds: milliseconds) { [trace] in
+            trace.timerCallbackEntered()
+            action()
+        }
     }
 }
 

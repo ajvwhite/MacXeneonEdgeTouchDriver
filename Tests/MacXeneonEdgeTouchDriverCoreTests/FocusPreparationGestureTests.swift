@@ -4,6 +4,25 @@ import Foundation
 import XCTest
 
 final class FocusPreparationGestureTests: XCTestCase {
+    func testDeadlineDeliversAndCleansUpTouchWhenFocusNeverCompletes() {
+        let fixture = PreparationFixture()
+        fixture.send(.down, at: 0)
+        fixture.clock.advance(toMilliseconds: 29)
+        XCTAssertTrue(fixture.effects.input.isEmpty)
+
+        // Never deliver a focus callback. Advancing only the gesture clock must
+        // be sufficient to press, drag, release, and return the cursor.
+        fixture.clock.advance(toMilliseconds: 30)
+        XCTAssertEqual(fixture.effects.input, [.down(start)])
+        fixture.send(.move, at: 31, rawX: 4_000, rawY: 2_000)
+        fixture.send(.up, at: 32, rawX: 4_000, rawY: 2_000)
+        let moved = fixture.point(rawX: 4_000, rawY: 2_000)
+        XCTAssertEqual(fixture.effects.input, [.down(start), .drag(moved), .up(moved)])
+        XCTAssertEqual(fixture.focus.preparationCount, 1)
+        XCTAssertTrue(fixture.effects.restoredCaptures.isEmpty)
+        fixture.assertFinished()
+    }
+
     func testCaptureAtZeroOrBeforeDeadlinePrecedesInputAndRemainsRestorable() {
         for completionTime: UInt64 in [0, 29] {
             let fixture = PreparationFixture()

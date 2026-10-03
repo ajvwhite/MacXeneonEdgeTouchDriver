@@ -245,7 +245,6 @@ public final class GestureController {
         cancelPreparation()
         if !captureIsTimely {
             focusRestorer.discardCapturedWindow()
-            DriverLoggers.log(.debug, category: .focus, "Continuing touch without a completed pre-input focus capture.")
         }
         guard mapperProvider() != nil,
               cursorController.borrow(warpingTo: preparation.point) else {
