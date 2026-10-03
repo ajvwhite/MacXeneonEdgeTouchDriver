@@ -230,12 +230,7 @@ final class DisplayRoutingTests: XCTestCase {
 
         XCTAssertTrue(fixture.recorder.input.isEmpty, "Due mouse-down must observe the begin arrival immediately")
         XCTAssertEqual(fixture.recorder.returnCount, 1)
-        if let discard = fixture.recorder.calls.firstIndex(of: .discard),
-           let restore = fixture.recorder.calls.firstIndex(of: .restore) {
-            XCTAssertLessThan(discard, restore, "Invalid geometry must discard captured focus before cancellation restores it")
-        } else {
-            XCTFail("Expected focus invalidation and gesture cleanup")
-        }
+        assertFocusDiscardedBeforeCursorReturn(fixture.recorder)
 
         fixture.application.enqueueDisplayReconfiguration(flags: .movedFlag)
         queue.async {
@@ -246,6 +241,7 @@ final class DisplayRoutingTests: XCTestCase {
         waitForQueue(queue)
         XCTAssertEqual(fixture.recorder.input, [.down(movedOrigin)])
         XCTAssertEqual(fixture.recorder.returnCount, 1)
+        XCTAssertEqual(fixture.recorder.restoreCount, 0)
 
         queue.async {
             fixture.send(.up, at: 1_001)
@@ -254,6 +250,7 @@ final class DisplayRoutingTests: XCTestCase {
         waitForQueue(queue)
         XCTAssertEqual(fixture.recorder.input, [.down(movedOrigin), .up(movedOrigin)])
         XCTAssertEqual(fixture.recorder.returnCount, 2)
+        XCTAssertEqual(fixture.recorder.restoreCount, 1)
     }
 
     func testOlderQueuedEndCannotResolveDuringANewerBegin() {
@@ -277,6 +274,7 @@ final class DisplayRoutingTests: XCTestCase {
         XCTAssertEqual(fixture.provider.readCount, readsBeforeQueuedEnd)
         XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin)])
         XCTAssertNil(fixture.resolver.currentMapper)
+        assertFocusDiscardedBeforeCursorReturn(fixture.recorder)
 
         fixture.provider.displays = [display(at: movedOrigin)]
         fixture.application.enqueueDisplayReconfiguration(flags: .movedFlag)
@@ -290,10 +288,12 @@ final class DisplayRoutingTests: XCTestCase {
         XCTAssertEqual(fixture.provider.readCount, readsBeforeQueuedEnd + 2)
         XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin), .down(movedOrigin)])
         XCTAssertEqual(fixture.recorder.returnCount, 1)
+        XCTAssertEqual(fixture.recorder.restoreCount, 0)
         queue.async { fixture.send(.up) }
         waitForQueue(queue)
         XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin), .down(movedOrigin), .up(movedOrigin)])
         XCTAssertEqual(fixture.recorder.returnCount, 2)
+        XCTAssertEqual(fixture.recorder.restoreCount, 1)
     }
 
     func testBeginArrivalDuringResolutionPreventsCommittingThatSnapshot() {
@@ -379,6 +379,7 @@ final class DisplayRoutingTests: XCTestCase {
         XCTAssertNil(fixture.resolver.currentMapper)
         XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin)])
         XCTAssertEqual(fixture.recorder.returnCount, 1)
+        assertFocusDiscardedBeforeCursorReturn(fixture.recorder)
         fixture.send(.down, at: 1)
         fixture.application.handleDeviceMatched()
         fixture.send(.move, at: 2)
@@ -391,7 +392,8 @@ final class DisplayRoutingTests: XCTestCase {
         XCTAssertEqual(fixture.resolver.currentBounds?.origin, movedOrigin)
         fixture.send(.down, at: 4)
         fixture.send(.up, at: 5)
-        XCTAssertEqual(fixture.recorder.input.suffix(2), [.down(movedOrigin), .up(movedOrigin)])
+        XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin), .down(movedOrigin), .up(movedOrigin)])
+        XCTAssertEqual(fixture.recorder.restoreCount, 1)
     }
 
     func testFirstPostChangeCallbackSettlesUnequalBeginAndEndCounts() {
@@ -406,6 +408,7 @@ final class DisplayRoutingTests: XCTestCase {
             }
             XCTAssertEqual(fixture.provider.readCount, readsBeforeBegin)
             XCTAssertEqual(fixture.recorder.returnCount, 1)
+            assertFocusDiscardedBeforeCursorReturn(fixture.recorder)
 
             fixture.application.handleDisplayReconfiguration(flags: .movedFlag)
             fixture.send(.down, at: 1)
@@ -419,6 +422,8 @@ final class DisplayRoutingTests: XCTestCase {
             XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin), .down(movedOrigin)])
             fixture.send(.up, at: 2)
             XCTAssertEqual(fixture.recorder.returnCount, 2)
+            XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin), .down(movedOrigin), .up(movedOrigin)])
+            XCTAssertEqual(fixture.recorder.restoreCount, 1)
         }
     }
 
@@ -448,6 +453,20 @@ final class DisplayRoutingTests: XCTestCase {
         for phase in RoutingPhase.allCases {
             assertRecovery(from: phase, throughLoss: true)
         }
+    }
+
+    private func assertFocusDiscardedBeforeCursorReturn(
+        _ recorder: RoutingRecorder,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(recorder.restoreCount, 0, "Invalid geometry must not restore focus", file: file, line: line)
+        guard let discard = recorder.calls.firstIndex(of: .discard),
+              let returned = recorder.calls.firstIndex(of: .returned) else {
+            XCTFail("Expected focus invalidation and cursor cleanup", file: file, line: line)
+            return
+        }
+        XCTAssertLessThan(discard, returned, "Discard captured focus before required cursor cleanup", file: file, line: line)
     }
 
     private func assertRecovery(

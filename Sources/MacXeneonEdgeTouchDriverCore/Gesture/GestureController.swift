@@ -143,6 +143,10 @@ public final class GestureController {
             }
 
             cursorController.updatePosition(point)
+            guard mapperProvider() != nil else {
+                cancelForMissingMapper()
+                return
+            }
             inputSink.postMouseDragged(to: point)
             currentContext.lastPoint = point
             currentContext.lastRawX = event.rawX
@@ -214,7 +218,7 @@ public final class GestureController {
                 inputSink.postMouseUp(at: context.lastPoint)
             }
             cursorController.returnToOrigin()
-            focusRestorer.restoreCapturedWindow()
+            restoreFocusAfterCursorReturn()
             transitionToIdle()
         }
     }
@@ -321,9 +325,19 @@ public final class GestureController {
 
         phase = .finishing
         cursorController.returnToOrigin()
-        focusRestorer.restoreCapturedWindow()
+        restoreFocusAfterCursorReturn()
         pendingCursorReturn = nil
         transitionToIdle()
+    }
+
+    private func restoreFocusAfterCursorReturn() {
+        // Cursor cleanup may deliver a display notification. Recheck before starting
+        // focus work; the cursor operation that already ran cannot be retracted.
+        guard mapperProvider() != nil else {
+            focusRestorer.discardCapturedWindow()
+            return
+        }
+        focusRestorer.restoreCapturedWindow()
     }
 
     private func transitionToIdle() {

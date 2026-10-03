@@ -3,6 +3,70 @@ import CoreGraphics
 import XCTest
 
 final class MissingMapperCleanupTests: XCTestCase {
+    func testMapperLostInsideDelayedCursorReturnDiscardsFocusBeforeRestore() {
+        let fixture = MissingMapperFixture(timing: missingMapperTiming(back: 100))
+        fixture.send(.down, at: 0)
+        fixture.send(.up, at: 1)
+        let recordReturn = fixture.cursor.onReturn
+        fixture.cursor.onReturn = { [weak fixture] in
+            recordReturn?()
+            fixture?.hasMapper = false
+        }
+
+        fixture.clock.advance(toMilliseconds: 101)
+
+        XCTAssertEqual(fixture.input.calls, [.down(missingMapperNear), .up(missingMapperNear)])
+        XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .returned])
+        XCTAssertEqual(Array(fixture.cleanupEffects.prefix(3)), [.mouseUp, .returnCursor, .discardFocus])
+        XCTAssertFalse(fixture.cleanupEffects.contains(.restoreFocus(wasEligible: true)))
+        XCTAssertFalse(fixture.focus.calls.contains(.restore))
+        XCTAssertFalse(fixture.focus.hasCapturedWindow)
+        XCTAssertEqual(fixture.focus.restoredWindowCount, 0)
+        XCTAssertEqual(fixture.idleCount, 1)
+        fixture.assertBalanced()
+
+        fixture.clock.advance(toMilliseconds: 1_000)
+        XCTAssertEqual(fixture.idleCount, 1)
+        XCTAssertEqual(fixture.focus.restoredWindowCount, 0)
+    }
+
+    func testMapperLostInsideForcedCursorReturnDiscardsFocusBeforeRestore() {
+        let fixture = MissingMapperFixture()
+        fixture.send(.down, at: 0)
+        fixture.send(.move, at: 1, far: true)
+        let recordReturn = fixture.cursor.onReturn
+        fixture.cursor.onReturn = { [weak fixture] in
+            recordReturn?()
+            fixture?.hasMapper = false
+        }
+
+        fixture.controller.forceCancel()
+
+        XCTAssertEqual(fixture.input.calls, [.down(missingMapperNear), .drag(missingMapperFar), .up(missingMapperFar)])
+        XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .update(missingMapperFar), .returned])
+        XCTAssertEqual(Array(fixture.cleanupEffects.prefix(3)), [.mouseUp, .returnCursor, .discardFocus])
+        XCTAssertFalse(fixture.cleanupEffects.contains(.restoreFocus(wasEligible: true)))
+        XCTAssertFalse(fixture.focus.calls.contains(.restore))
+        XCTAssertFalse(fixture.focus.hasCapturedWindow)
+        XCTAssertEqual(fixture.focus.restoredWindowCount, 0)
+        XCTAssertEqual(fixture.idleCount, 1)
+        fixture.assertBalanced()
+    }
+
+    func testMapperLostInsideCursorUpdatePreventsDragAndReleasesLastSavedPoint() {
+        let fixture = MissingMapperFixture()
+        fixture.send(.down, at: 0)
+        fixture.cursor.onUpdate = { [weak fixture] in fixture?.hasMapper = false }
+
+        fixture.send(.move, at: 1, far: true)
+
+        XCTAssertEqual(fixture.input.calls, [.down(missingMapperNear), .up(missingMapperNear)])
+        XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .update(missingMapperFar), .returned])
+        XCTAssertEqual(fixture.idleCount, 1)
+        fixture.assertMissingMapperCleanup(releasingButton: true)
+        fixture.assertBalanced()
+    }
+
     func testMapperLostDuringFocusCaptureRejectsContactBeforeCursorBorrow() {
         let fixture = MissingMapperFixture()
         fixture.focus.onCapture = { fixture.hasMapper = false }
@@ -38,7 +102,7 @@ final class MissingMapperCleanupTests: XCTestCase {
         XCTAssertEqual(fixture.controller.state, .idle)
         XCTAssertTrue(fixture.input.calls.isEmpty)
         XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .returned])
-        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .restore])
+        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .discard])
         XCTAssertEqual(fixture.idleCount, 1)
         fixture.assertMissingMapperCleanup(releasingButton: false)
 
@@ -60,7 +124,7 @@ final class MissingMapperCleanupTests: XCTestCase {
 
         XCTAssertEqual(fixture.input.calls, [.down(missingMapperNear), .up(missingMapperNear)])
         XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .returned])
-        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .restore])
+        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .discard])
         XCTAssertEqual(fixture.controller.state, .idle)
         fixture.assertMissingMapperCleanup(releasingButton: true)
 
@@ -111,7 +175,7 @@ final class MissingMapperCleanupTests: XCTestCase {
         XCTAssertEqual(fixture.controller.state, .idle)
         XCTAssertTrue(fixture.input.calls.isEmpty)
         XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .returned])
-        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .restore])
+        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .discard])
         XCTAssertEqual(fixture.idleCount, 1)
         fixture.assertMissingMapperCleanup(releasingButton: false)
 
@@ -139,7 +203,7 @@ final class MissingMapperCleanupTests: XCTestCase {
 
         XCTAssertEqual(fixture.input.calls, [.down(missingMapperNear), .drag(missingMapperFar), .up(missingMapperFar)])
         XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .update(missingMapperFar), .returned])
-        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .restore])
+        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .discard])
         XCTAssertEqual(fixture.controller.state, .idle)
         XCTAssertEqual(fixture.idleCount, 1)
         fixture.assertMissingMapperCleanup(releasingButton: true)
@@ -155,7 +219,7 @@ final class MissingMapperCleanupTests: XCTestCase {
 
         XCTAssertEqual(fixture.input.calls, [.down(missingMapperNear), .up(missingMapperFar)])
         XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .returned])
-        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .restore])
+        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .discard])
         XCTAssertEqual(fixture.controller.state, .idle)
         fixture.assertMissingMapperCleanup(releasingButton: true)
 
@@ -181,7 +245,7 @@ final class MissingMapperCleanupTests: XCTestCase {
 
         XCTAssertEqual(fixture.input.calls, [.down(missingMapperNear), .up(missingMapperNear)])
         XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .returned])
-        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .restore])
+        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .discard])
         XCTAssertEqual(fixture.controller.state, .idle)
         fixture.assertMissingMapperCleanup(releasingButton: false, after: [.mouseUp])
 
@@ -190,13 +254,13 @@ final class MissingMapperCleanupTests: XCTestCase {
         fixture.clock.advance(toMilliseconds: 101)
         XCTAssertTrue(fixture.isPressed, "Cancelled cursor return must not idle the recovered contact")
         XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .returned, .borrow(missingMapperFar)])
-        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .restore, .capture])
+        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .discard, .capture])
         XCTAssertEqual(fixture.idleCount, 1)
         fixture.send(.up, at: 102, far: true)
         fixture.clock.advance(toMilliseconds: 202)
 
         XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .returned, .borrow(missingMapperFar), .returned])
-        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .restore, .capture, .restore])
+        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .discard, .capture, .restore])
         XCTAssertEqual(fixture.idleCount, 2)
         fixture.assertBalanced()
     }
@@ -210,7 +274,7 @@ final class MissingMapperCleanupTests: XCTestCase {
 
         XCTAssertEqual(fixture.input.calls, [.down(missingMapperNear), .up(missingMapperFar)])
         XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .returned])
-        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .restore])
+        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .discard])
         XCTAssertEqual(fixture.controller.state, .idle)
         XCTAssertEqual(fixture.idleCount, 1)
         fixture.assertMissingMapperCleanup(releasingButton: true)
@@ -230,7 +294,7 @@ final class MissingMapperCleanupTests: XCTestCase {
 
         XCTAssertEqual(fixture.input.calls, [.down(missingMapperNear), .up(missingMapperNear)])
         XCTAssertEqual(fixture.cursor.calls, [.borrow(missingMapperNear), .returned])
-        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .restore])
+        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .discard])
         XCTAssertEqual(fixture.controller.state, .idle)
         XCTAssertEqual(fixture.idleCount, 1)
         fixture.assertMissingMapperCleanup(releasingButton: false, after: [.mouseUp])
@@ -283,7 +347,7 @@ final class MissingMapperCleanupTests: XCTestCase {
         fixture.send(.up, at: 6, far: true)
 
         XCTAssertEqual(fixture.input.calls, [.down(missingMapperNear), .up(missingMapperNear), .down(missingMapperFar), .up(missingMapperFar)])
-        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .restore, .capture, .restore])
+        XCTAssertEqual(fixture.focus.calls, [.capture, .discard, .discard, .capture, .restore])
         XCTAssertEqual(fixture.idleCount, 2)
         fixture.assertBalanced()
     }
@@ -376,11 +440,12 @@ private final class MissingMapperFixture {
         let release: [MissingMapperCleanupEffect] = releasingButton ? [.mouseUp] : []
         XCTAssertEqual(
             cleanupEffects,
-            previousEffects + [.discardFocus] + release + [.returnCursor, .restoreFocus(wasEligible: false)],
-            "Discard focus before releasing input or attempting focus restoration",
+            previousEffects + [.discardFocus] + release + [.returnCursor, .discardFocus],
+            "Discard focus before cleanup and again after cursor return without attempting restoration",
             file: file,
             line: line
         )
+        XCTAssertFalse(focus.calls.contains(.restore), file: file, line: line)
         XCTAssertFalse(focus.hasCapturedWindow, file: file, line: line)
         XCTAssertEqual(focus.restoredWindowCount, 0, file: file, line: line)
     }
@@ -406,8 +471,12 @@ private final class MissingMapperCursorController: CursorController {
     enum Call: Equatable { case borrow(CGPoint), update(CGPoint), returned, show }
     var calls: [Call] = []
     var onReturn: (() -> Void)?
+    var onUpdate: (() -> Void)?
     func borrow(warpingTo point: CGPoint) -> Bool { calls.append(.borrow(point)); return true }
-    func updatePosition(_ point: CGPoint) { calls.append(.update(point)) }
+    func updatePosition(_ point: CGPoint) {
+        calls.append(.update(point))
+        onUpdate?()
+    }
     func returnToOrigin() {
         calls.append(.returned)
         onReturn?()
