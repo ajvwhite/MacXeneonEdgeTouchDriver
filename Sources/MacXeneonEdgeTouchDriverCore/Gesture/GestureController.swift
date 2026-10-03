@@ -11,35 +11,123 @@ public final class GestureController {
 
     private let mapperProvider: () -> CoordinateMapper?
     private let timing: GestureTiming
-    private let schedulingQueue: DispatchQueue?
+    private let scheduler: GestureScheduler
     private let inputSink: SyntheticInputSink
     private let cursorController: CursorController
     private let focusRestorer: FocusRestorer
-    private var pendingMouseDown: DispatchWorkItem?
-    private var pendingMouseUp: DispatchWorkItem?
-    private var pendingCursorReturn: DispatchWorkItem?
+    private let returnCursorToPreviousPosition: Bool
+    private var pendingMouseDown: GestureScheduledTask?
+    private var pendingMouseUp: GestureScheduledTask?
+    private var pendingCursorReturn: GestureScheduledTask?
     private var lastCompletedTouchTimestamp: DispatchTime?
+    private var preparation: Preparation?
+    private var preparationDeadline: GestureScheduledTask?
+    private var preparationGeneration: UInt64 = 0
+
+    /// An input deadline, not a promise that an in-flight AX call can be cancelled.
+    static let focusPreparationTimeoutMs = 30
+
+    private struct Preparation {
+        let generation: UInt64
+        let contactID: Int
+        let point: CGPoint
+        let deadline: DispatchTime
+    }
+
+    private var generation: UInt64 = 0
+    private var phase: Phase?
+    // A rejected down rejects that entire contact, even if cleanup finishes before its up.
+    private var rejectedContactIDs: Set<Int> = []
+
+    private enum Phase {
+        case preparing
+        case tracking
+        case waitingForMouseUp
+        case waitingForCursorReturn
+        case finishing
+    }
 
     /// Creates a single-touch gesture controller.
-    public init(
+    public convenience init(
         mapperProvider: @escaping () -> CoordinateMapper?,
         inputSink: SyntheticInputSink,
         cursorController: CursorController,
         focusRestorer: FocusRestorer = NoOpFocusRestorer(),
+        returnCursorToPreviousPosition: Bool = true,
         timing: GestureTiming = .immediate,
         schedulingQueue: DispatchQueue? = nil
+    ) {
+        self.init(
+            mapperProvider: mapperProvider,
+            inputSink: inputSink,
+            cursorController: cursorController,
+            focusRestorer: focusRestorer,
+            returnCursorToPreviousPosition: returnCursorToPreviousPosition,
+            timing: timing,
+            scheduler: DispatchGestureScheduler(queue: schedulingQueue)
+        )
+    }
+
+    init(
+        mapperProvider: @escaping () -> CoordinateMapper?,
+        inputSink: SyntheticInputSink,
+        cursorController: CursorController,
+        focusRestorer: FocusRestorer = NoOpFocusRestorer(),
+        returnCursorToPreviousPosition: Bool = true,
+        timing: GestureTiming = .immediate,
+        scheduler: GestureScheduler
     ) {
         self.mapperProvider = mapperProvider
         self.inputSink = inputSink
         self.cursorController = cursorController
         self.focusRestorer = focusRestorer
+        self.returnCursorToPreviousPosition = returnCursorToPreviousPosition
         self.timing = timing
-        self.schedulingQueue = schedulingQueue
+        self.scheduler = scheduler
     }
 
     /// Handles one normalized touch event.
     public func handle(_ event: TouchEvent) {
+        // Consume contact boundaries even when the display mapper is unavailable.
+        if rejectedContactIDs.contains(event.contactID) {
+            if event.kind == .up {
+                rejectedContactIDs.remove(event.contactID)
+            }
+            return
+        }
+
+        // Freeze focus restoration eligibility at the accepted HID release, before synthetic cleanup.
+        if event.kind == .up, phase == .preparing || phase == .tracking,
+           case .singleTouch(let context) = state, context.contactID == event.contactID {
+            focusRestorer.inputDidEnd()
+        }
+
+        if let preparation {
+            guard event.contactID == preparation.contactID else {
+                if event.kind == .down { rejectedContactIDs.insert(event.contactID) }
+                return
+            }
+            if event.kind == .down {
+                // A second down with the reused hardware ID makes the pending contact ambiguous.
+                forceCancel()
+                rejectedContactIDs.insert(event.contactID)
+                return
+            }
+            // Preserve every move/up, without buffering or coalescing a drag path.
+            finishPreparation(generation: preparation.generation, captureReady: false)
+            if rejectedContactIDs.contains(event.contactID) {
+                if event.kind == .up { rejectedContactIDs.remove(event.contactID) }
+                return
+            }
+        }
+
         guard let mapper = mapperProvider() else {
+            if case .singleTouch = state {
+                cancelForMissingMapper()
+            }
+            if event.kind == .down {
+                rejectedContactIDs.insert(event.contactID)
+            }
             DriverLoggers.log(.warning, category: .gesture, "Dropping touch event because no display mapper is available.")
             return
         }
@@ -49,17 +137,13 @@ public final class GestureController {
         switch (state, event.kind) {
         case (.idle, .down):
             guard !isDebounced(event.timestamp) else {
+                rejectedContactIDs.insert(event.contactID)
                 DriverLoggers.log(.debug, category: .gesture, "Ignoring touch down inside tap debounce window.")
                 return
             }
 
-            focusRestorer.captureFocusedWindow()
-            guard cursorController.borrow(warpingTo: point) else {
-                focusRestorer.discardCapturedWindow()
-                DriverLoggers.log(.warning, category: .gesture, "Dropping touch down because cursor borrow failed.")
-                return
-            }
-
+            generation &+= 1
+            phase = .preparing
             state = .singleTouch(
                 SingleTouchContext(
                     contactID: event.contactID,
@@ -71,9 +155,10 @@ public final class GestureController {
                     hasMoved: false
                 )
             )
-            scheduleMouseDown(contactID: event.contactID, at: point)
+            beginPreparation(contactID: event.contactID, at: point)
 
         case (.singleTouch(let context), .move):
+            guard phase == .tracking else { return }
             guard context.contactID == event.contactID else {
                 DriverLoggers.log(.warning, category: .gesture, "Ignoring move for unexpected contact ID \(event.contactID).")
                 return
@@ -84,7 +169,16 @@ public final class GestureController {
                 return
             }
 
+            guard mapperProvider() != nil else {
+                cancelForMissingMapper()
+                return
+            }
+
             cursorController.updatePosition(point)
+            guard mapperProvider() != nil else {
+                cancelForMissingMapper()
+                return
+            }
             inputSink.postMouseDragged(to: point)
             currentContext.lastPoint = point
             currentContext.lastRawX = event.rawX
@@ -93,6 +187,7 @@ public final class GestureController {
             state = .singleTouch(currentContext)
 
         case (.singleTouch(let context), .up):
+            guard phase == .tracking else { return }
             guard context.contactID == event.contactID else {
                 DriverLoggers.log(.warning, category: .gesture, "Ignoring up for unexpected contact ID \(event.contactID).")
                 return
@@ -108,18 +203,25 @@ public final class GestureController {
             currentContext.lastRawY = event.rawY
             state = .singleTouch(currentContext)
             lastCompletedTouchTimestamp = event.timestamp
+            phase = .waitingForMouseUp
 
             if currentContext.hasMoved {
-                postMouseUpAndScheduleReturn(contactID: currentContext.contactID, at: point)
+                postMouseUpAndScheduleReturn(generation: generation, at: point)
             } else {
-                scheduleMouseUpThenReturn(contactID: currentContext.contactID, at: point)
+                scheduleMouseUpThenReturn(generation: generation, at: point)
             }
 
         case (.idle, .move), (.idle, .up):
             DriverLoggers.log(.debug, category: .gesture, "Ignoring touch event while idle.")
 
-        case (.singleTouch, .down):
-            DriverLoggers.log(.warning, category: .gesture, "Received touch down while already tracking a single touch.")
+        case (.singleTouch(let context), .down):
+            if phase == .tracking, context.contactID == event.contactID {
+                // Hardware reuses ID 0. A second down without an up is ambiguous;
+                // release the owned button before rejecting the malformed contact.
+                forceCancel()
+            }
+            rejectedContactIDs.insert(event.contactID)
+            DriverLoggers.log(.warning, category: .gesture, "Rejecting touch down while a gesture is active or cleaning up.")
         }
     }
 
@@ -130,26 +232,102 @@ public final class GestureController {
 
     /// Forces the controller back to idle, posting cleanup events if needed.
     public func forceCancel() {
+        guard phase != .finishing else { return }
+        generation &+= 1
         cancelPendingWork()
+        rejectedContactIDs.removeAll()
+        if preparation != nil {
+            cancelPreparation()
+            focusRestorer.discardCapturedWindow()
+            transitionToIdle()
+            return
+        }
 
         switch state {
         case .idle:
             cursorController.forceShow()
             focusRestorer.discardCapturedWindow()
 
-        case .singleTouch(let context):
+        case .singleTouch(var context):
+            phase = .finishing
             if context.isMouseDownPosted {
+                context.isMouseDownPosted = false
+                state = .singleTouch(context)
+                focusRestorer.inputDidEnd()
                 inputSink.postMouseUp(at: context.lastPoint)
             }
-            cursorController.returnToOrigin()
-            focusRestorer.restoreCapturedWindow()
+            cursorController.releaseBorrow(returnToPreviousPosition: returnCursorToPreviousPosition)
+            restoreFocusAfterCursorReturn()
             transitionToIdle()
         }
     }
 
-    private func scheduleMouseDown(contactID: Int, at point: CGPoint) {
-        pendingMouseDown = schedule(after: timing.warpToClickDelayMs) { [weak self] in
-            self?.postMouseDownIfNeeded(contactID: contactID, at: point)
+    private func beginPreparation(contactID: Int, at point: CGPoint) {
+        preparationGeneration &+= 1
+        let generation = preparationGeneration
+        preparation = Preparation(
+            generation: generation,
+            contactID: contactID,
+            point: point,
+            deadline: DispatchTime(uptimeNanoseconds:
+                scheduler.now.uptimeNanoseconds + UInt64(Self.focusPreparationTimeoutMs) * 1_000_000)
+        )
+
+        // Offer inline/no-op capture before installing a timer: the queue-less scheduler
+        // intentionally executes even delayed tasks synchronously.
+        focusRestorer.prepareFocusedWindow { [weak self] in
+            self?.finishPreparation(generation: generation, captureReady: true)
+        }
+        guard let preparation, preparation.generation == generation else { return }
+        let deadline = preparation.deadline.uptimeNanoseconds
+        let remaining = deadline - min(deadline, scheduler.now.uptimeNanoseconds)
+        let milliseconds = Int((remaining + 999_999) / 1_000_000)
+        let task = schedule(after: milliseconds) { [weak self] in
+            self?.finishPreparation(generation: generation, captureReady: false)
+        }
+        if self.preparation?.generation == generation {
+            preparationDeadline = task
+        } else {
+            task.cancel()
+        }
+    }
+
+    private func finishPreparation(generation: UInt64, captureReady: Bool) {
+        guard let preparation, preparation.generation == generation else { return }
+        let captureIsTimely = captureReady && scheduler.now.uptimeNanoseconds < preparation.deadline.uptimeNanoseconds
+        cancelPreparation()
+        if !captureIsTimely {
+            focusRestorer.discardCapturedWindow()
+        }
+        guard mapperProvider() != nil,
+              cursorController.borrow(warpingTo: preparation.point) else {
+            rejectedContactIDs.insert(preparation.contactID)
+            focusRestorer.discardCapturedWindow()
+            transitionToIdle()
+            return
+        }
+        phase = .tracking
+        scheduleMouseDown(generation: self.generation, at: preparation.point)
+    }
+
+    private func cancelPreparation() {
+        preparationGeneration &+= 1
+        preparation = nil
+        preparationDeadline?.cancel()
+        preparationDeadline = nil
+    }
+
+    private func scheduleMouseDown(generation: UInt64, at point: CGPoint) {
+        pendingMouseDown?.cancel()
+        let task = schedule(after: timing.warpToClickDelayMs) { [weak self] in
+            self?.postMouseDownIfNeeded(generation: generation, at: point)
+        }
+        // Zero-delay scheduling runs inline; it may have completed this phase already.
+        if self.generation == generation, phase == .tracking,
+           case .singleTouch(let context) = state, !context.isMouseDownPosted {
+            pendingMouseDown = task
+        } else {
+            task.cancel()
         }
     }
 
@@ -161,53 +339,107 @@ public final class GestureController {
             return
         }
 
-        postMouseDownIfNeeded(contactID: context.contactID, at: context.startPoint)
+        postMouseDownIfNeeded(generation: generation, at: context.startPoint)
     }
 
-    private func postMouseDownIfNeeded(contactID: Int, at point: CGPoint) {
-        guard case .singleTouch(var context) = state, context.contactID == contactID else {
+    private func postMouseDownIfNeeded(generation: UInt64, at point: CGPoint) {
+        guard self.generation == generation, phase == .tracking,
+              case .singleTouch(var context) = state else {
             return
         }
         guard !context.isMouseDownPosted else {
             return
         }
+        guard mapperProvider() != nil else {
+            cancelForMissingMapper()
+            return
+        }
 
-        inputSink.postMouseDown(at: point)
         context.isMouseDownPosted = true
         state = .singleTouch(context)
         pendingMouseDown = nil
+        inputSink.postMouseDown(at: point)
     }
 
-    private func scheduleMouseUpThenReturn(contactID: Int, at point: CGPoint) {
-        pendingMouseUp = schedule(after: timing.downToUpDelayMs) { [weak self] in
-            self?.postMouseUpAndScheduleReturn(contactID: contactID, at: point)
+    private func cancelForMissingMapper() {
+        // Geometry loss must not use focus-restoration fallbacks at stale coordinates.
+        focusRestorer.discardCapturedWindow()
+        forceCancel()
+    }
+
+    private func scheduleMouseUpThenReturn(generation: UInt64, at point: CGPoint) {
+        pendingMouseUp?.cancel()
+        let task = schedule(after: timing.downToUpDelayMs) { [weak self] in
+            self?.postMouseUpAndScheduleReturn(generation: generation, at: point)
+        }
+        if self.generation == generation, phase == .waitingForMouseUp {
+            pendingMouseUp = task
+        } else {
+            task.cancel()
         }
     }
 
-    private func postMouseUpAndScheduleReturn(contactID: Int, at point: CGPoint) {
-        guard case .singleTouch(let context) = state, context.contactID == contactID else {
+    private func postMouseUpAndScheduleReturn(generation: UInt64, at point: CGPoint) {
+        guard self.generation == generation, phase == .waitingForMouseUp,
+              case .singleTouch(var context) = state, context.isMouseDownPosted else {
+            return
+        }
+        guard mapperProvider() != nil else {
+            cancelForMissingMapper()
             return
         }
 
-        inputSink.postMouseUp(at: point)
+        context.isMouseDownPosted = false
+        state = .singleTouch(context)
+        phase = .waitingForCursorReturn
+        pendingMouseUp?.cancel()
         pendingMouseUp = nil
-        pendingCursorReturn = schedule(after: timing.clickToWarpBackDelayMs) { [weak self] in
-            self?.returnCursorAndIdle(contactID: contactID)
+        focusRestorer.inputDidEnd()
+        inputSink.postMouseUp(at: point)
+        guard self.generation == generation, phase == .waitingForCursorReturn else { return }
+        pendingCursorReturn?.cancel()
+        let task = schedule(after: timing.clickToWarpBackDelayMs) { [weak self] in
+            self?.returnCursorAndIdle(generation: generation)
+        }
+        if self.generation == generation, phase == .waitingForCursorReturn {
+            pendingCursorReturn = task
+        } else {
+            task.cancel()
         }
     }
 
-    private func returnCursorAndIdle(contactID: Int) {
-        guard case .singleTouch(let context) = state, context.contactID == contactID else {
+    private func returnCursorAndIdle(generation: UInt64) {
+        guard self.generation == generation, phase == .waitingForCursorReturn,
+              case .singleTouch = state else {
+            return
+        }
+        guard mapperProvider() != nil else {
+            cancelForMissingMapper()
             return
         }
 
-        cursorController.returnToOrigin()
-        focusRestorer.restoreCapturedWindow()
+        phase = .finishing
+        cursorController.releaseBorrow(returnToPreviousPosition: returnCursorToPreviousPosition)
+        restoreFocusAfterCursorReturn()
         pendingCursorReturn = nil
         transitionToIdle()
     }
 
+    private func restoreFocusAfterCursorReturn() {
+        // Cursor cleanup may deliver a display notification. Recheck before starting
+        // focus work; the cursor operation that already ran cannot be retracted.
+        guard mapperProvider() != nil else {
+            focusRestorer.discardCapturedWindow()
+            return
+        }
+        focusRestorer.restoreCapturedWindow()
+    }
+
     private func transitionToIdle() {
+        cancelPreparation()
+        generation &+= 1
+        cancelPendingWork()
+        phase = nil
         state = .idle
         onBecameIdle?()
     }
@@ -221,16 +453,8 @@ public final class GestureController {
         pendingCursorReturn = nil
     }
 
-    private func schedule(after milliseconds: Int, action: @escaping () -> Void) -> DispatchWorkItem {
-        let workItem = DispatchWorkItem(block: action)
-
-        guard milliseconds > 0, let schedulingQueue else {
-            workItem.perform()
-            return workItem
-        }
-
-        schedulingQueue.asyncAfter(deadline: .now() + .milliseconds(milliseconds), execute: workItem)
-        return workItem
+    private func schedule(after milliseconds: Int, action: @escaping () -> Void) -> GestureScheduledTask {
+        scheduler.schedule(afterMilliseconds: milliseconds, action: action)
     }
 
     private func isDebounced(_ timestamp: DispatchTime) -> Bool {

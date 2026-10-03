@@ -46,8 +46,11 @@ public struct DisplaySnapshot: Equatable {
 
 /// Resolves and tracks the Xeneon Edge display by EDID and physical size.
 public final class DisplayResolver {
-    /// Callback fired after `refresh()` changes the resolved display.
+    /// Callback fired after committing a different display identity or bounds.
     public var onDisplayChanged: ((CGRect?) -> Void)?
+
+    /// Last committed display snapshot, if resolved.
+    public private(set) var currentSnapshot: DisplaySnapshot?
 
     /// Current Xeneon display bounds, if resolved.
     public private(set) var currentBounds: CGRect?
@@ -57,7 +60,6 @@ public final class DisplayResolver {
 
     private let configuration: DriverConfiguration.Display
     private let activeDisplayProvider: () -> [DisplaySnapshot]
-    private var currentDisplayID: CGDirectDisplayID?
 
     /// Creates a display resolver using the effective configuration.
     public convenience init(configuration: DriverConfiguration.Display = DriverConfiguration.defaults.display) {
@@ -74,15 +76,20 @@ public final class DisplayResolver {
 
     /// Re-resolves the Xeneon display from the active display list.
     public func refresh() {
-        let previousBounds = currentBounds
-        let previousDisplayID = currentDisplayID
-        let match = resolve()
+        update(with: resolve())
+    }
 
-        currentDisplayID = match?.displayID
+    /// Commits a previously resolved snapshot without enumerating displays again.
+    func update(with snapshot: DisplaySnapshot?) {
+        let previousBounds = currentBounds
+        let previousDisplayID = currentSnapshot?.displayID
+        let match = snapshot.flatMap { Self.hasValidBounds($0) ? $0 : nil }
+
+        currentSnapshot = match
         currentBounds = match?.bounds
         currentMapper = match.map { CoordinateMapper(displayBounds: $0.bounds) }
 
-        if currentBounds != previousBounds || currentDisplayID != previousDisplayID {
+        if currentBounds != previousBounds || currentSnapshot?.displayID != previousDisplayID {
             onDisplayChanged?(currentBounds)
         }
     }
@@ -96,7 +103,8 @@ public final class DisplayResolver {
     public func resolve(from displays: [DisplaySnapshot]) -> DisplaySnapshot? {
         let vendorModelMatches = displays.filter { display in
             display.vendorNumber == configuration.vendorNumber &&
-            display.modelNumber == configuration.modelNumber
+            display.modelNumber == configuration.modelNumber &&
+            Self.hasValidBounds(display)
         }
 
         let serialMatches: [DisplaySnapshot]
@@ -111,7 +119,17 @@ public final class DisplayResolver {
             display.pixelsHigh == configuration.expectedHeight
         }
 
-        return sizeMatches.first ?? serialMatches.first ?? vendorModelMatches.first
+        return sizeMatches.first ?? serialMatches.first
+    }
+
+    private static func hasValidBounds(_ display: DisplaySnapshot) -> Bool {
+        let bounds = display.bounds
+        return !bounds.isNull && !bounds.isInfinite &&
+            bounds.origin.x.isFinite && bounds.origin.y.isFinite &&
+            bounds.size.width.isFinite && bounds.size.height.isFinite &&
+            bounds.size.width > 0 && bounds.size.height > 0 &&
+            bounds.maxX.isFinite && bounds.maxY.isFinite &&
+            bounds.minX < bounds.maxX && bounds.minY < bounds.maxY
     }
 
     private static func activeDisplaySnapshots() -> [DisplaySnapshot] {

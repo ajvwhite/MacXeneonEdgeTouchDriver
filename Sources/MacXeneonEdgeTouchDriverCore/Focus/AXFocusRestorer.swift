@@ -1,206 +1,451 @@
-import ApplicationServices
-import CoreGraphics
+import CoreFoundation
 import Foundation
 
-/// Restores focus to the exact AX window that was focused before a touch gesture.
+/// Best-effort focus transactions. Main owns Workspace and observer run-loop sources;
+/// a single worker owns AX. Neither queue waits synchronously for the other.
 public final class AXFocusRestorer: FocusRestorer {
-    private struct CapturedWindow {
-        let application: AXUIElement
-        let window: AXUIElement
+    typealias Enqueue = (@escaping () -> Void) -> Void
+
+    private final class Session {
+        let token: FocusOperationToken
+        var captured: AXFocusTarget?
+        // Published under sessionLock while touching, then frozen by inputDidEnd.
+        var certifiedBaseline: AXFocusTarget?
+        var releasedBaseline: AXFocusTarget?
+        // Successive pipeline stages own these; callbacks touch the token only.
+        var observations: [AXFocusObservationProtocol] = []
+        var attachedSources: [CFRunLoopSource] = []
+
+        init(token: FocusOperationToken) { self.token = token }
     }
 
-    private let systemWideElement: AXUIElement
-    private var capturedWindow: CapturedWindow?
+    private let backend: AXFocusBackendProtocol
+    private let workspace: WorkspaceFocusMonitoring
+    private let onMain: Enqueue
+    private let onWorker: Enqueue
+    private var onCallback: Enqueue
+    private let now: () -> UInt64
+    private let state = FocusOperationState()
+    private let sessionLock = NSLock()
+    private var session: Session?
+    private var hasStarted = false
 
-    public init(systemWideElement: AXUIElement = AXUIElementCreateSystemWide()) {
-        self.systemWideElement = systemWideElement
+    /// Callback delivery belongs to the caller's serial gesture queue.
+    public convenience init(callbackQueue: DispatchQueue = .main) {
+        let worker = DispatchQueue(label: "\(DriverLoggers.subsystem).focus-ax")
+        self.init(
+            backend: AXFocusBackend(), workspace: WorkspaceFocusMonitor(),
+            onMain: { DispatchQueue.main.async(execute: $0) },
+            onWorker: { worker.async(execute: $0) },
+            onCallback: { callbackQueue.async(execute: $0) },
+            now: { DispatchTime.now().uptimeNanoseconds }
+        )
+    }
+
+    init(backend: AXFocusBackendProtocol, workspace: WorkspaceFocusMonitoring,
+         onMain: @escaping Enqueue, onWorker: @escaping Enqueue,
+         onCallback: @escaping Enqueue, now: @escaping () -> UInt64) {
+        self.backend = backend
+        self.workspace = workspace
+        self.onMain = onMain
+        self.onWorker = onWorker
+        self.onCallback = onCallback
+        self.now = now
+    }
+
+    deinit {
+        state.invalidate(shutdown: true)
+        let remaining = session
+        let monitor = workspace
+        let worker = onWorker
+        onMain {
+            monitor.stop()
+            guard let remaining else { return }
+            remaining.attachedSources.forEach { CFRunLoopRemoveSource(CFRunLoopGetMain(), $0, .commonModes) }
+            remaining.attachedSources.removeAll()
+            worker {
+                remaining.observations.forEach { $0.invalidate() }
+                remaining.observations.removeAll()
+            }
+        }
     }
 
     public func captureFocusedWindow() {
-        capturedWindow = nil
+        // A caller of the legacy synchronous entry point can post input as soon as
+        // it returns. Async capture here could therefore capture post-input focus.
+        discardCapturedWindow()
+        log("Focus capture requires the preparation completion boundary; legacy capture skipped.")
+    }
 
-        guard let application = copyElementAttribute(systemWideElement, attribute: kAXFocusedApplicationAttribute) else {
-            DriverLoggers.log(.debug, category: .focus, "Could not capture focused application before touch gesture.")
+    public func prepareFocusedWindow(completion: @escaping () -> Void) {
+        let next = Session(token: FocusOperationToken(now: now))
+        sessionLock.lock()
+        hasStarted = true
+        let previous = session
+        let admitted = state.beginPreparation(token: next.token)
+        session = admitted ? next : nil
+        sessionLock.unlock()
+
+        guard admitted else {
+            // A timed-out operation still occupies the worker until it actually returns.
+            deliverPreparation(completion)
             return
         }
-
-        guard let window = copyElementAttribute(application, attribute: kAXFocusedWindowAttribute) else {
-            DriverLoggers.log(.debug, category: .focus, "Could not capture focused window before touch gesture.")
-            return
+        if let previous {
+            dispose(previous, finishOperation: false) { self.startPreparation(next, completion: completion) }
+        } else {
+            startPreparation(next, completion: completion)
         }
+    }
 
-        capturedWindow = CapturedWindow(application: application, window: window)
+    /// Application construction may bind an injected live restorer before it starts.
+    func bindCallbackQueue(_ queue: DispatchQueue) {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        precondition(!hasStarted, "Bind the focus callback queue before preparing a gesture")
+        onCallback = { queue.async(execute: $0) }
+    }
+
+    public func inputDidEnd() {
+        sessionLock.lock()
+        if state.inputDidEnd(), let current = session {
+            current.releasedBaseline = current.certifiedBaseline
+        }
+        sessionLock.unlock()
     }
 
     public func restoreCapturedWindow() {
-        guard let capturedWindow else {
-            return
-        }
-        self.capturedWindow = nil
-
-        // Do not use app-level AXFrontmost here; it raises sibling windows from the same application.
-        let focusedWindowResult = AXUIElementSetAttributeValue(
-            capturedWindow.application,
-            kAXFocusedWindowAttribute as CFString,
-            capturedWindow.window
-        )
-        let mainWindowResult = AXUIElementSetAttributeValue(
-            capturedWindow.application,
-            kAXMainWindowAttribute as CFString,
-            capturedWindow.window
-        )
-        let raiseResult = AXUIElementPerformAction(capturedWindow.window, kAXRaiseAction as CFString)
-        let sessionClickResult = clickCapturedWindowTitleBar(capturedWindow)
-        let refocusedWindowResult = AXUIElementSetAttributeValue(
-            capturedWindow.application,
-            kAXFocusedWindowAttribute as CFString,
-            capturedWindow.window
-        )
-        let remadeMainWindowResult = AXUIElementSetAttributeValue(
-            capturedWindow.application,
-            kAXMainWindowAttribute as CFString,
-            capturedWindow.window
-        )
-        let mainResult = AXUIElementSetAttributeValue(
-            capturedWindow.window,
-            kAXMainAttribute as CFString,
-            kCFBooleanTrue
-        )
-        let focusedResult = AXUIElementSetAttributeValue(
-            capturedWindow.window,
-            kAXFocusedAttribute as CFString,
-            kCFBooleanTrue
-        )
-
-        guard isWindowFocused(capturedWindow) else {
-            DriverLoggers.log(
-                .warning,
-                category: .focus,
-                "Could not verify restore of the previously focused window. focusedWindow=\(focusedWindowResult.rawValue), mainWindow=\(mainWindowResult.rawValue), raise=\(raiseResult.rawValue), sessionClick=\(sessionClickResult), refocusedWindow=\(refocusedWindowResult.rawValue), remadeMainWindow=\(remadeMainWindowResult.rawValue), windowMain=\(mainResult.rawValue), windowFocused=\(focusedResult.rawValue)."
-            )
-            return
-        }
-    }
-
-    public func discardCapturedWindow() {
-        capturedWindow = nil
-    }
-
-    private func copyElementAttribute(_ element: AXUIElement, attribute: String) -> AXUIElement? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
-        guard result == .success, let value else {
-            return nil
-        }
-
-        guard CFGetTypeID(value) == AXUIElementGetTypeID() else {
-            return nil
-        }
-
-        return (value as! AXUIElement)
-    }
-
-    private func isWindowFocused(_ capturedWindow: CapturedWindow) -> Bool {
-        guard let focusedApplication = copyElementAttribute(systemWideElement, attribute: kAXFocusedApplicationAttribute),
-              CFEqual(focusedApplication, capturedWindow.application) else {
-            return false
-        }
-
-        guard let focusedWindow = copyElementAttribute(capturedWindow.application, attribute: kAXFocusedWindowAttribute) else {
-            return false
-        }
-
-        return CFEqual(focusedWindow, capturedWindow.window)
-    }
-
-    private func clickCapturedWindowTitleBar(_ capturedWindow: CapturedWindow) -> Bool {
-        guard let clickPoint = titleBarClickPoint(for: capturedWindow.window) else {
-            return false
-        }
-
-        let originalPosition = CGEvent(source: nil)?.location
-        postMouseEvent(type: .leftMouseDown, at: clickPoint)
-        postMouseEvent(type: .leftMouseUp, at: clickPoint)
-
-        if let originalPosition {
-            CGWarpMouseCursorPosition(originalPosition)
-        }
-        return true
-    }
-
-    private func postMouseEvent(type: CGEventType, at point: CGPoint) {
-        guard let event = CGEvent(
-            mouseEventSource: CGEventSource(stateID: .privateState),
-            mouseType: type,
-            mouseCursorPosition: point,
-            mouseButton: .left
-        ) else {
-            DriverLoggers.log(.error, category: .focus, "Failed to create focus restore mouse event of type \(type.rawValue).")
+        sessionLock.lock()
+        let current = session
+        let admitted = current.map {
+            $0.captured != nil && $0.releasedBaseline != nil && state.beginRestoration(token: $0.token)
+        } ?? false
+        sessionLock.unlock()
+        guard admitted, let current, let captured = current.captured,
+              let baseline = current.releasedBaseline else {
+            discardCapturedWindow()
             return
         }
 
-        event.setIntegerValueField(.mouseEventButtonNumber, value: Int64(CGMouseButton.left.rawValue))
-        event.setIntegerValueField(.mouseEventClickState, value: 1)
-        event.post(tap: .cghidEventTap)
+        onMain {
+            guard current.token.isPermitted else { self.finish(current); return }
+            let baselineWorkspace = self.workspace.snapshot()
+            guard baselineWorkspace.sessionActive else { self.finish(current); return }
+            self.onWorker {
+                guard current.token.isPermitted else { self.finish(current); return }
+                let resolution = self.backend.resolve(workspace: baselineWorkspace.application,
+                                                       permit: { current.token.isPermitted })
+                guard case let .known(confirmed) = resolution else {
+                    self.logUnknown(resolution, context: "Post-release focus baseline unavailable")
+                    self.finish(current)
+                    return
+                }
+                guard self.backend.relationship(baseline, confirmed) == .same else {
+                    self.log("Focus changed from the certified pre-release baseline; restoration skipped.")
+                    self.finish(current)
+                    return
+                }
+                if self.backend.relationship(captured, baseline) == .same {
+                    self.log("Captured window is already focused; no mutation needed.")
+                    self.finish(current)
+                    return
+                }
+                self.onMain {
+                    guard current.token.isPermitted else { self.finish(current); return }
+                    let refreshedWorkspace = self.workspace.snapshot()
+                    let capturedApplication = self.workspace.application(
+                        processIdentifier: captured.workspaceApplication.processIdentifier)
+                    guard self.sameWorkspace(baselineWorkspace, refreshedWorkspace), current.token.isPermitted else {
+                        self.finish(current)
+                        return
+                    }
+                    self.onWorker {
+                        let result = self.backend.attemptRestore(
+                            captured: captured, baseline: baseline,
+                            workspace: refreshedWorkspace.application, capturedApplication: capturedApplication,
+                            permit: { current.token.isPermitted })
+                        self.completeAttempt(result, session: current, captured: captured)
+                    }
+                }
+            }
+        }
     }
 
-    private func titleBarClickPoint(for window: AXUIElement) -> CGPoint? {
-        if let title = copyElementAttribute(window, attribute: kAXTitleUIElementAttribute),
-           let position = copyCGPointAttribute(title, attribute: kAXPositionAttribute),
-           let size = copyCGSizeAttribute(title, attribute: kAXSizeAttribute),
-           size.width > 0,
-           size.height > 0 {
-            return CGPoint(x: position.x + size.width / 2, y: position.y + size.height / 2)
-        }
+    public func discardCapturedWindow() { invalidate(shutdown: false) }
 
-        guard let position = copyCGPointAttribute(window, attribute: kAXPositionAttribute),
-              let size = copyCGSizeAttribute(window, attribute: kAXSizeAttribute),
-              size.width > 0,
-              size.height > 0 else {
-            return nil
-        }
-
-        return CGPoint(
-            x: position.x + min(max(size.width / 2, 24), max(size.width - 24, 1)),
-            y: position.y + min(max(12, 1), max(size.height - 1, 1))
-        )
+    /// Terminal for this coordinator; restarting the driver creates a new instance.
+    public func shutdown() {
+        invalidate(shutdown: true)
+        // This never waits for AX, including observer deregistration.
+        onMain { self.workspace.stop() }
     }
 
-    private func copyCGPointAttribute(_ element: AXUIElement, attribute: String) -> CGPoint? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
-        guard result == .success, let value, CFGetTypeID(value) == AXValueGetTypeID() else {
-            return nil
-        }
-
-        let axValue = (value as! AXValue)
-        guard AXValueGetType(axValue) == .cgPoint else {
-            return nil
-        }
-
-        var point = CGPoint.zero
-        guard AXValueGetValue(axValue, .cgPoint, &point) else {
-            return nil
-        }
-        return point
+    private func invalidate(shutdown: Bool) {
+        sessionLock.lock()
+        state.invalidate(shutdown: shutdown)
+        let previous = session
+        let cleanup = previous != nil && state.beginCleanup()
+        if cleanup { session = nil }
+        sessionLock.unlock()
+        if cleanup, let previous { dispose(previous, finishOperation: true) }
     }
 
-    private func copyCGSizeAttribute(_ element: AXUIElement, attribute: String) -> CGSize? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
-        guard result == .success, let value, CFGetTypeID(value) == AXValueGetTypeID() else {
-            return nil
+    private func startPreparation(_ current: Session, completion: @escaping () -> Void) {
+        onMain {
+            guard current.token.isPermitted else { self.finish(current, completion: completion); return }
+            self.workspace.start(observation: self.observationHandler(current))
+            let before = self.workspace.snapshot()
+            guard before.sessionActive else { self.finish(current, completion: completion); return }
+            self.onWorker {
+                guard current.token.isPermitted else { self.finish(current, completion: completion); return }
+                let resolution = self.backend.resolve(workspace: before.application,
+                                                       permit: { current.token.isPermitted })
+                guard case let .known(target) = resolution else {
+                    self.logUnknown(resolution, context: "Pre-input focus capture unavailable")
+                    self.finish(current, completion: completion)
+                    return
+                }
+                guard current.token.isPermitted else { self.finish(current, completion: completion); return }
+                guard let observation = self.backend.prepareObservation(
+                        target: target, permit: { current.token.isPermitted },
+                        onChange: self.observationHandler(current)) else {
+                    self.log("Pre-input focus capture skipped because target observation is unavailable.")
+                    self.finish(current, completion: completion)
+                    return
+                }
+                current.observations.append(observation)
+                self.onMain {
+                    guard current.token.isPermitted else { self.finish(current, completion: completion); return }
+                    self.attachSources(current)
+                    let observed = self.workspace.snapshot()
+                    guard self.sameWorkspace(before, observed) else {
+                        self.finish(current, completion: completion)
+                        return
+                    }
+                    // Observer registration is not a snapshot. Re-resolve after attachment.
+                    self.onWorker {
+                        guard current.token.isPermitted else { self.finish(current, completion: completion); return }
+                        let confirmation = self.backend.resolve(workspace: observed.application,
+                                                                permit: { current.token.isPermitted })
+                        guard case let .known(confirmed) = confirmation else {
+                            self.logUnknown(confirmation, context: "Pre-input focus confirmation unavailable")
+                            self.finish(current, completion: completion)
+                            return
+                        }
+                        guard self.backend.relationship(target, confirmed) == .same else {
+                            self.log("Pre-input focus changed while observation was installed; capture skipped.")
+                            self.finish(current, completion: completion)
+                            return
+                        }
+                        self.onMain {
+                            guard current.token.isPermitted else { self.finish(current, completion: completion); return }
+                            let final = self.workspace.snapshot()
+                            self.sessionLock.lock()
+                            let accepted = self.session === current && self.sameWorkspace(observed, final)
+                                && current.token.isPermitted
+                            if accepted {
+                                current.captured = confirmed
+                                current.certifiedBaseline = confirmed
+                                self.state.finishOperation()
+                            }
+                            self.sessionLock.unlock()
+                            guard accepted else {
+                                self.finish(current, completion: completion)
+                                return
+                            }
+                            if let systemError = confirmed.systemWideError {
+                                self.log("Capture corroborated after system-wide AX error \(systemError.rawValue).")
+                            }
+                            self.deliverPreparation(completion, prepared: current)
+                        }
+                    }
+                }
+            }
         }
+    }
 
-        let axValue = (value as! AXValue)
-        guard AXValueGetType(axValue) == .cgSize else {
-            return nil
+    private func observationHandler(_ current: Session) -> (FocusObservationEvent) -> Void {
+        { [weak self, weak current, token = current.token] event in
+            // Dirty the certificate immediately, even if main is busy. The single
+            // queued request samples after a burst of activation/deactivation hints.
+            guard token.observe(event), let self, let current else { return }
+            self.onMain { [weak self, weak current] in
+                guard let self, let current else { return }
+                self.startEnrollment(current)
+            }
         }
+    }
 
-        var size = CGSize.zero
-        guard AXValueGetValue(axValue, .cgSize, &size) else {
-            return nil
+    /// One attempt per touch, sharing the actual-operation slot with all AX work.
+    /// If release wins any stage, its invalidated permit prevents late certification.
+    private func startEnrollment(_ current: Session) {
+        sessionLock.lock()
+        let captured = current.captured
+        let revision = session === current && captured != nil ? state.beginEnrollment(token: current.token) : nil
+        sessionLock.unlock()
+        guard let revision, let captured else { return }
+        let permit = { current.token.permitsEnrollment(revision: revision) }
+        let before = workspace.snapshot()
+        guard before.sessionActive, permit() else { finish(current); return }
+        onWorker {
+            guard permit() else { self.finish(current); return }
+            let resolution = self.backend.resolve(workspace: before.application, permit: permit)
+            guard case let .known(target) = resolution else {
+                self.logUnknown(resolution, context: "During-touch focus baseline unavailable")
+                self.finish(current)
+                return
+            }
+            guard permit() else { self.finish(current); return }
+            // The original observer already watches its application's focused-window
+            // changes. A different application needs one additional observer.
+            if !target.workspaceApplication.isSameApplication(as: captured.workspaceApplication) {
+                guard let observation = self.backend.prepareObservation(
+                    target: target, permit: permit, onChange: self.observationHandler(current)) else {
+                    self.log("During-touch baseline observation unavailable; restoration skipped.")
+                    self.finish(current)
+                    return
+                }
+                current.observations.append(observation)
+            }
+            self.onMain {
+                guard permit() else { self.finish(current); return }
+                self.attachSources(current)
+                let observed = self.workspace.snapshot()
+                guard self.sameWorkspace(before, observed), permit() else { self.finish(current); return }
+                self.onWorker {
+                    guard permit() else { self.finish(current); return }
+                    let confirmation = self.backend.resolve(workspace: observed.application, permit: permit)
+                    guard case let .known(confirmed) = confirmation else {
+                        self.logUnknown(confirmation, context: "During-touch focus confirmation unavailable")
+                        self.finish(current)
+                        return
+                    }
+                    guard self.backend.relationship(target, confirmed) == .same, permit() else {
+                        self.finish(current)
+                        return
+                    }
+                    self.onMain {
+                        let final = self.workspace.snapshot()
+                        self.sessionLock.lock()
+                        let accepted = self.session === current && self.sameWorkspace(observed, final)
+                            && current.token.certifyEnrollment(revision: revision)
+                        if accepted {
+                            current.certifiedBaseline = confirmed
+                            self.state.finishOperation()
+                        }
+                        self.sessionLock.unlock()
+                        if !accepted { self.finish(current) }
+                    }
+                }
+            }
         }
-        return size
+    }
+
+    private func completeAttempt(_ result: AXFocusAttemptResult, session current: Session, captured: AXFocusTarget) {
+        switch result {
+        case .skipped:
+            log("Focus restoration abstained; no mutation issued.")
+            finish(current)
+        case .unknown(let failure):
+            logUnknown(.unknown(failure), context: "Focus restoration abstained")
+            finish(current)
+        case .attempted(let error):
+            log("Issued one focus mutation; AX=\(error.rawValue). Timeout does not cancel an issued action.")
+            guard current.token.isPermitted else { finish(current); return }
+            onMain {
+                guard current.token.isPermitted else { self.finish(current); return }
+                let after = self.workspace.snapshot()
+                guard after.sessionActive else { self.finish(current); return }
+                self.onWorker {
+                    guard current.token.isPermitted else { self.finish(current); return }
+                    let verification = self.backend.resolve(workspace: after.application,
+                                                           permit: { current.token.isPermitted })
+                    guard case let .known(verified) = verification else {
+                        self.logUnknown(verification, context: "Focus mutation has no fresh verification result")
+                        self.finish(current)
+                        return
+                    }
+                    let restored = self.backend.relationship(captured, verified) == .same
+                    self.onMain {
+                        let final = self.workspace.snapshot()
+                        guard current.token.isPermitted, self.sameWorkspace(after, final) else {
+                            self.log("Focus verification became stale before main-thread revalidation.")
+                            self.finish(current)
+                            return
+                        }
+                        self.log(restored
+                            ? "Fresh AX verification found the captured window focused."
+                            : "Fresh AX verification did not find the captured window focused.")
+                        self.finish(current)
+                    }
+                }
+            }
+        }
+    }
+
+    private func sameWorkspace(_ lhs: WorkspaceFocusSnapshot, _ rhs: WorkspaceFocusSnapshot) -> Bool {
+        guard lhs.sessionActive, rhs.sessionActive, lhs.revision == rhs.revision,
+              let left = lhs.application, let right = rhs.application,
+              !left.isTerminated, !right.isTerminated, !left.isHidden, !right.isHidden else { return false }
+        return left.processIdentifier == right.processIdentifier && left.isSameApplication(as: right)
+    }
+
+    /// Main only. Each source is attached once; callbacks only invalidate eligibility.
+    private func attachSources(_ current: Session) {
+        for observation in current.observations {
+            guard let source = observation.source,
+                  !current.attachedSources.contains(where: { CFEqual($0, source) }) else { continue }
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+            current.attachedSources.append(source)
+        }
+    }
+
+    private func finish(_ current: Session, completion: (() -> Void)? = nil) {
+        current.token.invalidate()
+        dispose(current, finishOperation: true) {
+            if let completion { self.deliverPreparation(completion) }
+        }
+    }
+
+    /// Keep the actual-operation slot until worker-side observer cleanup returns too.
+    private func dispose(_ current: Session, finishOperation: Bool, completion: (() -> Void)? = nil) {
+        onMain {
+            for source in current.attachedSources {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+            }
+            current.attachedSources.removeAll()
+            self.onWorker {
+                current.observations.forEach { $0.invalidate() }
+                current.observations.removeAll()
+                self.sessionLock.lock()
+                if self.session === current { self.session = nil }
+                if finishOperation { self.state.finishOperation() }
+                self.sessionLock.unlock()
+                completion?()
+            }
+        }
+    }
+
+    private func log(_ message: String) { DriverLoggers.log(.debug, category: .focus, message) }
+
+    private func logUnknown(_ resolution: AXFocusResolution, context: String) {
+        guard case let .unknown(failure) = resolution else { return }
+        log("\(context): \(failure.stage); AX=\(failure.error?.rawValue.description ?? "none"), systemWideAX=\(failure.systemWideError?.rawValue.description ?? "none").")
+    }
+
+    private func deliverPreparation(_ completion: @escaping () -> Void, prepared: Session? = nil) {
+        onCallback { [weak self] in
+            guard let self, !self.state.isStopped else { return }
+            if let prepared {
+                self.sessionLock.lock()
+                let current = self.session === prepared
+                let eligible = current && prepared.token.beginTouch()
+                let cleanup = current && !eligible && self.state.beginCleanup()
+                if cleanup { self.session = nil }
+                self.sessionLock.unlock()
+                if cleanup { self.dispose(prepared, finishOperation: true) }
+            }
+            completion()
+        }
     }
 }

@@ -11,6 +11,12 @@ public struct DriverConfiguration: Codable, Equatable {
     /// Display matching options.
     public var display: Display
 
+    /// Window focus behavior after a touch gesture.
+    public var focus: Focus
+
+    /// Cursor position behavior after a touch gesture.
+    public var cursor: Cursor
+
     /// Gesture feature options.
     public var gesture: Gesture
 
@@ -34,6 +40,8 @@ public struct DriverConfiguration: Codable, Equatable {
             expectedWidth: CapturedXeneonDisplay.expectedWidth,
             expectedHeight: CapturedXeneonDisplay.expectedHeight
         ),
+        focus: Focus(restorePreviousWindow: true),
+        cursor: Cursor(returnToPreviousPosition: true),
         gesture: Gesture(
             multiTouchEnabled: XeneonEdgeDevice.supportsMultiTouch,
             pinchHysteresisPx: 5,
@@ -136,6 +144,14 @@ public struct DriverConfiguration: Codable, Equatable {
             }
         }
 
+        if let restorePreviousWindow = partial.focus?.restorePreviousWindow {
+            configuration.focus.restorePreviousWindow = restorePreviousWindow
+        }
+
+        if let returnToPreviousPosition = partial.cursor?.returnToPreviousPosition {
+            configuration.cursor.returnToPreviousPosition = returnToPreviousPosition
+        }
+
         if let gesture = partial.gesture {
             if let value = gesture.multiTouchEnabled {
                 configuration.gesture.multiTouchEnabled = value && XeneonEdgeDevice.supportsMultiTouch
@@ -176,6 +192,20 @@ public struct DriverConfiguration: Codable, Equatable {
 }
 
 public extension DriverConfiguration {
+    /// Decodes complete configurations written before the focus and cursor options were added.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            logLevel: try values.decode(String.self, forKey: .logLevel),
+            timing: try values.decode(Timing.self, forKey: .timing),
+            display: try values.decode(Display.self, forKey: .display),
+            focus: try values.decodeIfPresent(Focus.self, forKey: .focus) ?? Focus(restorePreviousWindow: true),
+            cursor: try values.decodeIfPresent(Cursor.self, forKey: .cursor) ?? Cursor(returnToPreviousPosition: true),
+            gesture: try values.decode(Gesture.self, forKey: .gesture),
+            diagnostics: try values.decode(Diagnostics.self, forKey: .diagnostics)
+        )
+    }
+
     /// Timing values in milliseconds.
     struct Timing: Codable, Equatable {
         public var warpToClickDelayMs: Int
@@ -192,6 +222,16 @@ public extension DriverConfiguration {
         public var serialNumber: UInt32?
         public var expectedWidth: Int
         public var expectedHeight: Int
+    }
+
+    /// Window focus configuration.
+    struct Focus: Codable, Equatable {
+        public var restorePreviousWindow: Bool
+    }
+
+    /// Cursor position configuration. Cleanup always restores visibility and mouse association.
+    struct Cursor: Codable, Equatable {
+        public var returnToPreviousPosition: Bool
     }
 
     /// Gesture configuration.
@@ -215,6 +255,20 @@ public extension DriverConfiguration {
     }
 }
 
+public extension DriverConfiguration.Focus {
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(restorePreviousWindow: try values.decodeIfPresent(Bool.self, forKey: .restorePreviousWindow) ?? true)
+    }
+}
+
+public extension DriverConfiguration.Cursor {
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(returnToPreviousPosition: try values.decodeIfPresent(Bool.self, forKey: .returnToPreviousPosition) ?? true)
+    }
+}
+
 /// Result of loading the configuration file.
 public struct ConfigurationLoadResult: Equatable {
     /// The effective configuration.
@@ -228,6 +282,8 @@ private struct PartialConfiguration: Decodable {
     var logLevel: String?
     var timing: PartialTiming?
     var display: PartialDisplay?
+    var focus: PartialFocus?
+    var cursor: PartialCursor?
     var gesture: PartialGesture?
     var diagnostics: PartialDiagnostics?
 }
@@ -246,6 +302,14 @@ private struct PartialDisplay: Decodable {
     var serialNumber: UInt32?
     var expectedWidth: Int?
     var expectedHeight: Int?
+}
+
+private struct PartialFocus: Decodable {
+    var restorePreviousWindow: Bool?
+}
+
+private struct PartialCursor: Decodable {
+    var returnToPreviousPosition: Bool?
 }
 
 private struct PartialGesture: Decodable {

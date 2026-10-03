@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Keep mapped touch points inside the target rectangle by clamping the final global coordinates below its excluded maximum edges. Existing interior coordinates stay unchanged. Reject bounds whose positive dimensions round to equal minimum and maximum edges. This establishes mathematical containment; live click routing at display boundaries remains unverified.
+
 ## 1.0.0 - 2026-05-03
 
 - Initial release of the single-touch Mac Xeneon Edge Touch Driver.
