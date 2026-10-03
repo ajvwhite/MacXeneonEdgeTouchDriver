@@ -51,9 +51,9 @@ private final class HIDDumpApplication {
         let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
 
         IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
-        IOHIDManagerRegisterDeviceMatchingCallback(manager, deviceMatchedCallback, context)
-        IOHIDManagerRegisterDeviceRemovalCallback(manager, deviceRemovedCallback, context)
-        IOHIDManagerRegisterInputValueCallback(manager, inputValueCallback, context)
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, makeDeviceMatchedCallback(), context)
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, makeDeviceRemovedCallback(), context)
+        IOHIDManagerRegisterInputValueCallback(manager, makeInputValueCallback(), context)
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
         let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -88,7 +88,7 @@ private final class HIDDumpApplication {
             device,
             registration.buffer,
             registration.length,
-            inputReportCallback,
+            makeInputReportCallback(),
             UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         )
 
@@ -184,40 +184,49 @@ private final class HIDDumpApplication {
     }
 }
 
-private let deviceMatchedCallback: IOHIDDeviceCallback = { context, _, _, device in
-    guard let context else {
-        return
-    }
+// Build noncapturing C callbacks at registration instead of storing function values at top level.
+private func makeDeviceMatchedCallback() -> IOHIDDeviceCallback {
+    { context, _, _, device in
+        guard let context else {
+            return
+        }
 
-    let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
-    application.handleDeviceMatched(device)
+        let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
+        application.handleDeviceMatched(device)
+    }
 }
 
-private let deviceRemovedCallback: IOHIDDeviceCallback = { context, _, _, device in
-    guard let context else {
-        return
-    }
+private func makeDeviceRemovedCallback() -> IOHIDDeviceCallback {
+    { context, _, _, device in
+        guard let context else {
+            return
+        }
 
-    let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
-    application.handleDeviceRemoved(device)
+        let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
+        application.handleDeviceRemoved(device)
+    }
 }
 
-private let inputValueCallback: IOHIDValueCallback = { context, _, _, value in
-    guard let context else {
-        return
-    }
+private func makeInputValueCallback() -> IOHIDValueCallback {
+    { context, _, _, value in
+        guard let context else {
+            return
+        }
 
-    let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
-    application.handleInputValue(value)
+        let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
+        application.handleInputValue(value)
+    }
 }
 
-private let inputReportCallback: IOHIDReportCallback = { context, _, _, type, reportID, report, reportLength in
-    guard let context else {
-        return
-    }
+private func makeInputReportCallback() -> IOHIDReportCallback {
+    { context, _, _, type, reportID, report, reportLength in
+        guard let context else {
+            return
+        }
 
-    let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
-    application.handleInputReport(type: type, reportID: reportID, report: report, reportLength: reportLength)
+        let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
+        application.handleInputReport(type: type, reportID: reportID, report: report, reportLength: reportLength)
+    }
 }
 
 private func usagePageName(_ page: UInt32) -> String {

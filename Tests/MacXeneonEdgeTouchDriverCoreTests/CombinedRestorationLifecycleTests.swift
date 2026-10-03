@@ -8,28 +8,27 @@ final class CombinedRestorationLifecycleTests: XCTestCase {
     func testPostUpCancellationAndWatchdogNeverReleaseTheButtonTwice() {
         for option in options {
             for useWatchdog in [false, true] {
-                XCTContext.runActivity(named: "\(option), watchdog=\(useWatchdog)") { _ in
-                    let fixture = CombinedGestureFixture(option: option)
-                    fixture.send(.down, at: 0)
-                    fixture.send(.up, at: 1)
-                    fixture.clock.advance(toMilliseconds: 21)
-                    XCTAssertFalse(fixture.isPressed)
-                    if useWatchdog {
-                        fixture.controller.handleIdleTimeout()
-                    } else {
-                        fixture.controller.forceCancel()
-                    }
+                let scenario = "\(option), watchdog=\(useWatchdog)"
+                let fixture = CombinedGestureFixture(option: option)
+                fixture.send(.down, at: 0)
+                fixture.send(.up, at: 1)
+                fixture.clock.advance(toMilliseconds: 21)
+                XCTAssertFalse(fixture.isPressed, scenario)
+                if useWatchdog {
+                    fixture.controller.handleIdleTimeout()
+                } else {
                     fixture.controller.forceCancel()
-                    fixture.controller.forceCancel()
-                    fixture.clock.advance(toMilliseconds: 1_000)
-
-                    XCTAssertEqual(fixture.effects.input, [.down(near), .up(near)])
-                    XCTAssertEqual(fixture.effects.releases, [option.cursor])
-                    XCTAssertEqual(fixture.effects.restores, option.focus ? 1 : 0)
-                    XCTAssertEqual(fixture.idleCount, 1)
-                    XCTAssertEqual(fixture.controller.state, .idle)
-                    fixture.effects.assertBalanced()
                 }
+                fixture.controller.forceCancel()
+                fixture.controller.forceCancel()
+                fixture.clock.advance(toMilliseconds: 1_000)
+
+                XCTAssertEqual(fixture.effects.input, [.down(near), .up(near)], scenario)
+                XCTAssertEqual(fixture.effects.releases, [option.cursor], scenario)
+                XCTAssertEqual(fixture.effects.restores, option.focus ? 1 : 0, scenario)
+                XCTAssertEqual(fixture.idleCount, 1, scenario)
+                XCTAssertEqual(fixture.controller.state, .idle, scenario)
+                fixture.effects.assertBalanced(context: scenario)
             }
         }
     }
@@ -124,27 +123,26 @@ final class CombinedRestorationLifecycleTests: XCTestCase {
         for option in options {
             for cancelTime: UInt64 in [10, 25, 45] {
                 for removal in [false, true] {
-                    XCTContext.runActivity(named: "\(option), cancel at \(cancelTime), removal=\(removal)") { _ in
-                        let fixture = CombinedApplicationFixture(option: option, warp: 20)
-                        fixture.send(.down, at: 0)
-                        if cancelTime > 20 { fixture.send(.up, at: 20) }
-                        fixture.clock.advance(toMilliseconds: cancelTime)
-                        if removal {
-                            fixture.application.handleDeviceRemoval()
-                            fixture.application.handleDeviceRemoval()
-                        } else {
-                            // The shared teardown invoked by stop(), without starting HID or touching permissions.
-                            fixture.application.cancelActiveGesture()
-                            fixture.application.cancelActiveGesture()
-                        }
-                        fixture.clock.advance(toMilliseconds: 2_000)
-
-                        XCTAssertEqual(fixture.effects.input, cancelTime < 20 ? [] : [.down(near), .up(near)])
-                        XCTAssertEqual(fixture.effects.releases, [option.cursor])
-                        XCTAssertEqual(fixture.effects.captures, option.focus ? 1 : 0)
-                        XCTAssertEqual(fixture.effects.restores, option.focus ? 1 : 0)
-                        fixture.effects.assertBalanced()
+                    let scenario = "\(option), cancel at \(cancelTime), removal=\(removal)"
+                    let fixture = CombinedApplicationFixture(option: option, warp: 20)
+                    fixture.send(.down, at: 0)
+                    if cancelTime > 20 { fixture.send(.up, at: 20) }
+                    fixture.clock.advance(toMilliseconds: cancelTime)
+                    if removal {
+                        fixture.application.handleDeviceRemoval()
+                        fixture.application.handleDeviceRemoval()
+                    } else {
+                        // The shared teardown invoked by stop(), without starting HID or touching permissions.
+                        fixture.application.cancelActiveGesture()
+                        fixture.application.cancelActiveGesture()
                     }
+                    fixture.clock.advance(toMilliseconds: 2_000)
+
+                    XCTAssertEqual(fixture.effects.input, cancelTime < 20 ? [] : [.down(near), .up(near)], scenario)
+                    XCTAssertEqual(fixture.effects.releases, [option.cursor], scenario)
+                    XCTAssertEqual(fixture.effects.captures, option.focus ? 1 : 0, scenario)
+                    XCTAssertEqual(fixture.effects.restores, option.focus ? 1 : 0, scenario)
+                    fixture.effects.assertBalanced(context: scenario)
                 }
             }
         }
@@ -266,21 +264,22 @@ private final class CombinedEffects {
     var captures = 0
     var restores = 0
 
-    func assertBalanced(file: StaticString = #filePath, line: UInt = #line) {
+    func assertBalanced(context: String = "", file: StaticString = #filePath, line: UInt = #line) {
+        let prefix = context.isEmpty ? "" : "\(context): "
         var pressed = false
         for event in input {
             switch event {
             case .down:
-                XCTAssertFalse(pressed, "Duplicate down", file: file, line: line)
+                XCTAssertFalse(pressed, "\(prefix)Duplicate down", file: file, line: line)
                 pressed = true
             case .up:
-                XCTAssertTrue(pressed, "Up without ownership", file: file, line: line)
+                XCTAssertTrue(pressed, "\(prefix)Up without ownership", file: file, line: line)
                 pressed = false
             case .drag:
-                XCTAssertTrue(pressed, "Drag without ownership", file: file, line: line)
+                XCTAssertTrue(pressed, "\(prefix)Drag without ownership", file: file, line: line)
             }
         }
-        XCTAssertFalse(pressed, "Button left down", file: file, line: line)
+        XCTAssertFalse(pressed, "\(prefix)Button left down", file: file, line: line)
     }
 }
 

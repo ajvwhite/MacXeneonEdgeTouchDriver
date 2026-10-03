@@ -7,30 +7,29 @@ final class CursorReturnGestureTests: XCTestCase {
     func testTapOptionsPreserveInputTimingAndCleanupOrder() {
         for timing in timings {
             for options in combinations {
-                XCTContext.runActivity(named: "tap: \(options), \(timing.name)") { _ in
-                    let harness = Harness(options: options, timing: timing.value)
-                    harness.send(.down)
+                let scenario = "tap: \(options), \(timing.name)"
+                let harness = Harness(options: options, timing: timing.value)
+                harness.send(.down)
+                harness.scheduler.advance(byMilliseconds: 1)
+                harness.send(.up)
+
+                XCTAssertEqual(harness.trace.downCount, 1, scenario)
+                if timing.value.downToUpDelayMs > 0 {
+                    XCTAssertEqual(harness.trace.upCount, 0, scenario)
+                    XCTAssertTrue(harness.trace.releases.isEmpty, scenario)
+                    harness.scheduler.advance(byMilliseconds: UInt64(timing.value.downToUpDelayMs - 1))
+                    XCTAssertEqual(harness.trace.upCount, 0, scenario)
                     harness.scheduler.advance(byMilliseconds: 1)
-                    harness.send(.up)
-
-                    XCTAssertEqual(harness.trace.downCount, 1)
-                    if timing.value.downToUpDelayMs > 0 {
-                        XCTAssertEqual(harness.trace.upCount, 0)
-                        XCTAssertTrue(harness.trace.releases.isEmpty)
-                        harness.scheduler.advance(byMilliseconds: UInt64(timing.value.downToUpDelayMs - 1))
-                        XCTAssertEqual(harness.trace.upCount, 0)
-                        harness.scheduler.advance(byMilliseconds: 1)
-                    }
-                    XCTAssertEqual(harness.trace.upCount, 1)
-                    finishReturnDelay(harness, milliseconds: timing.value.clickToWarpBackDelayMs)
-
-                    XCTAssertEqual(harness.trace.effects, expected(
-                        options,
-                        input: [.down(Harness.start), .up(Harness.start)]
-                    ))
-                    XCTAssertEqual(harness.controller.state, .idle)
-                    XCTAssertEqual(harness.idleTransitions, 1)
                 }
+                XCTAssertEqual(harness.trace.upCount, 1, scenario)
+                finishReturnDelay(harness, milliseconds: timing.value.clickToWarpBackDelayMs, context: scenario)
+
+                XCTAssertEqual(harness.trace.effects, expected(
+                    options,
+                    input: [.down(Harness.start), .up(Harness.start)]
+                ), scenario)
+                XCTAssertEqual(harness.controller.state, .idle, scenario)
+                XCTAssertEqual(harness.idleTransitions, 1, scenario)
             }
         }
     }
@@ -38,95 +37,90 @@ final class CursorReturnGestureTests: XCTestCase {
     func testDragOptionsKeepImmediateDragAndReleaseAtTheExistingDeadline() {
         for timing in timings {
             for options in combinations {
-                XCTContext.runActivity(named: "drag: \(options), \(timing.name)") { _ in
-                    let harness = Harness(options: options, timing: timing.value)
-                    harness.send(.down)
-                    harness.scheduler.advance(byMilliseconds: 1)
-                    harness.send(.move, atEnd: true)
+                let scenario = "drag: \(options), \(timing.name)"
+                let harness = Harness(options: options, timing: timing.value)
+                harness.send(.down)
+                harness.scheduler.advance(byMilliseconds: 1)
+                harness.send(.move, atEnd: true)
 
-                    XCTAssertEqual(harness.trace.downCount, 1)
-                    XCTAssertEqual(harness.trace.effects.suffix(2), [.update(Harness.end), .drag(Harness.end)])
-                    harness.send(.up, atEnd: true)
-                    XCTAssertEqual(harness.trace.upCount, 1, "Dragging must not acquire the tap's mouse-up delay.")
-                    finishReturnDelay(harness, milliseconds: timing.value.clickToWarpBackDelayMs)
+                XCTAssertEqual(harness.trace.downCount, 1, scenario)
+                XCTAssertEqual(harness.trace.effects.suffix(2), [.update(Harness.end), .drag(Harness.end)], scenario)
+                harness.send(.up, atEnd: true)
+                XCTAssertEqual(harness.trace.upCount, 1, "\(scenario): Dragging must not acquire the tap's mouse-up delay.")
+                finishReturnDelay(harness, milliseconds: timing.value.clickToWarpBackDelayMs, context: scenario)
 
-                    XCTAssertEqual(harness.trace.effects, expected(
-                        options,
-                        input: [.down(Harness.start), .update(Harness.end), .drag(Harness.end), .up(Harness.end)]
-                    ))
-                    XCTAssertEqual(harness.controller.state, .idle)
-                    XCTAssertEqual(harness.idleTransitions, 1)
-                }
+                XCTAssertEqual(harness.trace.effects, expected(
+                    options,
+                    input: [.down(Harness.start), .update(Harness.end), .drag(Harness.end), .up(Harness.end)]
+                ), scenario)
+                XCTAssertEqual(harness.controller.state, .idle, scenario)
+                XCTAssertEqual(harness.idleTransitions, 1, scenario)
             }
         }
     }
 
     func testCancelBeforeMouseDownReleasesBorrowWithoutPostingInput() {
         for options in combinations {
-            XCTContext.runActivity(named: options.description) { _ in
-                let harness = Harness(options: options, timing: cancellationTiming, executeCancelledActions: true)
-                harness.send(.down)
-                harness.scheduler.advance(byMilliseconds: 1)
-                harness.controller.forceCancel()
+            let scenario = options.description
+            let harness = Harness(options: options, timing: cancellationTiming, executeCancelledActions: true)
+            harness.send(.down)
+            harness.scheduler.advance(byMilliseconds: 1)
+            harness.controller.forceCancel()
 
-                XCTAssertEqual(harness.trace.effects, expected(options, input: []))
-                assertLateCallbacksHaveNoEffects(harness)
-            }
+            XCTAssertEqual(harness.trace.effects, expected(options, input: []), scenario)
+            assertLateCallbacksHaveNoEffects(harness, context: scenario)
         }
     }
 
     func testCancelDuringDragReleasesButtonBeforeCursorAndFocus() {
         for options in combinations {
-            XCTContext.runActivity(named: options.description) { _ in
-                let harness = Harness(options: options, timing: cancellationTiming, executeCancelledActions: true)
-                harness.send(.down)
-                harness.scheduler.advance(byMilliseconds: 1)
-                harness.send(.move, atEnd: true)
-                harness.controller.forceCancel()
+            let scenario = options.description
+            let harness = Harness(options: options, timing: cancellationTiming, executeCancelledActions: true)
+            harness.send(.down)
+            harness.scheduler.advance(byMilliseconds: 1)
+            harness.send(.move, atEnd: true)
+            harness.controller.forceCancel()
 
-                XCTAssertEqual(harness.trace.effects, expected(
-                    options,
-                    input: [.down(Harness.start), .update(Harness.end), .drag(Harness.end), .up(Harness.end)]
-                ))
-                assertLateCallbacksHaveNoEffects(harness)
-            }
+            XCTAssertEqual(harness.trace.effects, expected(
+                options,
+                input: [.down(Harness.start), .update(Harness.end), .drag(Harness.end), .up(Harness.end)]
+            ), scenario)
+            assertLateCallbacksHaveNoEffects(harness, context: scenario)
         }
     }
 
     func testCancelWhileWaitingForMouseUpReleasesOnceAndCancelsDelayedWork() {
         for options in combinations {
-            XCTContext.runActivity(named: options.description) { _ in
-                let harness = Harness(options: options, timing: cancellationTiming, executeCancelledActions: true)
-                harness.send(.down)
-                harness.scheduler.advance(byMilliseconds: 1)
-                harness.send(.up)
-                XCTAssertEqual(harness.trace.upCount, 0)
-                harness.controller.forceCancel()
+            let scenario = options.description
+            let harness = Harness(options: options, timing: cancellationTiming, executeCancelledActions: true)
+            harness.send(.down)
+            harness.scheduler.advance(byMilliseconds: 1)
+            harness.send(.up)
+            XCTAssertEqual(harness.trace.upCount, 0, scenario)
+            harness.controller.forceCancel()
 
-                XCTAssertEqual(harness.trace.effects, expected(
-                    options,
-                    input: [.down(Harness.start), .up(Harness.start)]
-                ))
-                assertLateCallbacksHaveNoEffects(harness)
-            }
+            XCTAssertEqual(harness.trace.effects, expected(
+                options,
+                input: [.down(Harness.start), .up(Harness.start)]
+            ), scenario)
+            assertLateCallbacksHaveNoEffects(harness, context: scenario)
         }
     }
 
     func testWatchdogDuringTrackingHonorsBothOptionsAndReleasesTheButton() {
         for options in combinations {
-            XCTContext.runActivity(named: options.description) { _ in
-                let harness = Harness(options: options, timing: cancellationTiming, executeCancelledActions: true)
-                harness.send(.down)
-                harness.scheduler.advance(byMilliseconds: 10)
-                XCTAssertEqual(harness.trace.downCount, 1)
-                harness.controller.handleIdleTimeout()
+            let scenario = options.description
+            let harness = Harness(options: options, timing: cancellationTiming, executeCancelledActions: true)
+            harness.send(.down)
+            harness.scheduler.advance(byMilliseconds: 10)
+            XCTAssertEqual(harness.trace.downCount, 1, scenario)
+            harness.controller.handleIdleTimeout()
 
-                XCTAssertEqual(harness.trace.effects, expected(
-                    options,
-                    input: [.down(Harness.start), .up(Harness.start)]
-                ))
-                assertLateCallbacksHaveNoEffects(harness)
-            }
+            XCTAssertEqual(harness.trace.effects, expected(
+                options,
+                input: [.down(Harness.start), .up(Harness.start)]
+            ), scenario)
+            assertLateCallbacksHaveNoEffects(harness, context: scenario)
         }
     }
 
@@ -170,25 +164,27 @@ final class CursorReturnGestureTests: XCTestCase {
             [.release(options.returnCursor)] + (options.restoreFocus ? [.restore] : [])
     }
 
-    private func finishReturnDelay(_ harness: Harness, milliseconds: Int, file: StaticString = #filePath, line: UInt = #line) {
+    private func finishReturnDelay(_ harness: Harness, milliseconds: Int, context: String,
+                                   file: StaticString = #filePath, line: UInt = #line) {
         if milliseconds > 0 {
-            XCTAssertTrue(harness.trace.releases.isEmpty, file: file, line: line)
-            XCTAssertEqual(harness.idleTransitions, 0, file: file, line: line)
+            XCTAssertTrue(harness.trace.releases.isEmpty, context, file: file, line: line)
+            XCTAssertEqual(harness.idleTransitions, 0, context, file: file, line: line)
             harness.scheduler.advance(byMilliseconds: UInt64(milliseconds - 1))
-            XCTAssertTrue(harness.trace.releases.isEmpty, file: file, line: line)
+            XCTAssertTrue(harness.trace.releases.isEmpty, context, file: file, line: line)
             harness.scheduler.advance(byMilliseconds: 1)
         }
-        XCTAssertEqual(harness.trace.releases.count, 1, file: file, line: line)
+        XCTAssertEqual(harness.trace.releases.count, 1, context, file: file, line: line)
     }
 
-    private func assertLateCallbacksHaveNoEffects(_ harness: Harness, file: StaticString = #filePath, line: UInt = #line) {
+    private func assertLateCallbacksHaveNoEffects(_ harness: Harness, context: String,
+                                                  file: StaticString = #filePath, line: UInt = #line) {
         let effects = harness.trace.effects
-        XCTAssertEqual(harness.controller.state, .idle, file: file, line: line)
-        XCTAssertEqual(harness.idleTransitions, 1, file: file, line: line)
+        XCTAssertEqual(harness.controller.state, .idle, context, file: file, line: line)
+        XCTAssertEqual(harness.idleTransitions, 1, context, file: file, line: line)
         harness.scheduler.advance(byMilliseconds: 1_000)
-        XCTAssertEqual(harness.trace.effects, effects, file: file, line: line)
-        XCTAssertEqual(harness.controller.state, .idle, file: file, line: line)
-        XCTAssertEqual(harness.idleTransitions, 1, file: file, line: line)
+        XCTAssertEqual(harness.trace.effects, effects, context, file: file, line: line)
+        XCTAssertEqual(harness.controller.state, .idle, context, file: file, line: line)
+        XCTAssertEqual(harness.idleTransitions, 1, context, file: file, line: line)
     }
 }
 

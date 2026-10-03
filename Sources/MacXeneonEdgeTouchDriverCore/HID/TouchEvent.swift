@@ -1,9 +1,9 @@
 import Foundation
 
 /// A normalized touch event produced from the Xeneon Edge HID report stream.
-public struct TouchEvent: Equatable {
+public struct TouchEvent: Equatable, Sendable {
     /// Contact lifecycle event.
-    public enum Kind: Equatable {
+    public enum Kind: Equatable, Sendable {
         case down
         case move
         case up

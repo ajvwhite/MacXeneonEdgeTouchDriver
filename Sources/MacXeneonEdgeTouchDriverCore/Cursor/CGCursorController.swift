@@ -132,12 +132,15 @@ public final class CGCursorController: CursorController {
         var show: (CGDirectDisplayID) -> CGError
         var associate: (Bool) -> CGError
 
-        static let live = Operations(
-            currentPosition: { CGEvent(source: nil)?.location },
-            warp: { CGWarpMouseCursorPosition($0) },
-            hide: { CGDisplayHideCursor($0) },
-            show: { CGDisplayShowCursor($0) },
-            associate: { CGAssociateMouseAndMouseCursorPosition($0 ? boolean_t(1) : boolean_t(0)) }
-        )
+        // Construct per controller; the injected closures are not shared Sendable state.
+        static var live: Operations {
+            Operations(
+                currentPosition: { CGEvent(source: nil)?.location },
+                warp: { CGWarpMouseCursorPosition($0) },
+                hide: { CGDisplayHideCursor($0) },
+                show: { CGDisplayShowCursor($0) },
+                associate: { CGAssociateMouseAndMouseCursorPosition($0 ? boolean_t(1) : boolean_t(0)) }
+            )
+        }
     }
 }

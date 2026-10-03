@@ -1,4 +1,5 @@
 import CoreGraphics
+import Foundation
 @testable import MacXeneonEdgeTouchDriverCore
 import XCTest
 
@@ -278,21 +279,23 @@ final class DisplayRoutingTests: XCTestCase {
         }
     }
 
-    func testBeginArrivalBlocksAnOlderQueuedDownBeforeBeginHandlerRuns() {
+    func testBeginArrivalBlocksAnOlderQueuedDownBeforeBeginHandlerRuns() throws {
         let queue = DispatchQueue(label: "display-routing-queued-down-test")
         let fixture = RoutingFixture(gestureQueue: queue)
-        fixture.provider.displays = [display(at: movedOrigin)]
+        queue.sync { fixture.provider.displays = [display(at: movedOrigin)] }
 
-        withBlockedQueue(queue) {
+        try withBlockedQueue(queue) {
             queue.async { fixture.send(.down) }
             fixture.application.enqueueDisplayReconfiguration(flags: .beginConfigurationFlag)
         }
-        waitForQueue(queue)
+        try waitForQueue(queue)
 
-        XCTAssertEqual(fixture.provider.readCount, 0, "Queued down must not read transient geometry")
-        XCTAssertTrue(fixture.recorder.input.isEmpty)
-        XCTAssertFalse(fixture.recorder.calls.contains(.borrow(movedOrigin)))
-        XCTAssertNil(fixture.resolver.currentMapper)
+        queue.sync {
+            XCTAssertEqual(fixture.provider.readCount, 0, "Queued down must not read transient geometry")
+            XCTAssertTrue(fixture.recorder.input.isEmpty)
+            XCTAssertFalse(fixture.recorder.calls.contains(.borrow(movedOrigin)))
+            XCTAssertNil(fixture.resolver.currentMapper)
+        }
 
         fixture.application.enqueueDisplayReconfiguration(flags: .movedFlag)
         queue.async {
@@ -300,28 +303,32 @@ final class DisplayRoutingTests: XCTestCase {
             fixture.send(.down, at: 1)
             fixture.send(.up, at: 2)
         }
-        waitForQueue(queue)
+        try waitForQueue(queue)
 
-        XCTAssertEqual(fixture.provider.readCount, 2)
-        XCTAssertEqual(fixture.recorder.input, [.down(movedOrigin), .up(movedOrigin)])
+        queue.sync {
+            XCTAssertEqual(fixture.provider.readCount, 2)
+            XCTAssertEqual(fixture.recorder.input, [.down(movedOrigin), .up(movedOrigin)])
+        }
     }
 
-    func testBeginArrivalBlocksPendingMouseDownAheadOfBeginHandler() {
+    func testBeginArrivalBlocksPendingMouseDownAheadOfBeginHandler() throws {
         let queue = DispatchQueue(label: "display-routing-pending-down-test")
         let fixture = RoutingFixture(warpDelay: 40, gestureQueue: queue)
         queue.async { fixture.send(.down) }
-        waitForQueue(queue)
-        fixture.provider.displays = [display(at: movedOrigin)]
+        try waitForQueue(queue)
+        queue.sync { fixture.provider.displays = [display(at: movedOrigin)] }
 
-        withBlockedQueue(queue) {
+        try withBlockedQueue(queue) {
             queue.async { fixture.clock.advance(toMilliseconds: 40) }
             fixture.application.enqueueDisplayReconfiguration(flags: .beginConfigurationFlag)
         }
-        waitForQueue(queue)
+        try waitForQueue(queue)
 
-        XCTAssertTrue(fixture.recorder.input.isEmpty, "Due mouse-down must observe the begin arrival immediately")
-        XCTAssertEqual(fixture.recorder.returnCount, 1)
-        assertFocusDiscardedBeforeCursorReturn(fixture.recorder)
+        queue.sync {
+            XCTAssertTrue(fixture.recorder.input.isEmpty, "Due mouse-down must observe the begin arrival immediately")
+            XCTAssertEqual(fixture.recorder.returnCount, 1)
+            assertFocusDiscardedBeforeCursorReturn(fixture.recorder)
+        }
 
         fixture.application.enqueueDisplayReconfiguration(flags: .movedFlag)
         queue.async {
@@ -329,116 +336,193 @@ final class DisplayRoutingTests: XCTestCase {
             // Deliver the cancelled old watchdog while the recovered contact remains held.
             fixture.clock.advance(toMilliseconds: 1_000)
         }
-        waitForQueue(queue)
-        XCTAssertEqual(fixture.recorder.input, [.down(movedOrigin)])
-        XCTAssertEqual(fixture.recorder.returnCount, 1)
-        XCTAssertEqual(fixture.recorder.restoreCount, 0)
+        try waitForQueue(queue)
+        queue.sync {
+            XCTAssertEqual(fixture.recorder.input, [.down(movedOrigin)])
+            XCTAssertEqual(fixture.recorder.returnCount, 1)
+            XCTAssertEqual(fixture.recorder.restoreCount, 0)
+        }
 
         queue.async {
             fixture.send(.up, at: 1_001)
             fixture.clock.advance(toMilliseconds: 2_000)
         }
-        waitForQueue(queue)
-        XCTAssertEqual(fixture.recorder.input, [.down(movedOrigin), .up(movedOrigin)])
-        XCTAssertEqual(fixture.recorder.returnCount, 2)
-        XCTAssertEqual(fixture.recorder.restoreCount, 1)
+        try waitForQueue(queue)
+        queue.sync {
+            XCTAssertEqual(fixture.recorder.input, [.down(movedOrigin), .up(movedOrigin)])
+            XCTAssertEqual(fixture.recorder.returnCount, 2)
+            XCTAssertEqual(fixture.recorder.restoreCount, 1)
+        }
     }
 
-    func testOlderQueuedEndCannotResolveDuringANewerBegin() {
+    func testOlderQueuedEndCannotResolveDuringANewerBegin() throws {
         let queue = DispatchQueue(label: "display-routing-stale-end-test")
         let fixture = RoutingFixture(gestureQueue: queue)
         queue.async {
             fixture.send(.down)
             fixture.application.handleDisplayReconfiguration(flags: .beginConfigurationFlag)
         }
-        waitForQueue(queue)
-        let readsBeforeQueuedEnd = fixture.provider.readCount
-        fixture.provider.displays = [display(at: CGPoint(x: 900, y: -800))]
+        try waitForQueue(queue)
+        let readsBeforeQueuedEnd = queue.sync { () -> Int in
+            fixture.provider.displays = [display(at: CGPoint(x: 900, y: -800))]
+            return fixture.provider.readCount
+        }
 
-        withBlockedQueue(queue) {
+        try withBlockedQueue(queue) {
             fixture.application.enqueueDisplayReconfiguration(flags: .movedFlag)
             queue.async { fixture.send(.down) }
             fixture.application.enqueueDisplayReconfiguration(flags: .beginConfigurationFlag)
         }
-        waitForQueue(queue)
+        try waitForQueue(queue)
 
-        XCTAssertEqual(fixture.provider.readCount, readsBeforeQueuedEnd)
-        XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin)])
-        XCTAssertNil(fixture.resolver.currentMapper)
-        assertFocusDiscardedBeforeCursorReturn(fixture.recorder)
+        queue.sync {
+            XCTAssertEqual(fixture.provider.readCount, readsBeforeQueuedEnd)
+            XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin)])
+            XCTAssertNil(fixture.resolver.currentMapper)
+            assertFocusDiscardedBeforeCursorReturn(fixture.recorder)
+            fixture.provider.displays = [display(at: movedOrigin)]
+        }
 
-        fixture.provider.displays = [display(at: movedOrigin)]
         fixture.application.enqueueDisplayReconfiguration(flags: .movedFlag)
         queue.async {
             fixture.send(.up)
             fixture.send(.down, at: 1)
             fixture.clock.advance(toMilliseconds: 1_000)
         }
-        waitForQueue(queue)
+        try waitForQueue(queue)
 
-        XCTAssertEqual(fixture.provider.readCount, readsBeforeQueuedEnd + 2)
-        XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin), .down(movedOrigin)])
-        XCTAssertEqual(fixture.recorder.returnCount, 1)
-        XCTAssertEqual(fixture.recorder.restoreCount, 0)
+        queue.sync {
+            XCTAssertEqual(fixture.provider.readCount, readsBeforeQueuedEnd + 2)
+            XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin), .down(movedOrigin)])
+            XCTAssertEqual(fixture.recorder.returnCount, 1)
+            XCTAssertEqual(fixture.recorder.restoreCount, 0)
+        }
         queue.async { fixture.send(.up) }
-        waitForQueue(queue)
-        XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin), .down(movedOrigin), .up(movedOrigin)])
-        XCTAssertEqual(fixture.recorder.returnCount, 2)
-        XCTAssertEqual(fixture.recorder.restoreCount, 1)
+        try waitForQueue(queue)
+        queue.sync {
+            XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin), .down(movedOrigin), .up(movedOrigin)])
+            XCTAssertEqual(fixture.recorder.returnCount, 2)
+            XCTAssertEqual(fixture.recorder.restoreCount, 1)
+        }
     }
 
-    func testBeginArrivalDuringResolutionPreventsCommittingThatSnapshot() {
+    func testBeginArrivalDuringResolutionPreventsCommittingThatSnapshot() throws {
         let queue = DispatchQueue(label: "display-routing-resolve-race-test")
         let fixture = RoutingFixture(gestureQueue: queue)
-        fixture.provider.displays = [display(at: CGPoint(x: 900, y: -800))]
-        fixture.provider.onRead = {
-            fixture.provider.onRead = nil
-            fixture.application.enqueueDisplayReconfiguration(flags: .beginConfigurationFlag)
+        queue.sync {
+            fixture.provider.displays = [display(at: CGPoint(x: 900, y: -800))]
+            fixture.provider.onRead = {
+                fixture.provider.onRead = nil
+                fixture.application.enqueueDisplayReconfiguration(flags: .beginConfigurationFlag)
+            }
         }
 
         queue.async { fixture.send(.down) }
         // The provider enqueues a begin while the down is running; drain that nested work too.
-        waitForQueue(queue)
-        waitForQueue(queue)
+        try waitForQueue(queue)
+        try waitForQueue(queue)
 
-        XCTAssertEqual(fixture.provider.readCount, 1)
-        XCTAssertNil(fixture.resolver.currentSnapshot)
-        XCTAssertTrue(fixture.recorder.input.isEmpty)
+        queue.sync {
+            XCTAssertEqual(fixture.provider.readCount, 1)
+            XCTAssertNil(fixture.resolver.currentSnapshot)
+            XCTAssertTrue(fixture.recorder.input.isEmpty)
+            fixture.provider.displays = [display(at: movedOrigin)]
+        }
 
-        fixture.provider.displays = [display(at: movedOrigin)]
         fixture.application.enqueueDisplayReconfiguration(flags: .movedFlag)
         queue.async {
             fixture.send(.up)
             fixture.send(.down, at: 1)
             fixture.send(.up, at: 2)
         }
-        waitForQueue(queue)
+        try waitForQueue(queue)
 
-        XCTAssertEqual(fixture.provider.readCount, 3)
-        XCTAssertEqual(fixture.resolver.currentBounds?.origin, movedOrigin)
-        XCTAssertEqual(fixture.recorder.input, [.down(movedOrigin), .up(movedOrigin)])
+        queue.sync {
+            XCTAssertEqual(fixture.provider.readCount, 3)
+            XCTAssertEqual(fixture.resolver.currentBounds?.origin, movedOrigin)
+            XCTAssertEqual(fixture.recorder.input, [.down(movedOrigin), .up(movedOrigin)])
+        }
     }
 
-    private func withBlockedQueue(_ queue: DispatchQueue, enqueue: () -> Void) {
+    func testQueueDrainTimeoutStopsTheDependentPhase() throws {
+        let queue = DispatchQueue(label: "display-routing-drain-timeout-test")
+        let fixture = RoutingFixture(gestureQueue: queue)
+        var reachedDependentPhase = false
+
+        try withBlockedQueue(queue) {
+            queue.async { fixture.send(.down) }
+            do {
+                try waitForQueue(queue, timeout: 0.01)
+                // This phase would read or mutate the fixture in the routing tests.
+                // Use only a local marker here so a regressed helper cannot race it.
+                reachedDependentPhase = true
+            } catch {
+                XCTAssertEqual(error as? QueueWaitFailure, .drainDidNotComplete)
+            }
+            XCTAssertFalse(reachedDependentPhase, "A failed drain must stop dependent fixture access")
+        }
+
+        // The barrier must be released even after the deliberately failed wait.
+        try waitForQueue(queue)
+        queue.sync {
+            XCTAssertEqual(fixture.recorder.input, [.down(origin)])
+            fixture.send(.up)
+            XCTAssertEqual(fixture.recorder.input, [.down(origin), .up(origin)])
+        }
+    }
+
+    func testBlockedQueueTimeoutSkipsEnqueueAndReleasesItsBarrier() throws {
+        let queue = DispatchQueue(label: "display-routing-barrier-timeout-test")
+        var didEnqueue = false
+
+        try withBlockedQueue(queue) {
+            XCTAssertThrowsError(try withBlockedQueue(queue, timeout: 0.01) {
+                didEnqueue = true
+            }) { error in
+                XCTAssertEqual(error as? QueueWaitFailure, .barrierDidNotStart)
+            }
+            XCTAssertFalse(didEnqueue, "A failed barrier must not execute its dependent phase")
+        }
+
+        // The inner barrier was enqueued before it timed out. Its release must
+        // already be signalled when the outer barrier lets it reach the queue.
+        try waitForQueue(queue)
+    }
+
+    private enum QueueWaitFailure: Error, Equatable {
+        case barrierDidNotStart
+        case drainDidNotComplete
+    }
+
+    private func withBlockedQueue(
+        _ queue: DispatchQueue,
+        timeout: TimeInterval = 2,
+        enqueue: () throws -> Void
+    ) throws {
         let entered = DispatchSemaphore(value: 0)
         let release = DispatchSemaphore(value: 0)
+        // The body can enqueue work but must not synchronously wait for this queue.
+        // Always release, including when the queued barrier starts only after
+        // the entry wait times out or the dependent phase throws.
+        defer { release.signal() }
         queue.async {
             entered.signal()
-            XCTAssertEqual(release.wait(timeout: .now() + .seconds(2)), .success)
+            release.wait()
         }
-        guard entered.wait(timeout: .now() + .seconds(2)) == .success else {
-            release.signal()
-            XCTFail("Gesture queue did not reach the test barrier")
-            return
+        guard entered.wait(timeout: .now() + timeout) == .success else {
+            throw QueueWaitFailure.barrierDidNotStart
         }
-        defer { release.signal() }
-        enqueue()
+        try enqueue()
     }
 
-    private func waitForQueue(_ queue: DispatchQueue) {
-        let drained = expectation(description: "Gesture queue drained")
+    private func waitForQueue(_ queue: DispatchQueue, timeout: TimeInterval = 2) throws {
+        let drained = XCTestExpectation(description: "Gesture queue drained")
         queue.async { drained.fulfill() }
-        wait(for: [drained], timeout: 2)
+        // XCTestCase.wait records a failure and normally keeps executing. A
+        // checked result must instead stop the caller's dependent phase.
+        guard XCTWaiter.wait(for: [drained], timeout: timeout) == .completed else {
+            throw QueueWaitFailure.drainDidNotComplete
+        }
     }
 
     func testDisplayIdentityChangeCancelsDragEvenWhenBoundsAreUnchanged() {

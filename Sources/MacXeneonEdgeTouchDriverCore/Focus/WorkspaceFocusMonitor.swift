@@ -18,7 +18,7 @@ protocol WorkspaceFocusMonitoring: AnyObject {
 /// All NSWorkspace/NSRunningApplication access and observer lifetime live on main.
 /// Revisions are invalidation hints, not substitutes for fresh AX focus resolution.
 final class WorkspaceFocusMonitor: WorkspaceFocusMonitoring {
-    enum Event {
+    enum Event: Sendable {
         case focusChanged
         case lifecycleChanged
         case sessionActive(Bool)
@@ -31,33 +31,36 @@ final class WorkspaceFocusMonitor: WorkspaceFocusMonitoring {
         var sessionIsActive: () -> Bool?
         var observe: (@escaping (Event) -> Void) -> (() -> Void)
 
-        static let live = Operations(
-            frontmostApplication: { snapshot(NSWorkspace.shared.frontmostApplication) },
-            application: { snapshot(NSRunningApplication(processIdentifier: $0)) },
-            sessionIsActive: {
-                guard let values = CGSessionCopyCurrentDictionary() as? [String: Any],
-                      let onConsole = values[kCGSessionOnConsoleKey as String] as? Bool,
-                      let loggedIn = values[kCGSessionLoginDoneKey as String] as? Bool else { return nil }
-                return onConsole && loggedIn
-            },
-            observe: { handler in
-                let center = NSWorkspace.shared.notificationCenter
-                let names: [(Notification.Name, Event)] = [
-                    (NSWorkspace.didActivateApplicationNotification, .focusChanged),
-                    (NSWorkspace.didDeactivateApplicationNotification, .focusChanged),
-                    (NSWorkspace.didTerminateApplicationNotification, .lifecycleChanged),
-                    (NSWorkspace.activeSpaceDidChangeNotification, .lifecycleChanged),
-                    (NSWorkspace.sessionDidResignActiveNotification, .sessionActive(false)),
-                    (NSWorkspace.sessionDidBecomeActiveNotification, .sessionActive(true)),
-                    (NSWorkspace.willSleepNotification, .sleeping(true)),
-                    (NSWorkspace.didWakeNotification, .sleeping(false))
-                ]
-                let observers = names.map { name, event in
-                    center.addObserver(forName: name, object: nil, queue: .main) { _ in handler(event) }
+        // Construct per monitor; workspace access and observer callbacks remain main-thread confined.
+        static var live: Operations {
+            Operations(
+                frontmostApplication: { snapshot(NSWorkspace.shared.frontmostApplication) },
+                application: { snapshot(NSRunningApplication(processIdentifier: $0)) },
+                sessionIsActive: {
+                    guard let values = CGSessionCopyCurrentDictionary() as? [String: Any],
+                          let onConsole = values[kCGSessionOnConsoleKey as String] as? Bool,
+                          let loggedIn = values[kCGSessionLoginDoneKey as String] as? Bool else { return nil }
+                    return onConsole && loggedIn
+                },
+                observe: { handler in
+                    let center = NSWorkspace.shared.notificationCenter
+                    let names: [(Notification.Name, Event)] = [
+                        (NSWorkspace.didActivateApplicationNotification, .focusChanged),
+                        (NSWorkspace.didDeactivateApplicationNotification, .focusChanged),
+                        (NSWorkspace.didTerminateApplicationNotification, .lifecycleChanged),
+                        (NSWorkspace.activeSpaceDidChangeNotification, .lifecycleChanged),
+                        (NSWorkspace.sessionDidResignActiveNotification, .sessionActive(false)),
+                        (NSWorkspace.sessionDidBecomeActiveNotification, .sessionActive(true)),
+                        (NSWorkspace.willSleepNotification, .sleeping(true)),
+                        (NSWorkspace.didWakeNotification, .sleeping(false))
+                    ]
+                    let observers = names.map { name, event in
+                        center.addObserver(forName: name, object: nil, queue: .main) { _ in handler(event) }
+                    }
+                    return { observers.forEach(center.removeObserver) }
                 }
-                return { observers.forEach(center.removeObserver) }
-            }
-        )
+            )
+        }
 
         private static func snapshot(_ application: NSRunningApplication?) -> AXFocusWorkspaceApplication? {
             guard let application else { return nil }
@@ -95,6 +98,7 @@ final class WorkspaceFocusMonitor: WorkspaceFocusMonitoring {
         observationGeneration &+= 1
         let generation = observationGeneration
         stopObserving = operations.observe { [weak self] event in
+            precondition(Thread.isMainThread)
             guard let self, self.stopObserving != nil, self.observationGeneration == generation else { return }
             self.revision &+= 1
             switch event {

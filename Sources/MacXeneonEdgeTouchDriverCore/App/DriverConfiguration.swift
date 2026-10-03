@@ -1,7 +1,7 @@
 import Foundation
 
 /// Runtime configuration loaded from the user's Application Support directory.
-public struct DriverConfiguration: Codable, Equatable {
+public struct DriverConfiguration: Codable, Equatable, Sendable {
     /// Logging verbosity name.
     public var logLevel: String
 
@@ -207,7 +207,7 @@ public extension DriverConfiguration {
     }
 
     /// Timing values in milliseconds.
-    struct Timing: Codable, Equatable {
+    struct Timing: Codable, Equatable, Sendable {
         public var warpToClickDelayMs: Int
         public var downToUpDelayMs: Int
         public var clickToWarpBackDelayMs: Int
@@ -216,7 +216,7 @@ public extension DriverConfiguration {
     }
 
     /// Display matching configuration.
-    struct Display: Codable, Equatable {
+    struct Display: Codable, Equatable, Sendable {
         public var vendorNumber: UInt32?
         public var modelNumber: UInt32?
         public var serialNumber: UInt32?
@@ -225,17 +225,17 @@ public extension DriverConfiguration {
     }
 
     /// Window focus configuration.
-    struct Focus: Codable, Equatable {
+    struct Focus: Codable, Equatable, Sendable {
         public var restorePreviousWindow: Bool
     }
 
     /// Cursor position configuration. Cleanup always restores visibility and mouse association.
-    struct Cursor: Codable, Equatable {
+    struct Cursor: Codable, Equatable, Sendable {
         public var returnToPreviousPosition: Bool
     }
 
     /// Gesture configuration.
-    struct Gesture: Codable, Equatable {
+    struct Gesture: Codable, Equatable, Sendable {
         public var multiTouchEnabled: Bool
         public var pinchHysteresisPx: Int
         public var minPinchForMagnify: Int
@@ -243,13 +243,13 @@ public extension DriverConfiguration {
     }
 
     /// Diagnostic file logging configuration.
-    struct Diagnostics: Codable, Equatable {
+    struct Diagnostics: Codable, Equatable, Sendable {
         public var fileLogPath: String?
         public var fileLogMaxBytes: Int
     }
 
     /// Pinch behavior mode. This remains disabled for the current single-touch hardware.
-    enum PinchMode: String, Codable, Equatable {
+    enum PinchMode: String, Codable, Equatable, Sendable {
         case contentZoom
         case windowSize
     }
@@ -270,7 +270,7 @@ public extension DriverConfiguration.Cursor {
 }
 
 /// Result of loading the configuration file.
-public struct ConfigurationLoadResult: Equatable {
+public struct ConfigurationLoadResult: Equatable, Sendable {
     /// The effective configuration.
     public let configuration: DriverConfiguration
 
