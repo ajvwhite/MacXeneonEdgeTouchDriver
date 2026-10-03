@@ -83,10 +83,12 @@ rollback() {
         return 1
       fi
     fi
-  elif [ "$old_loaded" -eq 1 ]; then
+  else
+    # A job can appear during publication even if none was registered during
+    # preflight. Do not restore files under a registration we did not create.
     if job_state; then
-      if [ "$binary_changed" -eq 1 ] || [ "$plist_changed" -eq 1 ] || [ "$config_changed" -eq 1 ]; then
-        printf 'Rollback incomplete: a job was registered again during replacement; files were not restored.\n' >&2
+      if [ "$old_loaded" -eq 0 ] || [ "$binary_changed" -eq 1 ] || [ "$plist_changed" -eq 1 ] || [ "$config_changed" -eq 1 ]; then
+        printf 'Rollback incomplete: an unexpected job was registered during replacement; files were not restored.\n' >&2
         return 1
       fi
       # The initial bootout failed without removing the old job. No files
@@ -95,7 +97,7 @@ rollback() {
     else
       state_status=$?
       if [ "$state_status" -ne 1 ]; then
-        printf 'Rollback incomplete: cannot determine whether the prior job is still registered.\n' >&2
+        printf 'Rollback incomplete: job state is unknown; files were not restored.\n' >&2
         return 1
       fi
     fi
@@ -186,7 +188,8 @@ install -m 755 "${package_root}/.build/release/${binary_name}" "$stage_dir/binar
 # CODESIGN_IDENTITY follows isleofgreg's interface from PR #4. Both signing
 # and verification happen before replacing any installed file.
 if [ -n "${CODESIGN_IDENTITY:-}" ]; then
-  codesign --force --sign "$CODESIGN_IDENTITY" "$stage_dir/binary"
+  # Keep the identifier used when signing the original executable basename.
+  codesign --force --sign "$CODESIGN_IDENTITY" --identifier "$binary_name" "$stage_dir/binary"
   codesign --verify --strict "$stage_dir/binary"
 fi
 swift "$package_root/Scripts/prepare-install.swift" "$plist_template" "$stage_dir" "$installed_binary" "$config_path" "$log_dir"

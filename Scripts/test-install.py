@@ -110,6 +110,8 @@ elif command == "codesign":
     if "--sign" in args:
         if args[args.index("--sign") + 1] != "Installer Test Identity":
             reject("unexpected signing identity")
+        if "--identifier" not in args or args[args.index("--identifier") + 1] != "MacXeneonEdgeTouchDriver":
+            reject("staged signing must preserve the executable identifier explicitly")
         fail("sign")
         state["signed"] = str(binary)
         save()
@@ -398,6 +400,9 @@ class InstallerTests(unittest.TestCase):
         self.assert_new_installation()
         sign_calls = [index for index, call in enumerate(self.calls) if call["command"] == "codesign"]
         self.assertEqual(len(sign_calls), 2)
+        sign_args = self.calls[sign_calls[0]]["args"]
+        self.assertIn("--identifier", sign_args)
+        self.assertEqual(sign_args[sign_args.index("--identifier") + 1], BINARY)
         bootout = next(index for index, call in enumerate(self.calls) if call["command"] == "launchctl" and call["args"][0] == "bootout")
         self.assertLess(max(sign_calls), bootout)
 
@@ -494,16 +499,24 @@ class InstallerTests(unittest.TestCase):
                 self.case = original_case
 
     def test_job_reregistered_during_publication_requires_manual_recovery(self):
-        self.prepare()
-        self.assertNotEqual(self.run_installer(["publish-plist-write", "job-reregistered"]), 0, self.output)
-        self.assertEqual(self.binary.read_bytes(), NEW_BINARY)
-        self.assertEqual(self.plist.read_bytes(), self.old_plist)
-        self.assertEqual(self.config.read_bytes(), OLD_CONFIG)
-        self.assertTrue(self.state["loaded"])
-        self.assertEqual(self.state["bootstrap_count"], 0)
-        self.assertEqual((self.backup_directories()[0] / "binary").read_bytes(), OLD_BINARY)
-        self.assertIn("Rollback incomplete", self.output)
-        self.assertIn(str(self.backup_directories()[0]), self.output)
+        original_case = self.case
+        for initially_loaded in [True, False]:
+            with self.subTest(initially_loaded=initially_loaded):
+                self.case = original_case / ("loaded" if initially_loaded else "unloaded")
+                self.case.mkdir()
+                self.prepare(loaded=initially_loaded)
+                self.assertNotEqual(self.run_installer(["publish-plist-write", "job-reregistered"]), 0, self.output)
+                self.assertEqual(self.binary.read_bytes(), NEW_BINARY, self.output)
+                self.assertEqual(self.plist.read_bytes(), self.old_plist)
+                self.assertEqual(self.config.read_bytes(), OLD_CONFIG)
+                self.assertTrue(self.state["loaded"])
+                self.assertEqual(self.state["bootout_count"], int(initially_loaded))
+                self.assertEqual(self.state["bootstrap_count"], 0)
+                self.assertEqual((self.backup_directories()[0] / "binary").read_bytes(), OLD_BINARY)
+                self.assertIn("Rollback incomplete", self.output)
+                self.assertIn("Manual recovery is required", self.output)
+                self.assertIn(str(self.backup_directories()[0]), self.output)
+        self.case = original_case
 
     def test_failed_bootstrap_restores_previous_files_and_job(self):
         self.prepare()
