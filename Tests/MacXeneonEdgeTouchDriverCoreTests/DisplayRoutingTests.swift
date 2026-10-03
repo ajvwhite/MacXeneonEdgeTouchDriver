@@ -184,6 +184,32 @@ final class DisplayRoutingTests: XCTestCase {
         }
     }
 
+    func testAmbiguousTargetDropsNewInputWithoutReusingThePreviousMappingAndCanRecover() {
+        let first = display()
+        let second = display(id: 99, at: movedOrigin)
+        let fixture = RoutingFixture()
+
+        for candidates in [[first, second], [second, first]] {
+            fixture.provider.displays = candidates
+            fixture.send(.down)
+            fixture.send(.move, far: true)
+            fixture.send(.up, far: true)
+
+            XCTAssertNil(fixture.resolver.currentSnapshot)
+            XCTAssertNil(fixture.resolver.currentBounds)
+            XCTAssertNil(fixture.resolver.currentMapper)
+            XCTAssertTrue(fixture.recorder.input.isEmpty)
+        }
+
+        fixture.provider.displays = [second]
+        fixture.send(.down, at: 1)
+        fixture.send(.up, at: 2)
+
+        XCTAssertEqual(fixture.resolver.currentSnapshot, second)
+        XCTAssertEqual(fixture.recorder.input, [.down(movedOrigin), .up(movedOrigin)])
+        XCTAssertEqual(fixture.provider.readCount, 3)
+    }
+
     func testRepeatedLossDoesNotRepeatGestureCleanup() {
         let fixture = RoutingFixture()
         fixture.send(.down)
@@ -520,6 +546,16 @@ final class DisplayRoutingTests: XCTestCase {
         }
     }
 
+    func testAmbiguityCancelsEveryOwnedPhaseBeforeUniqueRecoveryInEitherOrder() {
+        let first = display()
+        let second = display(id: 99, at: movedOrigin)
+        for candidates in [[first, second], [second, first]] {
+            for phase in RoutingPhase.allCases {
+                assertRecovery(from: phase, throughLoss: true, unavailableDisplays: candidates)
+            }
+        }
+    }
+
     private func assertFarCornerCallsAreContained(
         _ recorder: RoutingRecorder,
         file: StaticString = #filePath,
@@ -561,6 +597,7 @@ final class DisplayRoutingTests: XCTestCase {
     private func assertRecovery(
         from phase: RoutingPhase,
         throughLoss: Bool,
+        unavailableDisplays: [DisplaySnapshot] = [],
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
@@ -577,7 +614,7 @@ final class DisplayRoutingTests: XCTestCase {
         }
         fixture.clock.advance(toMilliseconds: 10)
         let replacement = display(at: movedOrigin)
-        fixture.provider.displays = throughLoss ? [] : [replacement]
+        fixture.provider.displays = throughLoss ? unavailableDisplays : [replacement]
 
         fixture.application.handleDisplayReconfiguration(flags: .movedFlag)
 
@@ -591,6 +628,9 @@ final class DisplayRoutingTests: XCTestCase {
 
         if throughLoss {
             XCTAssertNil(fixture.resolver.currentMapper, file: file, line: line)
+            fixture.application.handleDisplayReconfiguration(flags: .movedFlag)
+            fixture.send(.down)
+            fixture.send(.move, far: true)
             fixture.send(.up)
             fixture.application.handleDeviceRemoval()
             XCTAssertEqual(fixture.recorder.input, oldInput, file: file, line: line)

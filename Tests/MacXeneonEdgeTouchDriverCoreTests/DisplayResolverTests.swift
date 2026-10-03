@@ -82,6 +82,60 @@ final class DisplayResolverTests: XCTestCase {
         XCTAssertNil(resolver.resolve(from: []))
     }
 
+    func testEquallyPreferredCandidatesAreAmbiguousInEveryOrder() {
+        for serialNumber in [nil, 456] as [UInt32?] {
+            var configuration = DriverConfiguration.defaults.display
+            configuration.serialNumber = serialNumber
+            let resolver = DisplayResolver(configuration: configuration)
+            let first = xeneonDisplay(displayID: 1, serialNumber: serialNumber ?? 123)
+            let second = xeneonDisplay(displayID: 2, serialNumber: 456)
+            let fallback = xeneonDisplay(displayID: 3, serialNumber: serialNumber ?? 789, pixelsWide: 1_280, pixelsHigh: 360)
+
+            for displays in [[first, second], [second, first]] + permutations(of: [first, second, fallback]) {
+                XCTAssertNil(resolver.resolve(from: displays))
+            }
+        }
+    }
+
+    func testMultipleFallbackCandidatesAreAmbiguousInEitherOrder() {
+        for serialNumber in [nil, 456] as [UInt32?] {
+            var configuration = DriverConfiguration.defaults.display
+            configuration.serialNumber = serialNumber
+            let resolver = DisplayResolver(configuration: configuration)
+            let first = xeneonDisplay(displayID: 1, serialNumber: 456, pixelsWide: 1_280, pixelsHigh: 360)
+            let second = xeneonDisplay(displayID: 2, serialNumber: 456, pixelsWide: 3_840, pixelsHigh: 2_160)
+
+            for displays in [[first, second], [second, first]] {
+                XCTAssertNil(resolver.resolve(from: displays))
+            }
+        }
+    }
+
+    func testSizeDisambiguatesOnlyWithinConfiguredSerialMatchesInEveryOrder() {
+        var configuration = DriverConfiguration.defaults.display
+        configuration.serialNumber = 456
+        let resolver = DisplayResolver(configuration: configuration)
+        let wrongSerial = xeneonDisplay(displayID: 1, serialNumber: 123)
+        let wrongSize = xeneonDisplay(displayID: 2, serialNumber: 456, pixelsWide: 1_280, pixelsHigh: 360)
+        let selected = xeneonDisplay(displayID: 3, serialNumber: 456)
+
+        for displays in permutations(of: [wrongSerial, wrongSize, selected]) {
+            XCTAssertEqual(resolver.resolve(from: displays), selected)
+        }
+    }
+
+    func testInvalidDuplicateSerialDoesNotMakeAValidMatchAmbiguous() {
+        var configuration = DriverConfiguration.defaults.display
+        configuration.serialNumber = 456
+        let resolver = DisplayResolver(configuration: configuration)
+        let invalid = xeneonDisplay(displayID: 1, serialNumber: 456, bounds: .zero)
+        let valid = xeneonDisplay(displayID: 2, serialNumber: 456)
+
+        for displays in [[invalid, valid], [valid, invalid]] {
+            XCTAssertEqual(resolver.resolve(from: displays), valid)
+        }
+    }
+
     func testConfiguredSerialRejectsOtherSameModelDisplaysInEitherOrder() {
         var configuration = DriverConfiguration.defaults.display
         configuration.serialNumber = 456
@@ -340,6 +394,34 @@ final class DisplayResolverTests: XCTestCase {
         XCTAssertEqual(changes, [first.bounds, nil, recovered.bounds])
     }
 
+    func testAmbiguityClearsStaleMappingOnceAndRecoversWithTheUniqueSnapshot() {
+        let first = xeneonDisplay(displayID: 1)
+        let second = xeneonDisplay(displayID: 2, bounds: CGRect(x: -2_560, y: 0, width: 2_560, height: 720))
+        var displays = [first]
+        let resolver = DisplayResolver(activeDisplayProvider: { displays })
+        var changes: [CGRect?] = []
+        resolver.onDisplayChanged = { changes.append($0) }
+        resolver.refresh()
+
+        for candidates in [[first, second], [second, first], [first, second]] {
+            displays = candidates
+            resolver.refresh()
+            XCTAssertNil(resolver.currentSnapshot)
+            XCTAssertNil(resolver.currentBounds)
+            XCTAssertNil(resolver.currentMapper)
+        }
+        XCTAssertEqual(changes, [first.bounds, nil])
+
+        displays = [second]
+        resolver.refresh()
+        resolver.refresh()
+
+        XCTAssertEqual(resolver.currentSnapshot, second)
+        XCTAssertEqual(resolver.currentBounds, second.bounds)
+        XCTAssertEqual(resolver.currentMapper?.displayBounds, second.bounds)
+        XCTAssertEqual(changes, [first.bounds, nil, second.bounds])
+    }
+
     func testCommittingInvalidSnapshotClearsThePreviousMappingWithoutAProviderRead() {
         var providerReads = 0
         let resolver = DisplayResolver(activeDisplayProvider: {
@@ -354,6 +436,15 @@ final class DisplayResolverTests: XCTestCase {
         XCTAssertNil(resolver.currentSnapshot)
         XCTAssertNil(resolver.currentBounds)
         XCTAssertNil(resolver.currentMapper)
+    }
+
+    private func permutations(of displays: [DisplaySnapshot]) -> [[DisplaySnapshot]] {
+        guard !displays.isEmpty else { return [[]] }
+        return displays.indices.flatMap { index -> [[DisplaySnapshot]] in
+            var remaining = displays
+            let first = remaining.remove(at: index)
+            return permutations(of: remaining).map { [first] + $0 }
+        }
     }
 
     private func xeneonDisplay(

@@ -69,6 +69,7 @@ public final class HIDDeviceMonitor {
 
     /// Starts monitoring on the main CFRunLoop.
     public func start() throws {
+        precondition(Thread.isMainThread, "HID monitoring must start on the main thread.")
         guard !isStarted else {
             return
         }
@@ -100,36 +101,42 @@ public final class HIDDeviceMonitor {
             return
         }
 
+        precondition(Thread.isMainThread, "HID monitoring must stop on the main thread.")
+        isStarted = false
+        reportRegistrations.forEach { $0.input.invalidate() }
         IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         IOHIDManagerClose(manager, openOptions)
+        reportRegistrations.forEach { $0.unregisterCallback() }
         reportRegistrations.removeAll()
         parser.reset()
-        isStarted = false
     }
 
     fileprivate func handleDeviceMatched(_ device: IOHIDDevice) {
-        guard !reportRegistrations.contains(where: { $0.matches(device) }) else {
+        guard isStarted, !reportRegistrations.contains(where: { $0.matches(device) }) else {
             return
         }
 
         let registration = HIDReportRegistration(
             device: device,
-            length: maxInputReportLength(for: device)
+            length: maxInputReportLength(for: device),
+            receive: { [weak self] reportID, bytes, timestamp in
+                self?.handleInputReport(reportID: reportID, bytes: bytes, timestamp: timestamp)
+            }
         )
         reportRegistrations.append(registration)
 
         IOHIDDeviceRegisterInputReportCallback(
             device,
-            registration.buffer,
-            registration.length,
+            registration.input.buffer,
+            registration.input.length,
             hidInputReportCallback,
-            UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+            registration.input.context
         )
 
         DriverLoggers.log(
             .notice,
             category: .hid,
-            "Xeneon Edge HID device matched. Manufacturer: \(self.deviceProperty(device, key: kIOHIDManufacturerKey) ?? "Unknown"), product: \(self.deviceProperty(device, key: kIOHIDProductKey) ?? "Unknown"), max input report size: \(registration.length)"
+            "Xeneon Edge HID device matched. Manufacturer: \(self.deviceProperty(device, key: kIOHIDManufacturerKey) ?? "Unknown"), product: \(self.deviceProperty(device, key: kIOHIDProductKey) ?? "Unknown"), max input report size: \(registration.input.length)"
         )
 
         eventQueue.async { [deviceMatchedHandler] in
@@ -138,6 +145,15 @@ public final class HIDDeviceMonitor {
     }
 
     fileprivate func handleDeviceRemoved(_ device: IOHIDDevice) {
+        guard isStarted else { return }
+        let removed = reportRegistrations.filter { $0.matches(device) }
+        removed.forEach { $0.input.invalidate() }
+        // Removal can precede the manager dropping its device reference. Stop
+        // report delivery before releasing our preallocated input buffers.
+        removed.forEach {
+            IOHIDDeviceUnscheduleFromRunLoop($0.device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            $0.unregisterCallback()
+        }
         reportRegistrations.removeAll { $0.matches(device) }
         parser.reset()
 
@@ -147,21 +163,11 @@ public final class HIDDeviceMonitor {
         }
     }
 
-    fileprivate func handleInputReport(
-        type: IOHIDReportType,
-        reportID: UInt32,
-        report: UnsafeMutablePointer<UInt8>,
-        reportLength: CFIndex
-    ) {
-        guard type == kIOHIDReportTypeInput else {
-            return
-        }
-
-        let bytes = Array(UnsafeBufferPointer(start: report, count: Int(reportLength)))
-        guard let event = parser.parseReport(
+    private func handleInputReport(reportID: UInt32, bytes: [UInt8], timestamp: DispatchTime) {
+        guard isStarted, let event = parser.parseReport(
             reportID: Int(reportID),
             bytes: bytes,
-            timestamp: .now()
+            timestamp: timestamp
         ) else {
             return
         }
@@ -197,19 +203,19 @@ public final class HIDDeviceMonitor {
 
 private final class HIDReportRegistration {
     let device: IOHIDDevice
-    let buffer: UnsafeMutablePointer<UInt8>
-    let length: CFIndex
+    let input: HIDInputReportRegistration
 
-    init(device: IOHIDDevice, length: Int) {
+    init(device: IOHIDDevice, length: Int, receive: @escaping (UInt32, [UInt8], DispatchTime) -> Void) {
         self.device = device
-        self.length = CFIndex(length)
-        self.buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: length)
-        self.buffer.initialize(repeating: 0, count: length)
+        self.input = HIDInputReportRegistration(
+            sender: Unmanaged.passUnretained(device).toOpaque(),
+            length: length,
+            receive: receive
+        )
     }
 
-    deinit {
-        buffer.deinitialize(count: Int(length))
-        buffer.deallocate()
+    func unregisterCallback() {
+        IOHIDDeviceRegisterInputReportCallback(device, input.buffer, input.length, nil, input.context)
     }
 
     func matches(_ otherDevice: IOHIDDevice) -> Bool {
@@ -235,13 +241,16 @@ private let hidDeviceRemovedCallback: IOHIDDeviceCallback = { context, _, _, dev
     monitor.handleDeviceRemoved(device)
 }
 
-private let hidInputReportCallback: IOHIDReportCallback = { context, _, _, type, reportID, report, reportLength in
-    guard let context else {
-        return
-    }
-
-    let monitor = Unmanaged<HIDDeviceMonitor>.fromOpaque(context).takeUnretainedValue()
-    monitor.handleInputReport(type: type, reportID: reportID, report: report, reportLength: reportLength)
+private let hidInputReportCallback: IOHIDReportCallback = { context, result, sender, type, reportID, report, reportLength in
+    HIDInputReportRegistration.handleCallback(
+        context: context,
+        result: result,
+        sender: sender,
+        type: type,
+        reportID: reportID,
+        report: report,
+        reportLength: reportLength
+    )
 }
 
 private func formatIOReturn(_ value: IOReturn) -> String {

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Stop routing touch input when multiple valid displays are equally preferred, including duplicate reported serials. Detected ambiguity cancels any active gesture and clears stale mapping; routing resumes when a unique best match is found. Configured serial filtering stays strict and expected-size preference is unchanged.
 - Keep mapped touch points inside the target rectangle by clamping the final global coordinates below its excluded maximum edges. Existing interior coordinates stay unchanged. Reject bounds whose positive dimensions round to equal minimum and maximum edges. This establishes mathematical containment; live click routing at display boundaries remains unverified.
 
 ## 1.0.0 - 2026-05-03

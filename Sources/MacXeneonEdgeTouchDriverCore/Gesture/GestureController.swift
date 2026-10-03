@@ -36,6 +36,13 @@ public final class GestureController {
 
     private var generation: UInt64 = 0
     private var phase: Phase?
+    private var inputOperationInFlight = false
+    private var cancellationRequested = false
+    private var activeContactEndedDuringInput = false
+    private var contactDownVersions: [Int: UInt64] = [:]
+    private var deferredInputEnd: (generation: UInt64, event: TouchEvent)?
+    // Unlike a lifecycle cancellation, failed input quarantines until its physical up.
+    private var failedInputContactIDs: Set<Int> = []
     // A rejected down rejects that entire contact, even if cleanup finishes before its up.
     private var rejectedContactIDs: Set<Int> = []
 
@@ -45,6 +52,9 @@ public final class GestureController {
         case waitingForMouseUp
         case waitingForCursorReturn
         case finishing
+        // A reporting sink violated its reserved-release contract. Keep ownership
+        // without a cleanup warp, reject new input, and do not schedule retries.
+        case releaseBlocked
     }
 
     /// Creates a single-touch gesture controller.
@@ -88,9 +98,19 @@ public final class GestureController {
 
     /// Handles one normalized touch event.
     public func handle(_ event: TouchEvent) {
-        // Consume contact boundaries even when the display mapper is unavailable.
-        if rejectedContactIDs.contains(event.contactID) {
+        if event.kind == .down { contactDownVersions[event.contactID, default: 0] &+= 1 }
+        let downVersionAtReceipt = contactDownVersions[event.contactID, default: 0]
+        // Side effects may synchronously reenter the controller. Do not admit a
+        // newer contact while an older post invocation has not returned.
+        if inputOperationInFlight {
+            handleDuringInputOperation(event)
+            return
+        }
+        // Consume both forms of quarantine at the same physical boundary, even
+        // when geometry is unavailable. One up must not require a second up.
+        if failedInputContactIDs.contains(event.contactID) || rejectedContactIDs.contains(event.contactID) {
             if event.kind == .up {
+                failedInputContactIDs.remove(event.contactID)
                 rejectedContactIDs.remove(event.contactID)
             }
             return
@@ -114,11 +134,20 @@ public final class GestureController {
                 return
             }
             // Preserve every move/up, without buffering or coalescing a drag path.
+            let preparingGestureGeneration = generation
             finishPreparation(generation: preparation.generation, captureReady: false)
-            if rejectedContactIDs.contains(event.contactID) {
-                if event.kind == .up { rejectedContactIDs.remove(event.contactID) }
+            if rejectedContactIDs.contains(event.contactID) || failedInputContactIDs.contains(event.contactID) {
+                if event.kind == .up {
+                    if contactDownVersions[event.contactID, default: 0] == downVersionAtReceipt {
+                        rejectedContactIDs.remove(event.contactID)
+                        failedInputContactIDs.remove(event.contactID)
+                    }
+                }
                 return
             }
+            // A failed/flushed preparation may synchronously reach idle and start
+            // another contact. Never route this older move/up into that generation.
+            guard generation == preparingGestureGeneration else { return }
         }
 
         guard let mapper = mapperProvider() else {
@@ -164,10 +193,9 @@ public final class GestureController {
                 return
             }
 
-            ensureMouseDownPosted()
-            guard case .singleTouch(var currentContext) = state else {
-                return
-            }
+            guard ensureMouseDownPosted(), phase == .tracking,
+                  case .singleTouch(var currentContext) = state else { return }
+            let activeGeneration = generation
 
             guard mapperProvider() != nil else {
                 cancelForMissingMapper()
@@ -175,16 +203,29 @@ public final class GestureController {
             }
 
             cursorController.updatePosition(point)
+            guard generation == activeGeneration, phase == .tracking else { return }
             guard mapperProvider() != nil else {
                 cancelForMissingMapper()
                 return
             }
-            inputSink.postMouseDragged(to: point)
+            // Accept after cursor update and geometry revalidation, before the
+            // fallible drag. A failed drag still releases at this accepted point.
             currentContext.lastPoint = point
             currentContext.lastRawX = event.rawX
             currentContext.lastRawY = event.rawY
-            currentContext.hasMoved = true
             state = .singleTouch(currentContext)
+            let result = performInput {
+                if let reporting = inputSink as? ReportingSyntheticInputSink {
+                    return reporting.tryPostMouseDragged(to: point)
+                }
+                inputSink.postMouseDragged(to: point)
+                return .postInvoked
+            }
+            if result == .postInvoked, case .singleTouch(var updated) = state {
+                updated.hasMoved = true
+                state = .singleTouch(updated)
+            }
+            finishDeferredInput()
 
         case (.singleTouch(let context), .up):
             guard phase == .tracking else { return }
@@ -193,8 +234,13 @@ public final class GestureController {
                 return
             }
 
-            ensureMouseDownPosted()
-            guard case .singleTouch(var currentContext) = state else {
+            guard ensureMouseDownPosted(), phase == .tracking,
+                  case .singleTouch(var currentContext) = state else {
+                // This up closes the failed original contact, but cannot close a
+                // newer same-ID down observed while its down call was in flight.
+                if contactDownVersions[event.contactID, default: 0] == downVersionAtReceipt {
+                    failedInputContactIDs.remove(event.contactID)
+                }
                 return
             }
 
@@ -232,7 +278,11 @@ public final class GestureController {
 
     /// Forces the controller back to idle, posting cleanup events if needed.
     public func forceCancel() {
-        guard phase != .finishing else { return }
+        guard phase != .finishing, phase != .releaseBlocked else { return }
+        if inputOperationInFlight {
+            cancellationRequested = true
+            return
+        }
         generation &+= 1
         cancelPendingWork()
         rejectedContactIDs.removeAll()
@@ -248,13 +298,11 @@ public final class GestureController {
             cursorController.forceShow()
             focusRestorer.discardCapturedWindow()
 
-        case .singleTouch(var context):
+        case .singleTouch(let context):
             phase = .finishing
             if context.isMouseDownPosted {
-                context.isMouseDownPosted = false
-                state = .singleTouch(context)
                 focusRestorer.inputDidEnd()
-                inputSink.postMouseUp(at: context.lastPoint)
+                guard releaseOwnedMouseDown(at: context.lastPoint) else { return }
             }
             cursorController.releaseBorrow(returnToPreviousPosition: returnCursorToPreviousPosition)
             restoreFocusAfterCursorReturn()
@@ -331,15 +379,16 @@ public final class GestureController {
         }
     }
 
-    private func ensureMouseDownPosted() {
+    private func ensureMouseDownPosted() -> Bool {
         pendingMouseDown?.cancel()
         pendingMouseDown = nil
 
-        guard case .singleTouch(let context) = state else {
-            return
-        }
-
-        postMouseDownIfNeeded(generation: generation, at: context.startPoint)
+        guard case .singleTouch(let context) = state else { return false }
+        let activeGeneration = generation
+        postMouseDownIfNeeded(generation: activeGeneration, at: context.startPoint)
+        guard generation == activeGeneration, phase == .tracking,
+              case .singleTouch(let current) = state else { return false }
+        return current.isMouseDownPosted
     }
 
     private func postMouseDownIfNeeded(generation: UInt64, at point: CGPoint) {
@@ -355,10 +404,124 @@ public final class GestureController {
             return
         }
 
+        pendingMouseDown = nil
+        let result = performInput {
+            if let reporting = inputSink as? ReportingSyntheticInputSink {
+                return reporting.tryPostMouseDown(at: point)
+            }
+            inputSink.postMouseDown(at: point)
+            return .postInvoked
+        }
+        guard result == .postInvoked else {
+            abortFailedMouseDown(contactID: context.contactID)
+            return
+        }
         context.isMouseDownPosted = true
         state = .singleTouch(context)
-        pendingMouseDown = nil
-        inputSink.postMouseDown(at: point)
+        finishDeferredInput()
+    }
+
+    private func performInput(_ operation: () -> SyntheticInputResult) -> SyntheticInputResult {
+        precondition(!inputOperationInFlight)
+        inputOperationInFlight = true
+        activeContactEndedDuringInput = false
+        defer { inputOperationInFlight = false }
+        return operation()
+    }
+
+    private func handleDuringInputOperation(_ event: TouchEvent) {
+        if case .singleTouch(let context) = state, context.contactID == event.contactID {
+            if event.kind == .up { activeContactEndedDuringInput = true }
+            if event.kind == .down {
+                activeContactEndedDuringInput = false
+            }
+        }
+        if event.kind == .up {
+            // A rejected contact can complete while a collaborator is on-stack.
+            // Consume that boundary now instead of quarantining its next reuse.
+            let wasFailed = failedInputContactIDs.remove(event.contactID) != nil
+            let wasRejected = rejectedContactIDs.remove(event.contactID) != nil
+            if wasFailed || wasRejected { return }
+            if phase == .tracking, case .singleTouch(let context) = state,
+               context.contactID == event.contactID, deferredInputEnd == nil {
+                // One terminal event is enough; never buffer an unbounded path.
+                deferredInputEnd = (generation, event)
+                focusRestorer.inputDidEnd()
+            }
+        } else if event.kind == .down {
+            failedInputContactIDs.insert(event.contactID)
+            if phase == .tracking, case .singleTouch(let context) = state,
+               context.contactID == event.contactID {
+                // The reused active ID is ambiguous, just like an ordinary second
+                // down. Cancel only after the in-flight result establishes ownership.
+                cancellationRequested = true
+            }
+        }
+    }
+
+    private func finishDeferredInput() {
+        let ended = deferredInputEnd
+        deferredInputEnd = nil
+        if cancellationRequested {
+            cancellationRequested = false
+            if let ended, ended.generation == generation,
+               case .singleTouch(var context) = state,
+               context.contactID == ended.event.contactID,
+               let mapper = mapperProvider() {
+                context.lastPoint = mapper.map(rawX: ended.event.rawX, rawY: ended.event.rawY)
+                context.lastRawX = ended.event.rawX
+                context.lastRawY = ended.event.rawY
+                state = .singleTouch(context)
+            }
+            forceCancel()
+        } else if let ended, ended.generation == generation {
+            handle(ended.event)
+        }
+    }
+
+    private func abortFailedMouseDown(contactID: Int) {
+        // No poster was invoked, so no release is owed. Block reentry until cursor
+        // cleanup finishes, discard focus eligibility, and quarantine the contact.
+        phase = .finishing
+        cancellationRequested = false
+        failedInputContactIDs.insert(contactID)
+        // The active boundary may have been consumed as an ambiguous/rejected
+        // up, so it need not appear in deferredInputEnd. A later active-ID down
+        // resets this marker and remains quarantined until its own up.
+        if activeContactEndedDuringInput { failedInputContactIDs.remove(contactID) }
+        deferredInputEnd = nil
+        cancelPendingWork()
+        focusRestorer.discardCapturedWindow()
+        cursorController.releaseBorrow(returnToPreviousPosition: returnCursorToPreviousPosition)
+        transitionToIdle()
+    }
+
+    @discardableResult
+    private func releaseOwnedMouseDown(at point: CGPoint) -> Bool {
+        guard case .singleTouch(var context) = state, context.isMouseDownPosted else { return true }
+        let result = performInput {
+            if let reporting = inputSink as? ReportingSyntheticInputSink {
+                return reporting.tryPostMouseUp(at: point)
+            }
+            inputSink.postMouseUp(at: point)
+            return .postInvoked
+        }
+        guard result == .postInvoked else {
+            // Production CGEventInputSink cannot reach this after an accepted down.
+            // Never hide a contract violation behind idle, a cursor warp, or retries.
+            // Release visibility/association without moving the cursor; ownership
+            // remains unresolved, and repeated lifecycle cleanup is a no-op.
+            phase = .releaseBlocked
+            cancellationRequested = false
+            cancelPendingWork()
+            focusRestorer.discardCapturedWindow()
+            cursorController.releaseBorrow(returnToPreviousPosition: false)
+            DriverLoggers.log(.fault, category: .gesture, "Synthetic mouse release was not invoked; retaining unresolved release ownership without a cursor warp.")
+            return false
+        }
+        context.isMouseDownPosted = false
+        state = .singleTouch(context)
+        return true
     }
 
     private func cancelForMissingMapper() {
@@ -381,7 +544,7 @@ public final class GestureController {
 
     private func postMouseUpAndScheduleReturn(generation: UInt64, at point: CGPoint) {
         guard self.generation == generation, phase == .waitingForMouseUp,
-              case .singleTouch(var context) = state, context.isMouseDownPosted else {
+              case .singleTouch(let context) = state, context.isMouseDownPosted else {
             return
         }
         guard mapperProvider() != nil else {
@@ -389,13 +552,13 @@ public final class GestureController {
             return
         }
 
-        context.isMouseDownPosted = false
-        state = .singleTouch(context)
-        phase = .waitingForCursorReturn
         pendingMouseUp?.cancel()
         pendingMouseUp = nil
         focusRestorer.inputDidEnd()
-        inputSink.postMouseUp(at: point)
+        guard self.generation == generation, phase == .waitingForMouseUp else { return }
+        guard releaseOwnedMouseDown(at: point) else { return }
+        phase = .waitingForCursorReturn
+        finishDeferredInput()
         guard self.generation == generation, phase == .waitingForCursorReturn else { return }
         pendingCursorReturn?.cancel()
         let task = schedule(after: timing.clickToWarpBackDelayMs) { [weak self] in
@@ -440,6 +603,9 @@ public final class GestureController {
         generation &+= 1
         cancelPendingWork()
         phase = nil
+        cancellationRequested = false
+        activeContactEndedDuringInput = false
+        deferredInputEnd = nil
         state = .idle
         onBecameIdle?()
     }

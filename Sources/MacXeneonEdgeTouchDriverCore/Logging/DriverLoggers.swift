@@ -114,6 +114,60 @@ public enum DriverLoggers {
     }
 }
 
+// Internal I/O seams keep failure and recovery tests independent of filesystem timing.
+struct DriverFileLogHandle {
+    var write: (Data) throws -> Void
+    var offset: () throws -> UInt64
+    var close: () throws -> Void
+}
+
+struct DriverFileLogOperations {
+    var open: (URL, FileManager) throws -> DriverFileLogHandle
+    var size: (URL, FileManager) -> UInt64?
+    var rotate: (URL, FileManager) throws -> Void
+
+    // Construct per logger; no shared storage of non-Sendable I/O closures.
+    static var live: DriverFileLogOperations {
+        DriverFileLogOperations(
+            open: { url, fileManager in
+                try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if !fileManager.fileExists(atPath: url.path) {
+                    fileManager.createFile(atPath: url.path, contents: nil)
+                }
+
+                let handle = try FileHandle(forWritingTo: url)
+                do {
+                    try handle.seekToEnd()
+                } catch {
+                    try? handle.close()
+                    throw error
+                }
+                return DriverFileLogHandle(
+                    write: { try handle.write(contentsOf: $0) },
+                    offset: { try handle.offset() },
+                    close: { try handle.close() }
+                )
+            },
+            size: { url, fileManager in
+                guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+                      let size = attributes[.size] as? NSNumber else {
+                    return nil
+                }
+                return size.uint64Value
+            },
+            rotate: { url, fileManager in
+                let rotatedURL = url.appendingPathExtension("1")
+                if fileManager.fileExists(atPath: rotatedURL.path) {
+                    try fileManager.removeItem(at: rotatedURL)
+                }
+                if fileManager.fileExists(atPath: url.path) {
+                    try fileManager.moveItem(at: url, to: rotatedURL)
+                }
+            }
+        )
+    }
+}
+
 /// Mirrors driver log messages to a rotating diagnostics file.
 public final class DriverFileLog {
     /// Shared diagnostics file writer.
@@ -123,10 +177,17 @@ public final class DriverFileLog {
     private let dateFormatter = DateFormatter()
     private let dateProvider: () -> Date
     private let timeZoneProvider: () -> TimeZone
+    private let uptimeProvider: () -> TimeInterval
+    private let operations: DriverFileLogOperations
+    private let reportFailure: (Error) -> Void
+    private static let retryInterval: TimeInterval = 5
     private var fileURL: URL?
     private var maxBytes: Int = 0
-    private var fileHandle: FileHandle?
+    private var fileHandle: DriverFileLogHandle?
+    private var fileManager: FileManager = .default
     private var minimumLevel: DriverLogLevel = .notice
+    private var retryAfter: TimeInterval?
+    private var failureReported = false
 
     public convenience init() {
         self.init(
@@ -137,10 +198,19 @@ public final class DriverFileLog {
 
     init(
         dateProvider: @escaping () -> Date,
-        timeZoneProvider: @escaping () -> TimeZone
+        timeZoneProvider: @escaping () -> TimeZone,
+        uptimeProvider: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        operations: DriverFileLogOperations = .live,
+        reportFailure: @escaping (Error) -> Void = { error in
+            // Do not call DriverLoggers.log: it would re-enter this sink under its lock.
+            DriverLoggers.lifecycle.error("Diagnostics file logging interrupted: \(error.localizedDescription, privacy: .public). Will retry on eligible messages after a 5-second cooldown; interrupted messages are not replayed.")
+        }
     ) {
         self.dateProvider = dateProvider
         self.timeZoneProvider = timeZoneProvider
+        self.uptimeProvider = uptimeProvider
+        self.operations = operations
+        self.reportFailure = reportFailure
         dateFormatter.calendar = Calendar(identifier: .gregorian)
         dateFormatter.locale = Locale(identifier: "en_US_POSIX")
         dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSXXXXX"
@@ -160,34 +230,32 @@ public final class DriverFileLog {
         lock.lock()
         defer { lock.unlock() }
 
-        try fileHandle?.close()
-        fileHandle = nil
+        // Retire the old destination before any throwing work, including close.
+        // An unsuccessful explicit configuration stays disabled, with no stale retry.
+        fileURL = nil
+        self.maxBytes = 0
+        retryAfter = nil
+        failureReported = false
         self.minimumLevel = minimumLevel
+        self.fileManager = fileManager
+        try closeLocked()
 
         guard let fileLogPath, !fileLogPath.isEmpty else {
-            fileURL = nil
-            self.maxBytes = 0
             return
         }
 
         let expandedPath = NSString(string: fileLogPath).expandingTildeInPath
         let url = URL(fileURLWithPath: expandedPath, isDirectory: false)
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-
+        let limit = max(65_536, maxBytes)
+        let handle = try openLocked(fileURL: url, maxBytes: limit)
         fileURL = url
-        self.maxBytes = max(65_536, maxBytes)
-        try rotateIfNeededLocked(fileManager: fileManager)
-
-        if !fileManager.fileExists(atPath: url.path) {
-            fileManager.createFile(atPath: url.path, contents: nil)
-        }
-
-        let handle = try FileHandle(forWritingTo: url)
-        try handle.seekToEnd()
+        self.maxBytes = limit
         fileHandle = handle
     }
 
     /// Writes one diagnostics log line if file logging is configured.
+    /// After an I/O failure, eligible messages retry at most once per five seconds.
+    /// Failed and cooldown messages are not replayed, since a failed write may be partial.
     public func write(level: DriverLogLevel, category: DriverLogCategory, message: String) {
         lock.lock()
         defer { lock.unlock() }
@@ -196,9 +264,22 @@ public final class DriverFileLog {
             return
         }
 
-        guard let fileURL, let fileHandle else {
+        guard let fileURL else {
             return
         }
+
+        if fileHandle == nil {
+            guard let retryAfter, uptimeProvider() >= retryAfter else {
+                return
+            }
+            do {
+                fileHandle = try openLocked(fileURL: fileURL, maxBytes: maxBytes)
+            } catch {
+                suspendLocked(after: error)
+                return
+            }
+        }
+        guard let fileHandle else { return }
 
         dateFormatter.timeZone = timeZoneProvider()
         let timestamp = dateFormatter.string(from: dateProvider())
@@ -208,11 +289,13 @@ public final class DriverFileLog {
         }
 
         do {
-            try fileHandle.write(contentsOf: data)
+            try fileHandle.write(data)
             try rotateAfterWriteIfNeededLocked(fileURL: fileURL)
+            // Opening alone is not recovery: a write or rotation may still fail.
+            retryAfter = nil
+            failureReported = false
         } catch {
-            try? fileHandle.close()
-            self.fileHandle = nil
+            suspendLocked(after: error)
         }
     }
 
@@ -226,39 +309,30 @@ public final class DriverFileLog {
             return
         }
 
-        try fileHandle?.close()
+        try closeLocked()
+        try operations.rotate(fileURL, fileManager)
+        fileHandle = try operations.open(fileURL, fileManager)
+    }
+
+    private func openLocked(fileURL: URL, maxBytes: Int) throws -> DriverFileLogHandle {
+        if let size = operations.size(fileURL, fileManager), size >= UInt64(maxBytes) {
+            try operations.rotate(fileURL, fileManager)
+        }
+        return try operations.open(fileURL, fileManager)
+    }
+
+    private func closeLocked() throws {
+        let handle = fileHandle
         fileHandle = nil
-        try rotateLocked(fileURL: fileURL, fileManager: .default)
-
-        FileManager.default.createFile(atPath: fileURL.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: fileURL)
-        try handle.seekToEnd()
-        fileHandle = handle
+        try handle?.close()
     }
 
-    private func rotateIfNeededLocked(fileManager: FileManager) throws {
-        guard let fileURL, maxBytes > 0 else {
-            return
-        }
-
-        guard let attributes = try? fileManager.attributesOfItem(atPath: fileURL.path),
-              let size = attributes[.size] as? NSNumber,
-              size.intValue >= maxBytes else {
-            return
-        }
-
-        try rotateLocked(fileURL: fileURL, fileManager: fileManager)
-    }
-
-    private func rotateLocked(fileURL: URL, fileManager: FileManager) throws {
-        let rotatedURL = fileURL.appendingPathExtension("1")
-
-        if fileManager.fileExists(atPath: rotatedURL.path) {
-            try fileManager.removeItem(at: rotatedURL)
-        }
-
-        if fileManager.fileExists(atPath: fileURL.path) {
-            try fileManager.moveItem(at: fileURL, to: rotatedURL)
+    private func suspendLocked(after error: Error) {
+        try? closeLocked()
+        retryAfter = uptimeProvider() + Self.retryInterval
+        if !failureReported {
+            failureReported = true
+            reportFailure(error)
         }
     }
 }

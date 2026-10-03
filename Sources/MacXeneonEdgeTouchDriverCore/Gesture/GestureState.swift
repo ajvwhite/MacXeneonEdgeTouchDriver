@@ -24,9 +24,10 @@ public struct SingleTouchContext: Equatable {
     /// Last raw Y coordinate.
     public var lastRawY: Int
 
-    /// Whether this gesture currently owns a synthetic mouse-down without a matching mouse-up.
+    /// Whether this gesture owns a down post invocation without a matching up invocation.
+    /// This is release ownership, not proof that the operating system delivered input.
     public var isMouseDownPosted: Bool
 
-    /// Whether at least one drag event has been posted for this gesture.
+    /// Whether a drag post was invoked for this gesture; not a delivery acknowledgement.
     public var hasMoved: Bool
 }

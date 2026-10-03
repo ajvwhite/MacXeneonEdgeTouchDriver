@@ -119,7 +119,9 @@ public final class DisplayResolver {
             display.pixelsHigh == configuration.expectedHeight
         }
 
-        return sizeMatches.first ?? serialMatches.first
+        let bestMatches = sizeMatches.isEmpty ? serialMatches : sizeMatches
+        guard bestMatches.count == 1 else { return nil }
+        return bestMatches.first
     }
 
     private static func hasValidBounds(_ display: DisplaySnapshot) -> Bool {
