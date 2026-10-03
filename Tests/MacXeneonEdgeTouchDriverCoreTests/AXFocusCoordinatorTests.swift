@@ -58,8 +58,8 @@ final class AXFocusCoordinatorTests: XCTestCase {
     func testBaselineObserverFailureNeverMutates() {
         let f = FocusCoordinatorFixture()
         f.prepare()
-        f.changeFocusDuringTouch()
         f.backend.observationSucceeds = false
+        f.changeFocusDuringTouch()
         f.releaseAndRestore()
         XCTAssertEqual(f.backend.attemptCount, 0)
         XCTAssertEqual(f.backend.observers.first?.invalidations, 1)
@@ -75,7 +75,7 @@ final class AXFocusCoordinatorTests: XCTestCase {
         }
         f.releaseAndRestore()
         XCTAssertEqual(f.backend.attemptCount, 1)
-        XCTAssertEqual(f.backend.resolveCount, 4)
+        XCTAssertEqual(f.backend.resolveCount, 6)
         XCTAssertEqual(f.backend.observers.count, 2)
         XCTAssertTrue(f.backend.observers.allSatisfy { $0.invalidations == 1 })
     }
@@ -108,11 +108,182 @@ final class AXFocusCoordinatorTests: XCTestCase {
         f.prepare()
         f.changeFocusDuringTouch()
         f.restorer.inputDidEnd()
-        f.backend.observers.first?.emit(.focusChanged)
+        f.backend.emit(.focusChanged, processIdentifier: f.other.workspaceApplication.processIdentifier)
         f.clock.nanoseconds += 100_000_000
         f.restorer.restoreCapturedWindow()
         f.pump()
         XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
+    func testSiblingWindowChangeInTouchDestinationAfterReleaseDoesNotRestoreOriginalWindow() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        f.changeFocusDuringTouch(enroll: false)
+        XCTAssertEqual(f.backend.observers.count, 1,
+                       "Only the original application's observer exists during the touch.")
+        XCTAssertTrue(f.backend.observers.allSatisfy { f.backend.relationship($0.target, f.captured) == .same })
+        XCTAssertFalse(f.backend.observers.contains {
+            CFEqual($0.target.application.rawValue, f.other.application.rawValue)
+        }, "The touch destination application is not observed before mouse-up.")
+        f.restorer.inputDidEnd()
+
+        let workspaceRevision = f.workspace.revision
+        let sibling = coordinatorTarget(pid: f.other.workspaceApplication.processIdentifier, window: "other-sibling")
+        f.backend.focused = sibling
+        // B1 -> B2 stays inside the touch destination app. Route its event only
+        // to registered B observers; the captured A observer cannot see it.
+        XCTAssertEqual(f.backend.emit(.focusChanged, processIdentifier: sibling.workspaceApplication.processIdentifier), 0)
+        XCTAssertEqual(f.workspace.revision, workspaceRevision)
+        XCTAssertEqual(f.backend.observers.count, 1)
+        var mutations = 0
+        f.backend.onAttempt = {
+            mutations += 1
+            f.backend.focused = f.captured
+            f.workspace.frontmost = f.captured.workspaceApplication
+        }
+
+        f.clock.nanoseconds += 100_000_000
+        f.restorer.restoreCapturedWindow()
+        f.pump()
+
+        XCTAssertEqual(f.backend.attemptCount, 0,
+                       "A later baseline read must not authorize overriding a post-release sibling-window choice.")
+        XCTAssertEqual(mutations, 0, "The original window must not be raised over the user's newer focus choice.")
+        XCTAssertEqual(f.backend.relationship(f.backend.focused, sibling), .same)
+    }
+
+    func testCoveredDestinationSiblingChangeAfterReleaseRevokesRestoration() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        f.changeFocusDuringTouch()
+        XCTAssertEqual(f.backend.observers.count, 2)
+        f.restorer.inputDidEnd()
+        let revision = f.workspace.revision
+        let sibling = coordinatorTarget(pid: 20, window: "other-sibling")
+        f.backend.focused = sibling
+        XCTAssertEqual(f.backend.emit(.focusChanged, processIdentifier: 20), 1)
+        XCTAssertEqual(f.workspace.revision, revision)
+        f.clock.nanoseconds += 100_000_000
+        f.restorer.restoreCapturedWindow()
+        f.pump()
+        XCTAssertEqual(f.backend.attemptCount, 0)
+        XCTAssertEqual(f.backend.relationship(f.backend.focused, sibling), .same)
+    }
+
+    func testSilentPostReleaseMismatchCannotReplaceCertifiedBaseline() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        f.changeFocusDuringTouch()
+        f.restorer.inputDidEnd()
+        f.backend.focused = coordinatorTarget(pid: 20, window: "other-sibling")
+        f.clock.nanoseconds += 100_000_000
+        f.restorer.restoreCapturedWindow()
+        f.pump()
+        XCTAssertEqual(f.backend.attemptCount, 0, "Fresh reads confirm the release witness; they cannot replace it.")
+    }
+
+    func testSameApplicationEnrollmentReusesCapturedApplicationObserver() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        f.backend.focused = coordinatorTarget(pid: 10, window: "captured-sibling")
+        XCTAssertEqual(f.backend.emit(.focusChanged, processIdentifier: 10), 1)
+        f.pump()
+        XCTAssertEqual(f.backend.observers.count, 1)
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.attemptCount, 1)
+    }
+
+    func testReleaseBeforeEnrollmentStartsNeverInstallsDestinationObserver() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        f.changeFocusDuringTouch(enroll: false)
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.resolveCount, 2)
+        XCTAssertEqual(f.backend.observers.count, 1)
+        XCTAssertEqual(f.backend.attemptCount, 0)
+        XCTAssertEqual(f.backend.observers.first?.invalidations, 1)
+    }
+
+    func testReleaseWhileEnrollmentIsInFlightRetainsSlotUntilActualCleanup() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        f.changeFocusDuringTouch(enroll: false)
+        f.main.runAll()
+        XCTAssertEqual(f.worker.jobs.count, 1)
+        f.backend.onResolve = {
+            f.restorer.inputDidEnd()
+            f.restorer.restoreCapturedWindow()
+            for _ in 0..<100 { f.restorer.prepareFocusedWindow {} }
+            XCTAssertTrue(f.worker.jobs.isEmpty, "Busy requests cannot queue behind an in-flight AX read.")
+        }
+        f.worker.runAll()
+        f.backend.onResolve = nil
+        f.pump()
+        XCTAssertEqual(f.backend.resolveCount, 3)
+        XCTAssertEqual(f.backend.attemptCount, 0)
+        XCTAssertEqual(f.backend.observers.count, 1)
+        XCTAssertEqual(f.backend.observers.first?.invalidations, 1)
+        f.prepare()
+        XCTAssertEqual(f.backend.resolveCount, 5, "The slot becomes reusable only after actual cleanup.")
+    }
+
+    func testReleaseBeforeFinalEnrollmentPublicationRejectsLateCertificate() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        f.changeFocusDuringTouch(enroll: false)
+        f.main.runAll()
+        f.worker.runAll()
+        f.main.runAll()
+        f.worker.runAll()
+        XCTAssertEqual(f.backend.resolveCount, 4)
+        XCTAssertEqual(f.backend.observers.count, 2)
+        f.restorer.inputDidEnd()
+        f.pump()
+        f.restorer.restoreCapturedWindow()
+        f.pump()
+        XCTAssertEqual(f.backend.attemptCount, 0)
+        XCTAssertTrue(f.backend.observers.allSatisfy { $0.invalidations == 1 })
+    }
+
+    func testFocusHintBurstUsesOneEnrollmentAndLaterChangeDoesNotRetry() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        f.changeFocusDuringTouch(enroll: false)
+        for _ in 0..<100 {
+            f.workspace.emit(.focusChanged)
+            f.backend.emit(.focusChanged, processIdentifier: 10)
+        }
+        XCTAssertEqual(f.main.jobs.count, 1)
+        XCTAssertTrue(f.worker.jobs.isEmpty)
+        f.main.runAll()
+        XCTAssertEqual(f.worker.jobs.count, 1)
+        f.pump()
+        XCTAssertEqual(f.backend.resolveCount, 4)
+        XCTAssertEqual(f.backend.observers.count, 2)
+        f.backend.focused = coordinatorTarget(pid: 20, window: "other-sibling")
+        f.backend.emit(.focusChanged, processIdentifier: 20)
+        XCTAssertTrue(f.main.jobs.isEmpty)
+        XCTAssertTrue(f.worker.jobs.isEmpty)
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.resolveCount, 4)
+        XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
+    func testNewGestureAndShutdownDuringEnrollmentCleanUpBothObservers() {
+        for shutdown in [false, true] {
+            let f = FocusCoordinatorFixture()
+            f.prepare()
+            f.changeFocusDuringTouch(enroll: false)
+            f.main.runAll()
+            f.worker.runAll()
+            XCTAssertEqual(f.backend.observers.count, 2)
+            if shutdown { f.restorer.shutdown() }
+            else { f.restorer.prepareFocusedWindow {} }
+            f.pump()
+            XCTAssertEqual(f.backend.attemptCount, 0)
+            XCTAssertTrue(f.backend.observers.allSatisfy { $0.invalidations == 1 })
+            XCTAssertEqual(f.backend.resolveCount, 3)
+        }
     }
 
     func testLifecycleChangeDuringTouchRevokesRestoration() {
@@ -149,7 +320,7 @@ final class AXFocusCoordinatorTests: XCTestCase {
         }
         f.releaseAndRestore()
         XCTAssertEqual(f.backend.attemptCount, 1)
-        XCTAssertEqual(f.backend.resolveCount, 3)
+        XCTAssertEqual(f.backend.resolveCount, 5)
         XCTAssertTrue(f.backend.observers.allSatisfy { $0.invalidations == 1 })
     }
 
@@ -328,11 +499,12 @@ private final class FocusCoordinatorFixture {
         pump()
     }
 
-    func changeFocusDuringTouch() {
+    func changeFocusDuringTouch(enroll: Bool = true) {
         backend.focused = other
         workspace.frontmost = other.workspaceApplication
         workspace.emit(.focusChanged)
-        backend.observers.first?.emit(.focusChanged)
+        backend.emit(.focusChanged, processIdentifier: captured.workspaceApplication.processIdentifier)
+        if enroll { pump() }
     }
 
     func releaseAndRestore() {
@@ -360,11 +532,13 @@ private func coordinatorTarget(pid: pid_t, window: String) -> AXFocusTarget {
 }
 
 private final class CoordinatorObservationFake: AXFocusObservationProtocol {
+    let target: AXFocusTarget
     let source: CFRunLoopSource?
     var invalidations = 0
     var onInvalidate: (() -> Void)?
     let change: (FocusObservationEvent) -> Void
-    init(change: @escaping (FocusObservationEvent) -> Void, source: CFRunLoopSource? = nil) {
+    init(target: AXFocusTarget, change: @escaping (FocusObservationEvent) -> Void, source: CFRunLoopSource? = nil) {
+        self.target = target
         self.change = change
         self.source = source
     }
@@ -382,6 +556,14 @@ private final class CoordinatorBackendFake: AXFocusBackendProtocol {
     var onResolve: (() -> Void)?
     var onAttempt: (() -> Void)?
     init(focused: AXFocusTarget) { self.focused = focused }
+
+    @discardableResult func emit(_ event: FocusObservationEvent, processIdentifier: pid_t) -> Int {
+        let recipients = observers.filter {
+            $0.invalidations == 0 && $0.target.workspaceApplication.processIdentifier == processIdentifier
+        }
+        recipients.forEach { $0.emit(event) }
+        return recipients.count
+    }
 
     func resolve(workspace: AXFocusWorkspaceApplication?, permit: () -> Bool) -> AXFocusResolution {
         resolveCount += 1
@@ -406,7 +588,7 @@ private final class CoordinatorBackendFake: AXFocusBackendProtocol {
     func prepareObservation(target: AXFocusTarget, permit: () -> Bool,
         onChange: @escaping (FocusObservationEvent) -> Void) -> AXFocusObservationProtocol? {
         guard observationSucceeds, permit() else { return nil }
-        let observer = CoordinatorObservationFake(change: onChange, source: observationSource)
+        let observer = CoordinatorObservationFake(target: target, change: onChange, source: observationSource)
         observers.append(observer)
         return observer
     }

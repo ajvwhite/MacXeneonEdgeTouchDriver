@@ -14,6 +14,10 @@ final class FocusOperationToken {
     private let now: () -> UInt64
     private var phase: Phase = .preparing
     private var deadline: UInt64?
+    private var focusRevision: UInt64 = 0
+    private var certifiedRevision: UInt64?
+    private var enrollmentRequested = false
+    private var enrollmentStarted = false
 
     init(preparationMilliseconds: UInt64 = 30, now: @escaping () -> UInt64) {
         self.now = now
@@ -32,12 +36,19 @@ final class FocusOperationToken {
         lock.unlock()
     }
 
-    func observe(_ event: FocusObservationEvent) {
+    /// Returns true once per touch to request a coalesced main-queue enrollment.
+    @discardableResult func observe(_ event: FocusObservationEvent) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         if event == .lifecycleChanged || phase != .touching {
             phase = .invalidated
+            return false
         }
+        focusRevision &+= 1
+        certifiedRevision = nil
+        guard !enrollmentRequested else { return false }
+        enrollmentRequested = true
+        return true
     }
 
     func beginTouch() -> Bool {
@@ -45,6 +56,33 @@ final class FocusOperationToken {
         defer { lock.unlock() }
         guard phase == .preparing, permittedWhileLocked() else { return false }
         phase = .touching
+        deadline = nil
+        certifiedRevision = focusRevision
+        return true
+    }
+
+    func beginEnrollment(budgetMilliseconds: UInt64 = 150) -> UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard phase == .touching, enrollmentRequested, !enrollmentStarted,
+              permittedWhileLocked() else { return nil }
+        enrollmentStarted = true
+        deadline = now() &+ budgetMilliseconds * 1_000_000
+        return focusRevision
+    }
+
+    func permitsEnrollment(revision: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return phase == .touching && enrollmentStarted && focusRevision == revision && permittedWhileLocked()
+    }
+
+    func certifyEnrollment(revision: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard phase == .touching, enrollmentStarted, focusRevision == revision,
+              permittedWhileLocked() else { return false }
+        certifiedRevision = revision
         deadline = nil
         return true
     }
@@ -58,10 +96,17 @@ final class FocusOperationToken {
         return true
     }
 
-    func inputDidEnd() {
+    /// A late enrollment cannot authorize restoration after this release boundary.
+    @discardableResult func inputDidEnd() -> Bool {
         lock.lock()
-        if phase == .touching { phase = .released }
-        lock.unlock()
+        defer { lock.unlock() }
+        guard phase == .touching, certifiedRevision == focusRevision,
+              permittedWhileLocked() else {
+            phase = .invalidated
+            return false
+        }
+        phase = .released
+        return true
     }
 
     private func permittedWhileLocked() -> Bool {
@@ -107,6 +152,15 @@ final class FocusOperationState {
         return true
     }
 
+    func beginEnrollment(token: FocusOperationToken) -> UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped, !occupied, currentToken === token,
+              let revision = token.beginEnrollment() else { return nil }
+        occupied = true
+        return revision
+    }
+
     func invalidate(shutdown: Bool = false) {
         lock.lock()
         if shutdown { stopped = true }
@@ -120,10 +174,10 @@ final class FocusOperationState {
         lock.unlock()
     }
 
-    func inputDidEnd() {
+    @discardableResult func inputDidEnd() -> Bool {
         lock.lock()
-        currentToken?.inputDidEnd()
-        lock.unlock()
+        defer { lock.unlock() }
+        return currentToken?.inputDidEnd() ?? false
     }
 
     /// Reserve the otherwise-idle worker to remove an invalidated capture's observers.

@@ -9,6 +9,9 @@ public final class AXFocusRestorer: FocusRestorer {
     private final class Session {
         let token: FocusOperationToken
         var captured: AXFocusTarget?
+        // Published under sessionLock while touching, then frozen by inputDidEnd.
+        var certifiedBaseline: AXFocusTarget?
+        var releasedBaseline: AXFocusTarget?
         // Successive pipeline stages own these; callbacks touch the token only.
         var observations: [AXFocusObservationProtocol] = []
         var attachedSources: [CFRunLoopSource] = []
@@ -103,14 +106,23 @@ public final class AXFocusRestorer: FocusRestorer {
         onCallback = { queue.async(execute: $0) }
     }
 
-    public func inputDidEnd() { state.inputDidEnd() }
+    public func inputDidEnd() {
+        sessionLock.lock()
+        if state.inputDidEnd(), let current = session {
+            current.releasedBaseline = current.certifiedBaseline
+        }
+        sessionLock.unlock()
+    }
 
     public func restoreCapturedWindow() {
         sessionLock.lock()
         let current = session
-        let admitted = current.map { state.beginRestoration(token: $0.token) } ?? false
+        let admitted = current.map {
+            $0.captured != nil && $0.releasedBaseline != nil && state.beginRestoration(token: $0.token)
+        } ?? false
         sessionLock.unlock()
-        guard admitted, let current, let captured = current.captured else {
+        guard admitted, let current, let captured = current.captured,
+              let baseline = current.releasedBaseline else {
             discardCapturedWindow()
             return
         }
@@ -123,8 +135,13 @@ public final class AXFocusRestorer: FocusRestorer {
                 guard current.token.isPermitted else { self.finish(current); return }
                 let resolution = self.backend.resolve(workspace: baselineWorkspace.application,
                                                        permit: { current.token.isPermitted })
-                guard case let .known(baseline) = resolution else {
+                guard case let .known(confirmed) = resolution else {
                     self.logUnknown(resolution, context: "Post-release focus baseline unavailable")
+                    self.finish(current)
+                    return
+                }
+                guard self.backend.relationship(baseline, confirmed) == .same else {
+                    self.log("Focus changed from the certified pre-release baseline; restoration skipped.")
                     self.finish(current)
                     return
                 }
@@ -133,17 +150,8 @@ public final class AXFocusRestorer: FocusRestorer {
                     self.finish(current)
                     return
                 }
-                guard let observation = self.backend.prepareObservation(
-                    target: baseline, permit: { current.token.isPermitted },
-                    onChange: { [token = current.token] in token.observe($0) }) else {
-                    self.log("Focus restoration skipped because baseline observation is unavailable.")
-                    self.finish(current)
-                    return
-                }
-                current.observations.append(observation)
                 self.onMain {
                     guard current.token.isPermitted else { self.finish(current); return }
-                    self.attachSources(current)
                     let refreshedWorkspace = self.workspace.snapshot()
                     let capturedApplication = self.workspace.application(
                         processIdentifier: captured.workspaceApplication.processIdentifier)
@@ -185,8 +193,7 @@ public final class AXFocusRestorer: FocusRestorer {
     private func startPreparation(_ current: Session, completion: @escaping () -> Void) {
         onMain {
             guard current.token.isPermitted else { self.finish(current, completion: completion); return }
-            let operationState = self.state
-            self.workspace.start { [weak operationState] event in operationState?.observe(event) }
+            self.workspace.start(observation: self.observationHandler(current))
             let before = self.workspace.snapshot()
             guard before.sessionActive else { self.finish(current, completion: completion); return }
             self.onWorker {
@@ -201,7 +208,7 @@ public final class AXFocusRestorer: FocusRestorer {
                 guard current.token.isPermitted else { self.finish(current, completion: completion); return }
                 guard let observation = self.backend.prepareObservation(
                         target: target, permit: { current.token.isPermitted },
-                        onChange: { [token = current.token] in token.observe($0) }) else {
+                        onChange: self.observationHandler(current)) else {
                     self.log("Pre-input focus capture skipped because target observation is unavailable.")
                     self.finish(current, completion: completion)
                     return
@@ -238,6 +245,7 @@ public final class AXFocusRestorer: FocusRestorer {
                                 && current.token.isPermitted
                             if accepted {
                                 current.captured = confirmed
+                                current.certifiedBaseline = confirmed
                                 self.state.finishOperation()
                             }
                             self.sessionLock.unlock()
@@ -250,6 +258,83 @@ public final class AXFocusRestorer: FocusRestorer {
                             }
                             self.deliverPreparation(completion, prepared: current)
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    private func observationHandler(_ current: Session) -> (FocusObservationEvent) -> Void {
+        { [weak self, weak current, token = current.token] event in
+            // Dirty the certificate immediately, even if main is busy. The single
+            // queued request samples after a burst of activation/deactivation hints.
+            guard token.observe(event), let self, let current else { return }
+            self.onMain { [weak self, weak current] in
+                guard let self, let current else { return }
+                self.startEnrollment(current)
+            }
+        }
+    }
+
+    /// One attempt per touch, sharing the actual-operation slot with all AX work.
+    /// If release wins any stage, its invalidated permit prevents late certification.
+    private func startEnrollment(_ current: Session) {
+        sessionLock.lock()
+        let captured = current.captured
+        let revision = session === current && captured != nil ? state.beginEnrollment(token: current.token) : nil
+        sessionLock.unlock()
+        guard let revision, let captured else { return }
+        let permit = { current.token.permitsEnrollment(revision: revision) }
+        let before = workspace.snapshot()
+        guard before.sessionActive, permit() else { finish(current); return }
+        onWorker {
+            guard permit() else { self.finish(current); return }
+            let resolution = self.backend.resolve(workspace: before.application, permit: permit)
+            guard case let .known(target) = resolution else {
+                self.logUnknown(resolution, context: "During-touch focus baseline unavailable")
+                self.finish(current)
+                return
+            }
+            guard permit() else { self.finish(current); return }
+            // The original observer already watches its application's focused-window
+            // changes. A different application needs one additional observer.
+            if !target.workspaceApplication.isSameApplication(as: captured.workspaceApplication) {
+                guard let observation = self.backend.prepareObservation(
+                    target: target, permit: permit, onChange: self.observationHandler(current)) else {
+                    self.log("During-touch baseline observation unavailable; restoration skipped.")
+                    self.finish(current)
+                    return
+                }
+                current.observations.append(observation)
+            }
+            self.onMain {
+                guard permit() else { self.finish(current); return }
+                self.attachSources(current)
+                let observed = self.workspace.snapshot()
+                guard self.sameWorkspace(before, observed), permit() else { self.finish(current); return }
+                self.onWorker {
+                    guard permit() else { self.finish(current); return }
+                    let confirmation = self.backend.resolve(workspace: observed.application, permit: permit)
+                    guard case let .known(confirmed) = confirmation else {
+                        self.logUnknown(confirmation, context: "During-touch focus confirmation unavailable")
+                        self.finish(current)
+                        return
+                    }
+                    guard self.backend.relationship(target, confirmed) == .same, permit() else {
+                        self.finish(current)
+                        return
+                    }
+                    self.onMain {
+                        let final = self.workspace.snapshot()
+                        self.sessionLock.lock()
+                        let accepted = self.session === current && self.sameWorkspace(observed, final)
+                            && current.token.certifyEnrollment(revision: revision)
+                        if accepted {
+                            current.certifiedBaseline = confirmed
+                            self.state.finishOperation()
+                        }
+                        self.sessionLock.unlock()
+                        if !accepted { self.finish(current) }
                     }
                 }
             }
