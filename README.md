@@ -110,7 +110,11 @@ All fields are optional. Missing or malformed config falls back to defaults and 
 
 `focus.restorePreviousWindow` defaults to `true`: the driver captures the focused window before each touch and attempts to restore it afterward. Set it to `false` to skip focus capture and restoration and leave focus to normal window behavior. If focus cannot be captured, the touch still proceeds.
 
-`cursor.returnToPreviousPosition` also defaults to `true`. Set it to `false` to skip the return to the pre-touch cursor position. Cleanup still releases the mouse button, restores cursor visibility and mouse association, and clears the borrowed state. This applies to normal completion, cancellation, device removal, and shutdown. Touch and focus restoration can still move the shared system cursor.
+Focus preparation has a 30 ms deadline on the gesture queue. If capture finishes first, input proceeds with that capture. If a move or release arrives first, the driver immediately delivers the original down followed by that event, without waiting for focus. Every subsequent drag point is delivered normally. The deadline also releases a stationary touch when capture is slow; late results are discarded. The existing warp and click delays apply after preparation. Queue scheduling can delay execution, so this is not a hard real-time guarantee.
+
+Accessibility work runs separately from input cleanup, with at most one operation outstanding. Restoration starts after button and cursor cleanup, with a 150 ms budget for starting further work. It checks the exact captured process and window against a fresh observation, skips an already-focused window, and makes at most one supported focus or raise request. It verifies the result when possible; it never clicks a title bar or retries an uncertain request. A stalled request can outlive the budget; later touches continue without capture until that worker returns. If macOS cannot report focus reliably or the app does not support the required operations and observations, the driver leaves focus alone.
+
+`cursor.returnToPreviousPosition` also defaults to `true`. Set it to `false` to skip the return to the pre-touch cursor position. Cleanup still releases the mouse button, restores cursor visibility and mouse association, and clears the borrowed state. This applies to normal completion, cancellation, device removal, and shutdown. Touch input still moves the shared system cursor; focus restoration does not warp it.
 
 | Restore previous window | Return cursor | End of gesture |
 | --- | --- | --- |
@@ -119,12 +123,13 @@ All fields are optional. Missing or malformed config falls back to defaults and 
 | `true` | `false` | Release the cursor at its current position and attempt to restore the previous window. |
 | `false` | `false` | Release the cursor at its current position; leave focus to normal window behavior. |
 
-Both settings preserve the existing gesture timing. Restart the driver after changing the configuration.
+The configured gesture delays are unchanged; enabling focus restoration can add the bounded preparation wait described above. Restart the driver after changing the configuration.
 
 `gesture.multiTouchEnabled` is always forced to `false` as the hardware only exposes single touch information, if this ever changes we will look to see how to support multi-touch gestures.
 
 ## Known Caveats
 
+- Focus restoration is best effort. An intentional app or window selection made during a touch may be restored over, as with the previous behavior. Changes observed after release, a newer gesture, shutdown, target invalidation, or a Space/session change stop further restoration work. An AX request already sent to another app can still finish afterward; invalidation cannot undo it.
 - With cursor return enabled, physical mouse movement during a touch does not change the saved return position. With it disabled, cleanup leaves the cursor at its current position rather than warping to an assumed final touch point.
 - Multi-contact gestures are not supported as the hardware doesn't report this information back.
 - If the process is killed with `SIGKILL`, normal shutdown cleanup cannot run. Relaunching the driver or moving the physical mouse after cursor association is restored may be needed.

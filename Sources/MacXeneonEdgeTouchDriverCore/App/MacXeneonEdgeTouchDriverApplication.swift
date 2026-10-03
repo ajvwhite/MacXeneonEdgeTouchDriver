@@ -9,7 +9,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
     private let configuration: DriverConfiguration
     private let displayResolver: DisplayResolver
     private let mapperStore = CoordinateMapperStore()
-    private let gestureQueue = DispatchQueue(label: "\(DriverLoggers.subsystem).gesture-queue")
+    private let gestureQueue: DispatchQueue
     private let inputSink: SyntheticInputSink
     private let cursorController: CursorController
     private let focusRestorer: FocusRestorer
@@ -52,23 +52,42 @@ public final class MacXeneonEdgeTouchDriverApplication {
             displayResolver: DisplayResolver(configuration: configuration.display),
             inputSink: CGEventInputSink(),
             cursorController: CGCursorController(),
-            focusRestorer: AXFocusRestorer()
+            focusFactory: { AXFocusRestorer(callbackQueue: $0) }
         )
     }
 
     /// Creates an application with injectable side-effect dependencies.
-    public init(
+    public convenience init(
         configuration: DriverConfiguration,
         displayResolver: DisplayResolver,
         inputSink: SyntheticInputSink,
         cursorController: CursorController,
         focusRestorer: FocusRestorer = NoOpFocusRestorer()
     ) {
+        self.init(
+            configuration: configuration,
+            displayResolver: displayResolver,
+            inputSink: inputSink,
+            cursorController: cursorController,
+            focusFactory: { _ in focusRestorer }
+        )
+    }
+
+    private init(
+        configuration: DriverConfiguration,
+        displayResolver: DisplayResolver,
+        inputSink: SyntheticInputSink,
+        cursorController: CursorController,
+        focusFactory: (DispatchQueue) -> FocusRestorer
+    ) {
+        let gestureQueue = DispatchQueue(label: "\(DriverLoggers.subsystem).gesture-queue")
+        self.gestureQueue = gestureQueue
         self.configuration = configuration
         self.displayResolver = displayResolver
         self.inputSink = inputSink
         self.cursorController = cursorController
-        self.focusRestorer = configuration.focus.restorePreviousWindow ? focusRestorer : NoOpFocusRestorer()
+        self.focusRestorer = configuration.focus.restorePreviousWindow ? focusFactory(gestureQueue) : NoOpFocusRestorer()
+        (self.focusRestorer as? AXFocusRestorer)?.bindCallbackQueue(gestureQueue)
     }
 
     deinit {
@@ -110,6 +129,8 @@ public final class MacXeneonEdgeTouchDriverApplication {
 
     /// Stops monitoring and restores cursor/input state.
     public func stop() {
+        // Invalidation must not wait for the gesture queue or an outstanding AX request.
+        focusRestorer.shutdown()
         guard isRunning else {
             return
         }
@@ -146,6 +167,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
         } else {
             DriverLoggers.log(.error, category: .display, "Could not resolve Xeneon Edge display after \(reason). Touch events will be dropped.")
             gestureQueue.async { [weak self] in
+                self?.focusRestorer.discardCapturedWindow()
                 self?.cancelStuckGestureTimer()
                 self?.gestureController.forceCancel()
             }
@@ -173,6 +195,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
     }
 
     private func handleDeviceRemoval() {
+        focusRestorer.discardCapturedWindow()
         cancelStuckGestureTimer()
         gestureController.forceCancel()
     }
@@ -184,6 +207,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
         timer.schedule(deadline: .now() + .milliseconds(configuration.timing.stuckGestureTimeoutMs))
         timer.setEventHandler { [weak self] in
             DriverLoggers.log(.warning, category: .gesture, "Touch gesture timed out without an up event; forcing cleanup.")
+            self?.focusRestorer.discardCapturedWindow()
             self?.gestureController.handleIdleTimeout()
             self?.stuckGestureTimer = nil
         }
