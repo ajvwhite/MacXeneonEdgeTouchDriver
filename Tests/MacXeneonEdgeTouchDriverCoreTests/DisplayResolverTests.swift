@@ -167,6 +167,54 @@ final class DisplayResolverTests: XCTestCase {
         XCTAssertEqual(resolver.resolve(from: [display]), display)
     }
 
+    func testRejectsPositiveDimensionsWhoseGlobalEdgesCollapse() {
+        let origin = CGFloat(4_503_599_627_370_496)
+        let collapsedBounds = [
+            CGRect(x: origin, y: 0, width: 0.25, height: 720),
+            CGRect(x: 0, y: origin, width: 2_560, height: 0.25),
+            CGRect(x: -origin, y: 0, width: 0.125, height: 720),
+            CGRect(x: 0, y: -origin, width: 2_560, height: 0.125),
+        ]
+
+        for bounds in collapsedBounds {
+            let valid = xeneonDisplay(displayID: 2)
+            let invalid = xeneonDisplay(bounds: bounds)
+            let resolver = DisplayResolver(activeDisplayProvider: { [invalid] })
+            XCTAssertGreaterThan(bounds.width, 0)
+            XCTAssertGreaterThan(bounds.height, 0)
+            XCTAssertTrue(bounds.minX == bounds.maxX || bounds.minY == bounds.maxY)
+            XCTAssertNil(resolver.resolve(from: [invalid]))
+            XCTAssertEqual(resolver.resolve(from: [invalid, valid]), valid)
+            resolver.update(with: valid)
+            var changes: [CGRect?] = []
+            resolver.onDisplayChanged = { changes.append($0) }
+
+            resolver.update(with: invalid)
+            resolver.refresh()
+
+            XCTAssertNil(resolver.currentSnapshot)
+            XCTAssertNil(resolver.currentBounds)
+            XCTAssertNil(resolver.currentMapper)
+            XCTAssertEqual(changes, [nil])
+        }
+    }
+
+    func testAcceptsBoundsWithExactlyOneRepresentableCoordinateOnEachAxis() {
+        let origin = CGFloat(4_503_599_627_370_496)
+        for bounds in [
+            CGRect(x: origin, y: origin, width: 1, height: 1),
+            CGRect(x: -CGFloat.leastNonzeroMagnitude, y: -CGFloat.leastNonzeroMagnitude,
+                   width: CGFloat.leastNonzeroMagnitude, height: CGFloat.leastNonzeroMagnitude),
+        ] {
+            let display = xeneonDisplay(bounds: bounds)
+            let resolver = DisplayResolver(activeDisplayProvider: { [display] })
+            resolver.refresh()
+
+            XCTAssertEqual(resolver.currentSnapshot, display)
+            XCTAssertEqual(resolver.currentMapper?.map(rawX: 16_383, rawY: 9_599), bounds.origin)
+        }
+    }
+
     func testRefreshReadsProviderOnceAndCommitsThatSnapshot() {
         let first = xeneonDisplay(displayID: 1)
         let second = xeneonDisplay(displayID: 2, bounds: CGRect(x: 900, y: 200, width: 2_560, height: 720))

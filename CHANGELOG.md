@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Keep mapped touch points inside the target rectangle by clamping the final global coordinates below its excluded maximum edges. Existing interior coordinates stay unchanged. Reject bounds whose positive dimensions round to equal minimum and maximum edges. This establishes mathematical containment; live click routing at display boundaries remains unverified.
 - Check the current target display before each touch-down, so missed display callbacks no longer leave taps at an old origin.
 - Drop new touches when the target is missing or has invalid bounds, instead of using its last-known coordinates. A configured display serial must match; it no longer falls back to another same-model panel. Without a configured serial, the existing pixel-size preference remains.
 - Pause routing during display reconfiguration and refresh after the change. Release owned input, return the cursor, and invalidate pending gesture and focus work before a changed mapping can drive another touch.

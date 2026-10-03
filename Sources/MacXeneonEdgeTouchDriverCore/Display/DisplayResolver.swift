@@ -128,7 +128,8 @@ public final class DisplayResolver {
             bounds.origin.x.isFinite && bounds.origin.y.isFinite &&
             bounds.size.width.isFinite && bounds.size.height.isFinite &&
             bounds.size.width > 0 && bounds.size.height > 0 &&
-            bounds.maxX.isFinite && bounds.maxY.isFinite
+            bounds.maxX.isFinite && bounds.maxY.isFinite &&
+            bounds.minX < bounds.maxX && bounds.minY < bounds.maxY
     }
 
     private static func activeDisplaySnapshots() -> [DisplaySnapshot] {

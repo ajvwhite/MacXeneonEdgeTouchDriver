@@ -3,6 +3,71 @@ import CoreGraphics
 import XCTest
 
 final class DisplayRoutingTests: XCTestCase {
+    func testFarCornerTapBorrowsAndClicksInsideTheSelectedDisplay() {
+        let fixture = RoutingFixture(displaysBeforeFirstMatch: [display(bounds: leftDisplayBounds)])
+
+        fixture.send(.down, far: true)
+        fixture.send(.up, at: 1, far: true)
+
+        XCTAssertEqual(fixture.recorder.calls, [
+            .capture, .borrow(leftDisplayFarPoint), .down(leftDisplayFarPoint),
+            .up(leftDisplayFarPoint), .returned, .restore,
+        ])
+        assertFarCornerCallsAreContained(fixture.recorder)
+    }
+
+    func testFarCornerDragUsesTheBorrowedPointAndReturnsAfterMouseUp() {
+        let fixture = RoutingFixture(
+            returnDelay: 80,
+            displaysBeforeFirstMatch: [display(bounds: leftDisplayBounds)]
+        )
+
+        fixture.send(.down, far: true)
+        fixture.send(.move, at: 1, far: true)
+        fixture.send(.up, at: 2, far: true)
+
+        let beforeReturn: [RoutingCall] = [
+            .capture, .borrow(leftDisplayFarPoint), .down(leftDisplayFarPoint),
+            .update(leftDisplayFarPoint), .drag(leftDisplayFarPoint), .up(leftDisplayFarPoint),
+        ]
+        XCTAssertEqual(fixture.recorder.calls, beforeReturn)
+        fixture.clock.advance(toMilliseconds: 81)
+        XCTAssertEqual(fixture.recorder.calls, beforeReturn)
+        fixture.clock.advance(toMilliseconds: 82)
+        XCTAssertEqual(fixture.recorder.calls, beforeReturn + [.returned, .restore])
+        assertFarCornerCallsAreContained(fixture.recorder)
+    }
+
+    func testFarCornerDeviceRemovalReleasesTheContainedPointOnceBeforeReturning() {
+        for phase in [RoutingPhase.heldDrag, .delayedUp] {
+            let fixture = RoutingFixture(
+                upDelay: 40,
+                returnDelay: 80,
+                displaysBeforeFirstMatch: [display(bounds: leftDisplayBounds)]
+            )
+            fixture.send(.down, far: true)
+            if phase == .heldDrag {
+                fixture.send(.move, at: 1, far: true)
+            } else {
+                fixture.send(.up, at: 1, far: true)
+            }
+
+            fixture.application.handleDeviceRemoval()
+
+            let dragCalls: [RoutingCall] = phase == .heldDrag
+                ? [.update(leftDisplayFarPoint), .drag(leftDisplayFarPoint)] : []
+            let expected: [RoutingCall] = [
+                .capture, .borrow(leftDisplayFarPoint), .down(leftDisplayFarPoint),
+            ] + dragCalls + [.up(leftDisplayFarPoint), .returned, .restore]
+            XCTAssertEqual(fixture.recorder.calls, expected, "Phase: \(phase)")
+            // Cancelled mouse-up, cursor-return, and watchdog work must not repeat cleanup.
+            fixture.clock.advance(toMilliseconds: 2_000)
+            fixture.send(.up, far: true)
+            XCTAssertEqual(fixture.recorder.calls, expected, "Phase: \(phase)")
+            assertFarCornerCallsAreContained(fixture.recorder)
+        }
+    }
+
     func testPreviouslyRefreshedResolverStillInstallsTheApplicationsMapper() {
         let fixture = RoutingFixture(initiallyResolved: true)
 
@@ -182,7 +247,7 @@ final class DisplayRoutingTests: XCTestCase {
             XCTAssertEqual(fixture.recorder.returnCount, 1)
             fixture.send(.move, far: true)
             fixture.send(.up, far: true)
-            let point = CGPoint(x: movedOrigin.x + 2_560, y: movedOrigin.y + 720)
+            let point = CGPoint(x: (movedOrigin.x + 2_560).nextDown, y: (movedOrigin.y + 720).nextDown)
             XCTAssertEqual(fixture.recorder.input.suffix(2), [.drag(point), .up(point)])
         }
     }
@@ -455,6 +520,30 @@ final class DisplayRoutingTests: XCTestCase {
         }
     }
 
+    private func assertFarCornerCallsAreContained(
+        _ recorder: RoutingRecorder,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let adjacentPrimary = CGRect(x: 0, y: 0, width: 2_560, height: 1_440)
+        let adjacentBelow = CGRect(x: -2_560, y: 720, width: 2_560, height: 720)
+        let points = recorder.calls.compactMap { call -> CGPoint? in
+            switch call {
+            case .borrow(let point), .update(let point), .down(let point), .drag(let point), .up(let point):
+                return point
+            default:
+                return nil
+            }
+        }
+        XCTAssertFalse(points.isEmpty, file: file, line: line)
+        for point in points {
+            XCTAssertEqual(point, leftDisplayFarPoint, file: file, line: line)
+            XCTAssertTrue(leftDisplayBounds.contains(point), "Point: \(point)", file: file, line: line)
+            XCTAssertFalse(adjacentPrimary.contains(point), "Point: \(point)", file: file, line: line)
+            XCTAssertFalse(adjacentBelow.contains(point), "Point: \(point)", file: file, line: line)
+        }
+    }
+
     private func assertFocusDiscardedBeforeCursorReturn(
         _ recorder: RoutingRecorder,
         file: StaticString = #filePath,
@@ -534,8 +623,10 @@ private enum RoutingPhase: CaseIterable {
 }
 
 private let origin = CGPoint(x: 100, y: 200)
-private let farPoint = CGPoint(x: 2_660, y: 920)
+private let farPoint = CGPoint(x: CGFloat(2_660).nextDown, y: CGFloat(920).nextDown)
 private let movedOrigin = CGPoint(x: -2_560, y: 500)
+private let leftDisplayBounds = CGRect(x: -2_560, y: 0, width: 2_560, height: 720)
+private let leftDisplayFarPoint = CGPoint(x: leftDisplayBounds.maxX.nextDown, y: leftDisplayBounds.maxY.nextDown)
 
 private func display(id: CGDirectDisplayID = 42, at point: CGPoint = origin) -> DisplaySnapshot {
     display(id: id, bounds: CGRect(origin: point, size: CGSize(width: 2_560, height: 720)))

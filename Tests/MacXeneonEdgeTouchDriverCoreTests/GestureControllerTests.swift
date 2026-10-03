@@ -29,7 +29,7 @@ final class GestureControllerTests: XCTestCase {
             cursor.calls,
             [
                 .borrow(CGPoint(x: 100, y: 200)),
-                .update(CGPoint(x: 2_660, y: 920)),
+                .update(CGPoint(x: CGFloat(2_660).nextDown, y: CGFloat(920).nextDown)),
                 .returnToOrigin
             ]
         )
@@ -37,8 +37,8 @@ final class GestureControllerTests: XCTestCase {
             input.calls,
             [
                 .mouseDown(CGPoint(x: 100, y: 200)),
-                .mouseDragged(CGPoint(x: 2_660, y: 920)),
-                .mouseUp(CGPoint(x: 2_660, y: 920))
+                .mouseDragged(CGPoint(x: CGFloat(2_660).nextDown, y: CGFloat(920).nextDown)),
+                .mouseUp(CGPoint(x: CGFloat(2_660).nextDown, y: CGFloat(920).nextDown))
             ]
         )
     }
@@ -52,7 +52,7 @@ final class GestureControllerTests: XCTestCase {
         controller.handle(event(.move, rawX: 16_383, rawY: 9_599))
         controller.forceCancel()
 
-        XCTAssertEqual(input.calls.last, .mouseUp(CGPoint(x: 2_660, y: 920)))
+        XCTAssertEqual(input.calls.last, .mouseUp(CGPoint(x: CGFloat(2_660).nextDown, y: CGFloat(920).nextDown)))
         XCTAssertEqual(cursor.calls.last, .returnToOrigin)
         XCTAssertEqual(controller.state, .idle)
     }
@@ -169,7 +169,7 @@ final class GestureControllerTests: XCTestCase {
             input.calls,
             [
                 .mouseDown(CGPoint(x: 100, y: 200)),
-                .mouseDragged(CGPoint(x: 2_660, y: 920))
+                .mouseDragged(CGPoint(x: CGFloat(2_660).nextDown, y: CGFloat(920).nextDown))
             ]
         )
     }

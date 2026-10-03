@@ -36,7 +36,8 @@ public struct CoordinateMapper: Equatable {
         self.displayBounds = displayBounds
     }
 
-    /// Maps a raw touchscreen coordinate to the target display.
+    /// Maps a raw touchscreen coordinate inside valid target display bounds.
+    /// The resolver requires finite, positive bounds with distinct minimum and maximum edges.
     public func map(rawX: Int, rawY: Int) -> CGPoint {
         let clampedX = clamp(rawX, lowerBound: rawMinX, upperBound: rawMaxX)
         let clampedY = clamp(rawY, lowerBound: rawMinY, upperBound: rawMaxY)
@@ -44,13 +45,27 @@ public struct CoordinateMapper: Equatable {
         let normalizedX = CGFloat(clampedX - rawMinX) / CGFloat(rawMaxX - rawMinX)
         let normalizedY = CGFloat(clampedY - rawMinY) / CGFloat(rawMaxY - rawMinY)
 
-        return CGPoint(
+        let point = CGPoint(
             x: displayBounds.origin.x + normalizedX * displayBounds.width,
             y: displayBounds.origin.y + normalizedY * displayBounds.height
+        )
+
+        // CGRect excludes its maximum edges. Clamp after adding the global origin,
+        // since that addition can round even an interior raw value onto an edge.
+        return CGPoint(
+            x: clamp(point.x, lowerBound: displayBounds.minX, upperBound: displayBounds.maxX.nextDown),
+            y: clamp(point.y, lowerBound: displayBounds.minY, upperBound: displayBounds.maxY.nextDown)
         )
     }
 
     private func clamp(_ value: Int, lowerBound: Int, upperBound: Int) -> Int {
         min(max(value, lowerBound), upperBound)
+    }
+
+    private func clamp(_ value: CGFloat, lowerBound: CGFloat, upperBound: CGFloat) -> CGFloat {
+        if value < lowerBound { return lowerBound }
+        if value > upperBound { return upperBound }
+        // Return contained values unchanged, including their signed zero.
+        return value
     }
 }

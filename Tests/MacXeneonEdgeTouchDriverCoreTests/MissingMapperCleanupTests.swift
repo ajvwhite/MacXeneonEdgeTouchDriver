@@ -354,7 +354,7 @@ final class MissingMapperCleanupTests: XCTestCase {
 }
 
 private let missingMapperNear = CGPoint(x: 100, y: 200)
-private let missingMapperFar = CGPoint(x: 2_660, y: 920)
+private let missingMapperFar = CGPoint(x: CGFloat(2_660).nextDown, y: CGFloat(920).nextDown)
 
 private func missingMapperTiming(warp: Int = 0, up: Int = 0, back: Int = 0) -> GestureTiming {
     GestureTiming(warpToClickDelayMs: warp, downToUpDelayMs: up, clickToWarpBackDelayMs: back, tapDebounceMs: 0)

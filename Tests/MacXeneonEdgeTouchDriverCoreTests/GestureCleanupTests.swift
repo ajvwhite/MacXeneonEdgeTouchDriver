@@ -278,7 +278,7 @@ final class GestureCleanupTests: XCTestCase {
 }
 
 private let near = CGPoint(x: 100, y: 200)
-private let far = CGPoint(x: 2_660, y: 920)
+private let far = CGPoint(x: CGFloat(2_660).nextDown, y: CGFloat(920).nextDown)
 
 private func timing(warp: Int = 0, up: Int = 0, back: Int = 0, debounce: Int = 0) -> GestureTiming {
     GestureTiming(warpToClickDelayMs: warp, downToUpDelayMs: up, clickToWarpBackDelayMs: back, tapDebounceMs: debounce)
