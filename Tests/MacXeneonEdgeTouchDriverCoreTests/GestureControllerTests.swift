@@ -1,5 +1,5 @@
 import CoreGraphics
-import MacXeneonEdgeTouchDriverCore
+@testable import MacXeneonEdgeTouchDriverCore
 import XCTest
 
 final class GestureControllerTests: XCTestCase {
@@ -145,7 +145,7 @@ final class GestureControllerTests: XCTestCase {
     }
 
     func testMoveBeforeDelayedMouseDownCancelsPendingMouseDown() {
-        let queue = DispatchQueue(label: "MacXeneonEdgeTouchDriverTests.delayed-move")
+        let scheduler = TestGestureScheduler()
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
         let controller = makeController(
@@ -157,17 +157,14 @@ final class GestureControllerTests: XCTestCase {
                 clickToWarpBackDelayMs: 0,
                 tapDebounceMs: 0
             ),
-            schedulingQueue: queue
+            scheduler: scheduler
         )
-        let delayedWorkSettled = expectation(description: "delayed mouse-down work settled")
 
         controller.handle(event(.down, rawX: 0, rawY: 0))
+        XCTAssertTrue(input.calls.isEmpty)
         controller.handle(event(.move, rawX: 16_383, rawY: 9_599))
-        queue.asyncAfter(deadline: .now() + .milliseconds(150)) {
-            delayedWorkSettled.fulfill()
-        }
 
-        wait(for: [delayedWorkSettled], timeout: 1.0)
+        scheduler.advance(byMilliseconds: 150)
         XCTAssertEqual(
             input.calls,
             [
@@ -178,7 +175,7 @@ final class GestureControllerTests: XCTestCase {
     }
 
     func testDelayedTapSchedulesMouseUpThenCursorReturn() {
-        let queue = DispatchQueue(label: "MacXeneonEdgeTouchDriverTests.delayed-tap")
+        let scheduler = TestGestureScheduler()
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
         let controller = makeController(
@@ -190,12 +187,10 @@ final class GestureControllerTests: XCTestCase {
                 clickToWarpBackDelayMs: 50,
                 tapDebounceMs: 0
             ),
-            schedulingQueue: queue
+            scheduler: scheduler
         )
-        let becameIdle = expectation(description: "controller became idle after delayed tap")
-        controller.onBecameIdle = {
-            becameIdle.fulfill()
-        }
+        var idleTransitions = 0
+        controller.onBecameIdle = { idleTransitions += 1 }
 
         controller.handle(event(.down, rawX: 0, rawY: 0))
         controller.handle(event(.up, rawX: 0, rawY: 0))
@@ -203,14 +198,21 @@ final class GestureControllerTests: XCTestCase {
         XCTAssertEqual(input.calls, [.mouseDown(CGPoint(x: 100, y: 200))])
         XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200))])
 
-        wait(for: [becameIdle], timeout: 1.0)
+        scheduler.advance(toMilliseconds: 49)
+        XCTAssertEqual(input.calls, [.mouseDown(CGPoint(x: 100, y: 200))])
+        scheduler.advance(toMilliseconds: 50)
         XCTAssertEqual(input.calls, [.mouseDown(CGPoint(x: 100, y: 200)), .mouseUp(CGPoint(x: 100, y: 200))])
+        XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200))])
+        scheduler.advance(toMilliseconds: 99)
+        XCTAssertEqual(idleTransitions, 0)
+        scheduler.advance(toMilliseconds: 100)
         XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200)), .returnToOrigin])
         XCTAssertEqual(controller.state, .idle)
+        XCTAssertEqual(idleTransitions, 1)
     }
 
     func testForceCancelCancelsPendingMouseDownWork() {
-        let queue = DispatchQueue(label: "MacXeneonEdgeTouchDriverTests.cancel-pending")
+        let scheduler = TestGestureScheduler()
         let input = RecordingInputSink()
         let cursor = RecordingCursorController()
         let controller = makeController(
@@ -222,17 +224,13 @@ final class GestureControllerTests: XCTestCase {
                 clickToWarpBackDelayMs: 0,
                 tapDebounceMs: 0
             ),
-            schedulingQueue: queue
+            scheduler: scheduler
         )
-        let delayedWorkSettled = expectation(description: "pending mouse-down work settled")
 
         controller.handle(event(.down, rawX: 0, rawY: 0))
         controller.forceCancel()
-        queue.asyncAfter(deadline: .now() + .milliseconds(150)) {
-            delayedWorkSettled.fulfill()
-        }
 
-        wait(for: [delayedWorkSettled], timeout: 1.0)
+        scheduler.advance(byMilliseconds: 150)
         XCTAssertTrue(input.calls.isEmpty)
         XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200)), .returnToOrigin])
         XCTAssertEqual(controller.state, .idle)
@@ -243,7 +241,7 @@ final class GestureControllerTests: XCTestCase {
         cursor: RecordingCursorController,
         focus: FocusRestorer = NoOpFocusRestorer(),
         timing: GestureTiming = .immediate,
-        schedulingQueue: DispatchQueue? = nil
+        scheduler: GestureScheduler = DispatchGestureScheduler(queue: nil)
     ) -> GestureController {
         let mapper = CoordinateMapper(displayBounds: CGRect(x: 100, y: 200, width: 2_560, height: 720))
         return GestureController(
@@ -252,7 +250,7 @@ final class GestureControllerTests: XCTestCase {
             cursorController: cursor,
             focusRestorer: focus,
             timing: timing,
-            schedulingQueue: schedulingQueue
+            scheduler: scheduler
         )
     }
 

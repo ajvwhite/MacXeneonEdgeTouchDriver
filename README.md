@@ -52,6 +52,18 @@ Build a signed release binary:
 
 By default this uses ad-hoc signing. Set `CODESIGN_IDENTITY` for Developer ID signing and `NOTARIZATION_PROFILE` to submit the release archive with `xcrun notarytool`.
 
+## Development checks
+
+Run the native tests and both build configurations on macOS:
+
+```sh
+swift test
+swift build --configuration debug
+swift build --configuration release
+```
+
+The unit tests use fake input, cursor, and focus dependencies. Delayed gesture tests advance a virtual clock instead of waiting for real time. These checks do not install or run the driver, require attached hardware, or request macOS permissions. GitHub Actions runs the same checks on macOS for pushes and pull requests.
+
 ## Configuration
 
 Optional config file:
