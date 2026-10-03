@@ -104,3 +104,7 @@ All fields are optional. Missing or malformed config falls back to defaults and 
 - If HID open fails, check Input Monitoring permission and confirm no other process has seized the same VID/PID device.
 - If taps land on the wrong display, run `swift run DisplayInfo` and adjust the optional display config override.
 - For HID investigation, use `swift run HIDDump`; it intentionally runs in non-seize mode and is separate from the production daemon.
+
+## Contributors
+
+Thanks to [Clark Hager](https://github.com/clarkhager) for the focus guard proposed in [PR #5](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/pull/5). That guard is the basis of the implementation and regression tests under review in [PR #10](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/pull/10). Neither PR has been merged yet.
