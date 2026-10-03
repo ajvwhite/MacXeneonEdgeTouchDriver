@@ -1,0 +1,23 @@
+name: macOS
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Swift version
+        run: swift --version
+      - name: Unit tests
+        run: swift test
+      - name: Debug build
+        run: swift build --configuration debug
+      - name: Release build
+        run: swift build --configuration release

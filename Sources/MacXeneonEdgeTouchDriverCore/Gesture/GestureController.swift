@@ -11,17 +11,17 @@ public final class GestureController {
 
     private let mapperProvider: () -> CoordinateMapper?
     private let timing: GestureTiming
-    private let schedulingQueue: DispatchQueue?
+    private let scheduler: GestureScheduler
     private let inputSink: SyntheticInputSink
     private let cursorController: CursorController
     private let focusRestorer: FocusRestorer
-    private var pendingMouseDown: DispatchWorkItem?
-    private var pendingMouseUp: DispatchWorkItem?
-    private var pendingCursorReturn: DispatchWorkItem?
+    private var pendingMouseDown: GestureScheduledTask?
+    private var pendingMouseUp: GestureScheduledTask?
+    private var pendingCursorReturn: GestureScheduledTask?
     private var lastCompletedTouchTimestamp: DispatchTime?
 
     /// Creates a single-touch gesture controller.
-    public init(
+    public convenience init(
         mapperProvider: @escaping () -> CoordinateMapper?,
         inputSink: SyntheticInputSink,
         cursorController: CursorController,
@@ -29,12 +29,30 @@ public final class GestureController {
         timing: GestureTiming = .immediate,
         schedulingQueue: DispatchQueue? = nil
     ) {
+        self.init(
+            mapperProvider: mapperProvider,
+            inputSink: inputSink,
+            cursorController: cursorController,
+            focusRestorer: focusRestorer,
+            timing: timing,
+            scheduler: DispatchGestureScheduler(queue: schedulingQueue)
+        )
+    }
+
+    init(
+        mapperProvider: @escaping () -> CoordinateMapper?,
+        inputSink: SyntheticInputSink,
+        cursorController: CursorController,
+        focusRestorer: FocusRestorer = NoOpFocusRestorer(),
+        timing: GestureTiming = .immediate,
+        scheduler: GestureScheduler
+    ) {
         self.mapperProvider = mapperProvider
         self.inputSink = inputSink
         self.cursorController = cursorController
         self.focusRestorer = focusRestorer
         self.timing = timing
-        self.schedulingQueue = schedulingQueue
+        self.scheduler = scheduler
     }
 
     /// Handles one normalized touch event.
@@ -221,16 +239,8 @@ public final class GestureController {
         pendingCursorReturn = nil
     }
 
-    private func schedule(after milliseconds: Int, action: @escaping () -> Void) -> DispatchWorkItem {
-        let workItem = DispatchWorkItem(block: action)
-
-        guard milliseconds > 0, let schedulingQueue else {
-            workItem.perform()
-            return workItem
-        }
-
-        schedulingQueue.asyncAfter(deadline: .now() + .milliseconds(milliseconds), execute: workItem)
-        return workItem
+    private func schedule(after milliseconds: Int, action: @escaping () -> Void) -> GestureScheduledTask {
+        scheduler.schedule(afterMilliseconds: milliseconds, action: action)
     }
 
     private func isDebounced(_ timestamp: DispatchTime) -> Bool {
