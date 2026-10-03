@@ -54,10 +54,11 @@ public final class MacXeneonEdgeTouchDriverApplication {
     private var stuckGestureTimer: GestureScheduledTask?
     private var stuckGestureTimerGeneration: UInt64 = 0
     private var currentDisplaySnapshot: DisplaySnapshot?
-    private var didRegisterDisplayCallback = false
+    private var displayCallbackRegistration: DisplayReconfigurationRegistration?
     private let startupDependencies: DriverStartupDependencies
     private let monitoringOverride: DriverMonitoringHooks?
     private var startupCoordinator: DriverStartupCoordinator?
+    private var didShutdownFocus = false
 
     /// Creates a production application with CoreGraphics side effects.
     public convenience init(configuration: DriverConfiguration = .defaults) {
@@ -160,33 +161,50 @@ public final class MacXeneonEdgeTouchDriverApplication {
     }
 
     deinit {
-        stop()
+        // run() owns the complete main-thread hardware lifecycle and pins self
+        // until teardown is finished. A completed application's last reference
+        // may be released by a gesture callback or by a library client off main;
+        // destruction must not re-enter main-only lifecycle operations.
+        shutdownFocus()
+    }
+
+    private func shutdownFocus() {
+        guard !didShutdownFocus else { return }
+        didShutdownFocus = true
+        focusRestorer.shutdown()
     }
 
     /// Starts one driver lifecycle on the main thread, waiting for permission if needed.
     public func run() -> Int32 {
         precondition(Thread.isMainThread, "Driver lifecycle must run on the main thread.")
-        if startupCoordinator == nil {
-            DriverLoggers.log(.notice, category: .lifecycle, "Starting Mac Xeneon Edge Touch Driver in single-touch mode.")
-            startupCoordinator = DriverStartupCoordinator(
-                dependencies: startupDependencies,
-                startHardware: { [weak self] in try self?.startMonitoring() },
-                stopHardware: { [weak self] in self?.stopMonitoring() }
-            )
+        if let startupCoordinator {
+            // A repeated or nested run must not tear down the owning run.
+            return startupCoordinator.run()
         }
-        return startupCoordinator!.run()
+        DriverLoggers.log(.notice, category: .lifecycle, "Starting Mac Xeneon Edge Touch Driver in single-touch mode.")
+        startupCoordinator = DriverStartupCoordinator(
+            dependencies: startupDependencies,
+            startHardware: { [weak self] in try self?.startMonitoring() },
+            stopHardware: { [weak self] in self?.stopMonitoring() }
+        )
+        return withExtendedLifetime(self) {
+            // Waiting, startup failure, and normal exit all invalidate focus,
+            // even when the coordinator never acquired hardware.
+            defer { shutdownFocus() }
+            return startupCoordinator!.run()
+        }
     }
 
     /// Stops the lifecycle on the main thread. Waiting callbacks are invalidated before teardown.
     public func stop() {
+        precondition(Thread.isMainThread, "Driver lifecycle must stop on the main thread.")
         guard let startupCoordinator else {
-            focusRestorer.shutdown()
+            shutdownFocus()
             return
         }
-        precondition(Thread.isMainThread, "Driver lifecycle must stop on the main thread.")
         startupCoordinator.stop()
         // Waiting has no hardware teardown; invalidate any remaining focus work too.
-        focusRestorer.shutdown()
+        shutdownFocus()
     }
 
     private func startMonitoring() throws {
@@ -203,17 +221,17 @@ public final class MacXeneonEdgeTouchDriverApplication {
 
     private func stopMonitoring() {
         // Signal-driven coordinator teardown also needs early focus invalidation.
-        focusRestorer.shutdown()
+        shutdownFocus()
         if let monitoringOverride {
             monitoringOverride.stop()
         } else {
             hidMonitor.stop()
         }
+        // Close callback admission before the drain. Removal is not assumed to
+        // fence a callback already selected by CoreGraphics, including on error.
+        unregisterDisplayReconfigurationCallback()
         gestureQueue.sync {
             cancelActiveGesture()
-        }
-        if monitoringOverride == nil {
-            unregisterDisplayReconfigurationCallback()
         }
     }
 
@@ -351,34 +369,20 @@ public final class MacXeneonEdgeTouchDriverApplication {
         stuckGestureTimer = nil
     }
 
-    private func registerDisplayReconfigurationCallback() {
-        guard !didRegisterDisplayCallback else {
-            return
-        }
-
-        let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        let result = CGDisplayRegisterReconfigurationCallback(displayReconfigurationCallback, context)
-
-        if result == .success {
-            didRegisterDisplayCallback = true
-        } else {
-            DriverLoggers.log(.error, category: .display, "CGDisplayRegisterReconfigurationCallback failed with \(result.rawValue).")
-        }
+    /// Internal registration seam keeps tests on the exact production ingress.
+    func registerDisplayReconfigurationCallback(operations: DisplayReconfigurationRegistration.Operations = .live) {
+        precondition(Thread.isMainThread, "Display registration must use the main thread.")
+        guard displayCallbackRegistration == nil else { return }
+        let registration = DisplayReconfigurationRegistration(application: self, operations: operations)
+        displayCallbackRegistration = registration
+        registration.start()
     }
 
     private func unregisterDisplayReconfigurationCallback() {
-        guard didRegisterDisplayCallback else {
-            return
-        }
-
-        let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        let result = CGDisplayRemoveReconfigurationCallback(displayReconfigurationCallback, context)
-
-        if result != .success {
-            DriverLoggers.log(.error, category: .display, "CGDisplayRemoveReconfigurationCallback failed with \(result.rawValue).")
-        }
-        didRegisterDisplayCallback = false
+        displayCallbackRegistration?.stop()
+        displayCallbackRegistration = nil
     }
+
 }
 
 private final class CoordinateMapperStore {
@@ -425,13 +429,4 @@ private final class CoordinateMapperStore {
         }
         return true
     }
-}
-
-private let displayReconfigurationCallback: CGDisplayReconfigurationCallBack = { _, flags, context in
-    guard let context else {
-        return
-    }
-
-    let application = Unmanaged<MacXeneonEdgeTouchDriverApplication>.fromOpaque(context).takeUnretainedValue()
-    application.enqueueDisplayReconfiguration(flags: flags)
 }

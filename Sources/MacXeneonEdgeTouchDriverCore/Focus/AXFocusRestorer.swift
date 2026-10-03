@@ -4,6 +4,12 @@ import Foundation
 /// Best-effort focus transactions. Main owns Workspace and observer run-loop sources;
 /// a single worker owns AX. Neither queue waits synchronously for the other.
 public final class AXFocusRestorer: FocusRestorer {
+    // Each executor must enqueue once, asynchronously and FIFO on its assigned
+    // serial queue. Main owns Workspace/source attachment; worker owns AX and
+    // observation disposal; callback owns the caller's gesture state. A stage
+    // transfers its work to the next queue only after its own mutations finish.
+    // This is an execution/ownership contract, not a Sendable claim about the
+    // injected backend, Workspace monitor, Session, clock or client completion.
     typealias Enqueue = (@escaping () -> Void) -> Void
 
     private final class Session {
@@ -30,7 +36,9 @@ public final class AXFocusRestorer: FocusRestorer {
     private var session: Session?
     private var hasStarted = false
 
-    /// Callback delivery belongs to the caller's serial gesture queue.
+    /// Callback delivery belongs to the caller's serial gesture queue. Use the same
+    /// queue for gesture handling, timers and final cancellation. Do not supply a
+    /// concurrent queue or mutate completion-owned state from another queue.
     public convenience init(callbackQueue: DispatchQueue = .main) {
         let worker = DispatchQueue(label: "\(DriverLoggers.subsystem).focus-ax")
         self.init(
@@ -42,6 +50,9 @@ public final class AXFocusRestorer: FocusRestorer {
         )
     }
 
+    /// Injected executors obey the ownership contract above. The clock must support
+    /// concurrent reads from all callers; backend and Workspace access stay on their
+    /// designated queues. Captured dependencies must outlive pending queued work.
     init(backend: AXFocusBackendProtocol, workspace: WorkspaceFocusMonitoring,
          onMain: @escaping Enqueue, onWorker: @escaping Enqueue,
          onCallback: @escaping Enqueue, now: @escaping () -> UInt64) {
@@ -174,6 +185,9 @@ public final class AXFocusRestorer: FocusRestorer {
     public func discardCapturedWindow() { invalidate(shutdown: false) }
 
     /// Terminal for this coordinator; restarting the driver creates a new instance.
+    /// Prevents new preparation-callback admission, but does not wait for an already
+    /// admitted completion. After stopping new input producers, the caller must
+    /// cancel/drain its serial gesture queue if it needs a final input-effect fence.
     public func shutdown() {
         invalidate(shutdown: true)
         // This never waits for AX, including observer deregistration.
@@ -435,6 +449,11 @@ public final class AXFocusRestorer: FocusRestorer {
 
     private func deliverPreparation(_ completion: @escaping () -> Void, prepared: Session? = nil) {
         onCallback { [weak self] in
+            // Admission is the stopped check, not completion return. Shutdown can
+            // invalidate the token immediately after this check. Calling client
+            // code under sessionLock (or waiting for it in shutdown) would break
+            // reentrant completion and nonblocking shutdown; the caller's serial
+            // gesture queue provides the subsequent cancellation/drain boundary.
             guard let self, !self.state.isStopped else { return }
             if let prepared {
                 self.sessionLock.lock()

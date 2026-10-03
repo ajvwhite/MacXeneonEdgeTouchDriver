@@ -8,6 +8,8 @@ struct WorkspaceFocusSnapshot {
     let sessionActive: Bool
 }
 
+/// Methods and observation delivery belong to main. Observations are synchronous
+/// invalidation hints; moving them to a later queue turn changes focus eligibility.
 protocol WorkspaceFocusMonitoring: AnyObject {
     func start(observation: @escaping (FocusObservationEvent) -> Void)
     func snapshot() -> WorkspaceFocusSnapshot
@@ -29,6 +31,11 @@ final class WorkspaceFocusMonitor: WorkspaceFocusMonitoring {
         var frontmostApplication: () -> AXFocusWorkspaceApplication?
         var application: (pid_t) -> AXFocusWorkspaceApplication?
         var sessionIsActive: () -> Bool?
+        // Register on main and deliver every handler invocation on main. The
+        // returned removal closure is also invoked on main, once per registration.
+        // It must retain its registration resources until removal and must not
+        // require the monitor to remain alive. Already queued notifications may
+        // still arrive after removal; the weak/generation guards reject them.
         var observe: (@escaping (Event) -> Void) -> (() -> Void)
 
         // Construct per monitor; workspace access and observer callbacks remain main-thread confined.
@@ -86,6 +93,10 @@ final class WorkspaceFocusMonitor: WorkspaceFocusMonitoring {
     }
 
     deinit {
+        // No callback can concurrently own this instance at final release: observer
+        // delivery promotes weak self for its duration. Transfer only the removal
+        // closure, which retains the registration resources independently, to main.
+        // The closure must never capture this monitor strongly.
         let stop = stopObserving
         if Thread.isMainThread { stop?() }
         else { DispatchQueue.main.async { stop?() } }

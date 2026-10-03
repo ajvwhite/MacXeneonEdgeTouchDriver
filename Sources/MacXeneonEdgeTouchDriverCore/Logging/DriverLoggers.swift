@@ -115,12 +115,18 @@ public enum DriverLoggers {
 }
 
 // Internal I/O seams keep failure and recovery tests independent of filesystem timing.
+// An opened handle transfers exclusive use of its resource to this logger. Its
+// closures are called synchronously under the logger lock, except for final close
+// in deinit, after the last logger owner is released. They must not escape work
+// that accesses the handle later, or call back into this logger.
 struct DriverFileLogHandle {
     var write: (Data) throws -> Void
     var offset: () throws -> UInt64
     var close: () throws -> Void
 }
 
+// These closures share the injection contract documented on DriverFileLog.init.
+// Invocation serialization does not protect externally aliased callback captures.
 struct DriverFileLogOperations {
     var open: (URL, FileManager) throws -> DriverFileLogHandle
     var size: (URL, FileManager) -> UInt64?
@@ -169,6 +175,11 @@ struct DriverFileLogOperations {
 }
 
 /// Mirrors driver log messages to a rotating diagnostics file.
+///
+/// Calls to configure and write serialize all logger-owned state. This does not
+/// synchronize arbitrary externally shared dependencies supplied to the internal
+/// initializer, or mutation of a custom FileManager/delegate supplied to configure.
+/// This class intentionally does not assert a universal Sendable contract.
 public final class DriverFileLog {
     /// Shared diagnostics file writer.
     public static let shared = DriverFileLog()
@@ -196,6 +207,17 @@ public final class DriverFileLog {
         )
     }
 
+    // Injection ownership contract:
+    // - configure/write invoke callbacks synchronously under the same NSLock.
+    //   They must not directly or indirectly reenter this logger, including via
+    //   DriverLoggers.log when this is the shared sink, or wait on work needing it.
+    //   Failure reporting must not reenter this sink; the default uses os.Logger.
+    // - Captured mutable resources must be exclusively transferred to the logger,
+    //   or protect every access (including external fixture access) themselves.
+    //   The logger lock serializes invocation, not aliases outside the logger.
+    // - Handle callbacks obey DriverFileLogHandle's final-release contract above;
+    //   final close can run on whichever thread releases the last logger owner.
+    // These are caller obligations, not properties enforced by closure types.
     init(
         dateProvider: @escaping () -> Date,
         timeZoneProvider: @escaping () -> TimeZone,
@@ -217,10 +239,14 @@ public final class DriverFileLog {
     }
 
     deinit {
+        // There is no logger-owned asynchronous work. Callers retain the logger
+        // for admitted calls; final close needs no lock after the last release.
         try? fileHandle?.close()
     }
 
     /// Opens the diagnostics log file. Pass `nil` or an empty path to disable file logging.
+    /// A custom file manager and its delegate must not reenter this logger or be
+    /// mutated concurrently without their own synchronization.
     public func configure(
         fileLogPath: String?,
         maxBytes: Int,

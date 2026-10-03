@@ -28,6 +28,7 @@ final class ApplicationPermissionStartupTests: XCTestCase {
         XCTAssertEqual(stops, 0)
         XCTAssertTrue(effects.calls.isEmpty)
         XCTAssertEqual(startup.permissions.requestCount, 1)
+        XCTAssertEqual(effects.shutdownCount, 1, "Waiting exit invalidates focus without attempting capture or restore.")
     }
 
     func testGrantDuringApplicationRunStartsMonitoringOnlyOnce() {
@@ -122,6 +123,8 @@ private enum ApplicationStartupError: Error { case hardware }
 
 private final class StartupRecordingEffects: SyntheticInputSink, CursorController, FocusRestorer {
     var calls: [String] = []
+    private(set) var shutdownCount = 0
+    func shutdown() { shutdownCount += 1 }
     func postMouseDown(at point: CGPoint) { calls.append("mouseDown") }
     func postMouseUp(at point: CGPoint) { calls.append("mouseUp") }
     func postMouseDragged(to point: CGPoint) { calls.append("mouseDragged") }

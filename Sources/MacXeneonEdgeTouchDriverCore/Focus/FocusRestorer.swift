@@ -21,6 +21,9 @@ public protocol FocusRestorer: AnyObject {
     func discardCapturedWindow()
 
     /// Invalidates outstanding work without waiting for an Accessibility request to return.
+    /// A completion already admitted on the gesture queue may still finish. The
+    /// owner must stop new input producers, then cancel/drain that same serial queue
+    /// if it requires a final boundary for gesture-side effects; shutdown is not that drain.
     func shutdown()
 }
 

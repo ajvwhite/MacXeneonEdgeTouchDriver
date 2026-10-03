@@ -16,6 +16,10 @@ public enum HIDDeviceMonitorError: Error, LocalizedError, Equatable {
 }
 
 /// Monitors the Xeneon Edge HID device and emits parsed single-touch events.
+/// An active monitor must be retained and stopped on main before its final release.
+/// The supplied event queue must be serial; handlers and their captured state
+/// belong to that queue. stop() closes HID ingress, but already-enqueued handlers
+/// may still run: owners must drain their event queue before releasing that state.
 public final class HIDDeviceMonitor {
     /// Receives parsed touch events on the configured event queue.
     public typealias TouchEventHandler = (TouchEvent) -> Void
@@ -37,6 +41,7 @@ public final class HIDDeviceMonitor {
     private let openOptions: IOOptionBits
 
     private var reportRegistrations: [HIDReportRegistration] = []
+    private var managerCallbackRegistration: HIDManagerCallbackRegistration?
     private var isStarted = false
 
     /// Creates a HID monitor for the Xeneon Edge touchscreen controller.
@@ -78,7 +83,9 @@ public final class HIDDeviceMonitor {
             kIOHIDVendorIDKey as String: XeneonEdgeDevice.vendorID,
             kIOHIDProductIDKey as String: XeneonEdgeDevice.productID
         ]
-        let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        let callbacks = HIDManagerCallbackRegistration(monitor: self)
+        managerCallbackRegistration = callbacks
+        let context = callbacks.context
 
         IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
         IOHIDManagerRegisterDeviceMatchingCallback(manager, hidDeviceMatchedCallback, context)
@@ -87,6 +94,10 @@ public final class HIDDeviceMonitor {
 
         let openResult = IOHIDManagerOpen(manager, openOptions)
         guard openResult == kIOReturnSuccess else {
+            callbacks.invalidate()
+            managerCallbackRegistration = nil
+            IOHIDManagerRegisterDeviceMatchingCallback(manager, nil, nil)
+            IOHIDManagerRegisterDeviceRemovalCallback(manager, nil, nil)
             IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
             throw HIDDeviceMonitorError.openFailed(openResult)
         }
@@ -103,6 +114,10 @@ public final class HIDDeviceMonitor {
 
         precondition(Thread.isMainThread, "HID monitoring must stop on the main thread.")
         isStarted = false
+        managerCallbackRegistration?.invalidate()
+        managerCallbackRegistration = nil
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, nil, nil)
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, nil, nil)
         reportRegistrations.forEach { $0.input.invalidate() }
         IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         IOHIDManagerClose(manager, openOptions)
@@ -112,6 +127,7 @@ public final class HIDDeviceMonitor {
     }
 
     fileprivate func handleDeviceMatched(_ device: IOHIDDevice) {
+        precondition(Thread.isMainThread, "HID callbacks must use the main run loop.")
         guard isStarted, !reportRegistrations.contains(where: { $0.matches(device) }) else {
             return
         }
@@ -145,6 +161,7 @@ public final class HIDDeviceMonitor {
     }
 
     fileprivate func handleDeviceRemoved(_ device: IOHIDDevice) {
+        precondition(Thread.isMainThread, "HID callbacks must use the main run loop.")
         guard isStarted else { return }
         let removed = reportRegistrations.filter { $0.matches(device) }
         removed.forEach { $0.input.invalidate() }
@@ -164,6 +181,7 @@ public final class HIDDeviceMonitor {
     }
 
     private func handleInputReport(reportID: UInt32, bytes: [UInt8], timestamp: DispatchTime) {
+        precondition(Thread.isMainThread, "HID reports must use the main run loop.")
         guard isStarted, let event = parser.parseReport(
             reportID: Int(reportID),
             bytes: bytes,
@@ -223,33 +241,30 @@ private final class HIDReportRegistration {
     }
 }
 
-private let hidDeviceMatchedCallback: IOHIDDeviceCallback = { context, _, _, device in
-    guard let context else {
-        return
-    }
-
-    let monitor = Unmanaged<HIDDeviceMonitor>.fromOpaque(context).takeUnretainedValue()
+private func hidDeviceMatchedCallback(
+    _ context: UnsafeMutableRawPointer?, _ result: IOReturn,
+    _ sender: UnsafeMutableRawPointer?, _ device: IOHIDDevice
+) {
+    guard let monitor = HIDManagerCallbackRegistration.monitor(for: context) else { return }
     monitor.handleDeviceMatched(device)
 }
 
-private let hidDeviceRemovedCallback: IOHIDDeviceCallback = { context, _, _, device in
-    guard let context else {
-        return
-    }
-
-    let monitor = Unmanaged<HIDDeviceMonitor>.fromOpaque(context).takeUnretainedValue()
+private func hidDeviceRemovedCallback(
+    _ context: UnsafeMutableRawPointer?, _ result: IOReturn,
+    _ sender: UnsafeMutableRawPointer?, _ device: IOHIDDevice
+) {
+    guard let monitor = HIDManagerCallbackRegistration.monitor(for: context) else { return }
     monitor.handleDeviceRemoved(device)
 }
 
-private let hidInputReportCallback: IOHIDReportCallback = { context, result, sender, type, reportID, report, reportLength in
+private func hidInputReportCallback(
+    _ context: UnsafeMutableRawPointer?, _ result: IOReturn,
+    _ sender: UnsafeMutableRawPointer?, _ type: IOHIDReportType,
+    _ reportID: UInt32, _ report: UnsafeMutablePointer<UInt8>, _ reportLength: CFIndex
+) {
     HIDInputReportRegistration.handleCallback(
-        context: context,
-        result: result,
-        sender: sender,
-        type: type,
-        reportID: reportID,
-        report: report,
-        reportLength: reportLength
+        context: context, result: result, sender: sender, type: type,
+        reportID: reportID, report: report, reportLength: reportLength
     )
 }
 

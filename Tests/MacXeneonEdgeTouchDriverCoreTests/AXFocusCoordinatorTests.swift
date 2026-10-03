@@ -443,6 +443,135 @@ final class AXFocusCoordinatorTests: XCTestCase {
         XCTAssertGreaterThan(f.workspace.stopCount, 0)
     }
 
+    func testAdmittedPreparationCanFinishAfterNonblockingShutdown() {
+        let f = FocusCoordinatorFixture()
+        let callbackQueue = DispatchQueue(label: "test.focus.admitted-callback")
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = expectation(description: "admitted callback and queue fence returned")
+        let effect = FocusLockedFlag()
+        let gateTimedOut = FocusLockedFlag()
+        f.restorer.prepareFocusedWindow {
+            dispatchPrecondition(condition: .onQueue(callbackQueue))
+            entered.signal()
+            if release.wait(timeout: .now() + 5) != .success { gateTimedOut.set() }
+            effect.set()
+        }
+        f.pump(includeCallbacks: false)
+        XCTAssertEqual(f.callbacks.jobs.count, 1)
+
+        // Transfer the manual callback executor to a real serial queue for this
+        // phase. Do not read it again until the marker after runAll has returned.
+        callbackQueue.async { [callbacks = f.callbacks] in
+            callbacks.runAll()
+            finished.fulfill()
+        }
+        defer { release.signal() }
+        guard entered.wait(timeout: .now() + 2) == .success else {
+            XCTFail("Preparation completion was not admitted")
+            return
+        }
+
+        f.restorer.shutdown()
+        XCTAssertFalse(effect.isSet, "Shutdown must return while an admitted client is still blocked")
+        // Main and AX cleanup are independent of the blocked client completion.
+        f.pump(includeCallbacks: false)
+        XCTAssertEqual(f.backend.observers.first?.invalidations, 1)
+        XCTAssertGreaterThan(f.workspace.stopCount, 0)
+        release.signal()
+        guard XCTWaiter.wait(for: [finished], timeout: 2) == .completed else {
+            XCTFail("Admitted completion did not finish; dependent fixture reads are unsafe")
+            return
+        }
+        XCTAssertFalse(gateTimedOut.isSet)
+        XCTAssertTrue(effect.isSet, "Admission, not shutdown return, owns this completion")
+        f.restorer.inputDidEnd()
+        f.restorer.restoreCapturedWindow()
+        f.pump()
+        XCTAssertEqual(f.backend.attemptCount, 0, "An admitted completion cannot revive stopped focus work")
+        XCTAssertEqual(f.backend.observers.first?.invalidations, 1)
+    }
+
+    func testPreparationCompletionCanReenterShutdownWithoutHoldingSessionLock() {
+        for observationSucceeds in [true, false] {
+            let f = FocusCoordinatorFixture()
+            f.backend.observationSucceeds = observationSucceeds
+            let callbackQueue = DispatchQueue(label: "test.focus.reentrant-callback")
+            let finished = expectation(description: "reentrant completion returned: \(observationSucceeds)")
+            let completed = FocusLockedFlag()
+            let lateCompletion = FocusLockedFlag()
+            f.restorer.prepareFocusedWindow {
+                dispatchPrecondition(condition: .onQueue(callbackQueue))
+                f.restorer.inputDidEnd()
+                f.restorer.discardCapturedWindow()
+                f.restorer.shutdown()
+                f.restorer.prepareFocusedWindow { lateCompletion.set() }
+                completed.set()
+            }
+            f.pump(includeCallbacks: false)
+            callbackQueue.async { [callbacks = f.callbacks] in
+                // Main/worker executors are quiescent while the callback enqueues
+                // its reentrant cleanup. The completion marker transfers them back.
+                callbacks.runAll()
+                finished.fulfill()
+            }
+            guard XCTWaiter.wait(for: [finished], timeout: 2) == .completed else {
+                XCTFail("Client completion deadlocked during reentrant shutdown; no dependent fixture access follows")
+                return
+            }
+            XCTAssertTrue(completed.isSet)
+            f.pump()
+            XCTAssertFalse(lateCompletion.isSet)
+            XCTAssertEqual(f.backend.attemptCount, 0)
+            XCTAssertTrue(f.backend.observers.allSatisfy { $0.invalidations == 1 })
+        }
+    }
+
+    func testSerialGestureCancellationFencesInputFromAnAdmittedCompletion() {
+        let f = CoordinatorGestureFixture(upDelay: 20, executeCancelledActions: true)
+        let callbackQueue = DispatchQueue(label: "test.focus.gesture-drain")
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let drained = expectation(description: "serial gesture cancellation returned")
+        let gateTimedOut = FocusLockedFlag()
+        f.effects.onMouseDown = {
+            dispatchPrecondition(condition: .onQueue(callbackQueue))
+            entered.signal()
+            if release.wait(timeout: .now() + 5) != .success { gateTimedOut.set() }
+        }
+        f.send(.down, at: 0)
+        f.focus.pump(includeCallbacks: false)
+        callbackQueue.async { [callbacks = f.focus.callbacks] in callbacks.runAll() }
+        defer { release.signal() }
+        guard entered.wait(timeout: .now() + 2) == .success else {
+            XCTFail("Admitted gesture did not reach fake mouse-down")
+            return
+        }
+
+        // This is the application's ordering: terminal focus invalidation first,
+        // then cancellation on the same serial queue as the admitted completion.
+        f.focus.restorer.shutdown()
+        callbackQueue.async { [controller = f.controller] in
+            controller.forceCancel()
+            drained.fulfill()
+        }
+        release.signal()
+        guard XCTWaiter.wait(for: [drained], timeout: 2) == .completed else {
+            XCTFail("Gesture queue did not drain; no dependent fixture access follows")
+            return
+        }
+        XCTAssertFalse(gateTimedOut.isSet)
+        XCTAssertEqual(f.effects.actions, [.borrow, .down, .up, .release(true)])
+        XCTAssertEqual(f.controller.state, .idle)
+        let afterDrain = f.effects.actions
+        f.focus.pump()
+        f.advance(to: 2_000)
+        f.focus.pump()
+        XCTAssertEqual(f.effects.actions, afterDrain, "Late focus/timer work must not recreate input after cancellation")
+        XCTAssertEqual(f.focus.backend.attemptCount, 0)
+        XCTAssertTrue(f.focus.backend.observers.allSatisfy { $0.invalidations == 1 })
+    }
+
     func testDiscardBeforeMainStageDoesNotStartWorkspaceOrAX() {
         let f = FocusCoordinatorFixture()
         f.restorer.prepareFocusedWindow {}
@@ -638,8 +767,8 @@ private final class CoordinatorGestureFixture {
     let effects = CoordinatorGestureEffects()
     let controller: GestureController
 
-    init(upDelay: Int, warpDelay: Int = 0) {
-        let scheduler = TestGestureScheduler()
+    init(upDelay: Int, warpDelay: Int = 0, executeCancelledActions: Bool = false) {
+        let scheduler = TestGestureScheduler(executeCancelledActions: executeCancelledActions)
         let focus = FocusCoordinatorFixture(now: { scheduler.now.uptimeNanoseconds })
         let mapper = CoordinateMapper(displayBounds: CGRect(x: 100, y: 200, width: 2_560, height: 720))
         self.scheduler = scheduler
