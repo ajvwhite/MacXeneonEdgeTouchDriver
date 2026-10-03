@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Check the current target display before each touch-down, so missed display callbacks no longer leave taps at an old origin.
+- Drop new touches when the target is missing or has invalid bounds, instead of using its last-known coordinates. A configured display serial must match; it no longer falls back to another same-model panel. Without a configured serial, the existing pixel-size preference remains.
+- Pause routing during display reconfiguration and refresh after the change. Release owned input, return the cursor, and invalidate pending gesture and focus work before a changed mapping can drive another touch.
+
 ## 1.0.0 - 2026-05-03
 
 - Initial release of the single-touch Mac Xeneon Edge Touch Driver.

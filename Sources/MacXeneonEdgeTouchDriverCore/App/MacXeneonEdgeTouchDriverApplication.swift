@@ -49,6 +49,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
     private var stuckGestureTimer: GestureScheduledTask?
     private var stuckGestureTimerGeneration: UInt64 = 0
     private var signalSources: [DispatchSourceSignal] = []
+    private var currentDisplaySnapshot: DisplaySnapshot?
     private var didRegisterDisplayCallback = false
     private var isRunning = false
 
@@ -88,9 +89,10 @@ public final class MacXeneonEdgeTouchDriverApplication {
         inputSink: SyntheticInputSink,
         cursorController: CursorController,
         focusRestorer: FocusRestorer = NoOpFocusRestorer(),
-        scheduler: GestureScheduler?
+        scheduler: GestureScheduler?,
+        gestureQueue: DispatchQueue? = nil
     ) {
-        let gestureQueue = DispatchQueue(label: "\(DriverLoggers.subsystem).gesture-queue")
+        let gestureQueue = gestureQueue ?? DispatchQueue(label: "\(DriverLoggers.subsystem).gesture-queue")
         self.gestureQueue = gestureQueue
         self.scheduler = scheduler ?? DispatchGestureScheduler(queue: gestureQueue)
         self.configuration = configuration
@@ -117,8 +119,10 @@ public final class MacXeneonEdgeTouchDriverApplication {
             return EXIT_FAILURE
         }
 
-        refreshDisplayMapping(reason: "startup")
         registerDisplayReconfigurationCallback()
+        gestureQueue.sync {
+            refreshDisplayMapping(reason: "startup")
+        }
         installSignalHandlers()
 
         do {
@@ -151,33 +155,84 @@ public final class MacXeneonEdgeTouchDriverApplication {
         CFRunLoopStop(CFRunLoopGetMain())
     }
 
-    fileprivate func handleDisplayReconfiguration() {
+    func enqueueDisplayReconfiguration(flags: CGDisplayChangeSummaryFlags) {
+        // Begin notifications must block already-queued input before this handler can run.
+        let revision = mapperStore.recordReconfiguration(flags: flags)
         gestureQueue.async { [weak self] in
-            self?.refreshDisplayMapping(reason: "display reconfiguration")
+            self?.handleDisplayReconfiguration(flags: flags, revision: revision)
         }
     }
 
-    private func refreshDisplayMapping(reason: String) {
-        displayResolver.refresh()
-        mapperStore.currentMapper = displayResolver.currentMapper
+    /// Synchronous entry point for display decisions on the gesture queue.
+    func handleDisplayReconfiguration(flags: CGDisplayChangeSummaryFlags) {
+        let revision = mapperStore.recordReconfiguration(flags: flags)
+        handleDisplayReconfiguration(flags: flags, revision: revision)
+    }
 
-        if let bounds = displayResolver.currentBounds {
+    private func handleDisplayReconfiguration(flags: CGDisplayChangeSummaryFlags, revision: UInt64) {
+        guard mapperStore.isCurrent(revision: revision) else { return }
+        if flags.contains(.beginConfigurationFlag) {
+            // Apple sends one begin callback per online display, without final geometry.
+            // The post-change callback count can differ when a display is added or removed.
+            commitDisplaySnapshot(nil, revision: revision, reason: "display reconfiguration began")
+        } else {
+            // All display state is current before any post-change callback is delivered.
+            // A newer begin notification makes this queued decision obsolete.
+            refreshDisplayMapping(reason: "display reconfiguration completed", completingRevision: revision)
+        }
+    }
+
+    private func refreshDisplayMapping(reason: String, completingRevision: UInt64? = nil) {
+        guard let revision = completingRevision ?? mapperStore.settledRevision,
+              mapperStore.isCurrent(revision: revision) else { return }
+        // Resolve once and commit that exact snapshot, including a missing target.
+        commitDisplaySnapshot(
+            displayResolver.resolve(),
+            revision: revision,
+            completesReconfiguration: completingRevision != nil,
+            reason: reason
+        )
+    }
+
+    private func commitDisplaySnapshot(
+        _ snapshot: DisplaySnapshot?,
+        revision: UInt64,
+        completesReconfiguration: Bool = false,
+        reason: String
+    ) {
+        guard mapperStore.isCurrent(revision: revision) else { return }
+        let changed = snapshot != currentDisplaySnapshot || snapshot != displayResolver.currentSnapshot
+
+        if changed, currentDisplaySnapshot != nil {
+            // Release any owned button and invalidate delayed work before replacing geometry.
+            // Keeping this inline prevents old loss cleanup from cancelling a recovered touch.
+            focusRestorer.discardCapturedWindow()
+            cancelActiveGesture()
+        }
+        guard mapperStore.update(
+            snapshot.map { CoordinateMapper(displayBounds: $0.bounds) },
+            revision: revision,
+            completesReconfiguration: completesReconfiguration
+        ) else { return }
+        currentDisplaySnapshot = snapshot
+        displayResolver.update(with: snapshot)
+        guard changed else { return }
+
+        if let snapshot {
+            let bounds = snapshot.bounds
             DriverLoggers.log(
                 .notice,
                 category: .display,
-                "Resolved Xeneon Edge display after \(reason): x=\(bounds.origin.x), y=\(bounds.origin.y), width=\(bounds.width), height=\(bounds.height)."
+                "Resolved Xeneon Edge display \(snapshot.displayID) after \(reason): x=\(bounds.origin.x), y=\(bounds.origin.y), width=\(bounds.width), height=\(bounds.height)."
             )
         } else {
             DriverLoggers.log(.error, category: .display, "Could not resolve Xeneon Edge display after \(reason). Touch events will be dropped.")
-            gestureQueue.async { [weak self] in
-                self?.cancelActiveGesture()
-            }
         }
     }
 
     func handleTouchEvent(_ event: TouchEvent) {
-        if mapperStore.currentMapper == nil {
-            refreshDisplayMapping(reason: "touch event without display mapper")
+        if event.kind == .down {
+            refreshDisplayMapping(reason: "touch down")
         }
 
         gestureController.handle(event)
@@ -328,26 +383,54 @@ public final class MacXeneonEdgeTouchDriverApplication {
 private final class CoordinateMapperStore {
     private let lock = NSLock()
     private var storedMapper: CoordinateMapper?
+    private var revision: UInt64 = 0
+    private var isReconfiguring = false
 
     var currentMapper: CoordinateMapper? {
-        get {
-            lock.lock()
-            defer { lock.unlock() }
-            return storedMapper
+        lock.lock()
+        defer { lock.unlock() }
+        return isReconfiguring ? nil : storedMapper
+    }
+
+    var settledRevision: UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        return isReconfiguring ? nil : revision
+    }
+
+    func recordReconfiguration(flags: CGDisplayChangeSummaryFlags) -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        if flags.contains(.beginConfigurationFlag) {
+            revision &+= 1
+            isReconfiguring = true
         }
-        set {
-            lock.lock()
-            storedMapper = newValue
-            lock.unlock()
+        return revision
+    }
+
+    func isCurrent(revision: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return self.revision == revision
+    }
+
+    func update(_ mapper: CoordinateMapper?, revision: UInt64, completesReconfiguration: Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.revision == revision else { return false }
+        storedMapper = mapper
+        if completesReconfiguration {
+            isReconfiguring = false
         }
+        return true
     }
 }
 
-private let displayReconfigurationCallback: CGDisplayReconfigurationCallBack = { _, _, context in
+private let displayReconfigurationCallback: CGDisplayReconfigurationCallBack = { _, flags, context in
     guard let context else {
         return
     }
 
     let application = Unmanaged<MacXeneonEdgeTouchDriverApplication>.fromOpaque(context).takeUnretainedValue()
-    application.handleDisplayReconfiguration()
+    application.enqueueDisplayReconfiguration(flags: flags)
 }

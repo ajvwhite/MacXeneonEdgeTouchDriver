@@ -77,6 +77,9 @@ public final class GestureController {
         }
 
         guard let mapper = mapperProvider() else {
+            if case .singleTouch = state {
+                cancelForMissingMapper()
+            }
             if event.kind == .down {
                 rejectedContactIDs.insert(event.contactID)
             }
@@ -95,6 +98,12 @@ public final class GestureController {
             }
 
             focusRestorer.captureFocusedWindow()
+            guard mapperProvider() != nil else {
+                rejectedContactIDs.insert(event.contactID)
+                focusRestorer.discardCapturedWindow()
+                DriverLoggers.log(.warning, category: .gesture, "Dropping touch down because the display mapper was lost during focus capture.")
+                return
+            }
             guard cursorController.borrow(warpingTo: point) else {
                 rejectedContactIDs.insert(event.contactID)
                 focusRestorer.discardCapturedWindow()
@@ -126,6 +135,10 @@ public final class GestureController {
 
             ensureMouseDownPosted()
             guard case .singleTouch(var currentContext) = state else {
+                return
+            }
+            guard mapperProvider() != nil else {
+                cancelForMissingMapper()
                 return
             }
 
@@ -239,11 +252,21 @@ public final class GestureController {
         guard !context.isMouseDownPosted else {
             return
         }
+        guard mapperProvider() != nil else {
+            cancelForMissingMapper()
+            return
+        }
 
         context.isMouseDownPosted = true
         state = .singleTouch(context)
         pendingMouseDown = nil
         inputSink.postMouseDown(at: point)
+    }
+
+    private func cancelForMissingMapper() {
+        // Geometry loss must not use focus-restoration fallbacks at stale coordinates.
+        focusRestorer.discardCapturedWindow()
+        forceCancel()
     }
 
     private func scheduleMouseUpThenReturn(generation: UInt64, at point: CGPoint) {
@@ -261,6 +284,10 @@ public final class GestureController {
     private func postMouseUpAndScheduleReturn(generation: UInt64, at point: CGPoint) {
         guard self.generation == generation, phase == .waitingForMouseUp,
               case .singleTouch(var context) = state, context.isMouseDownPosted else {
+            return
+        }
+        guard mapperProvider() != nil else {
+            cancelForMissingMapper()
             return
         }
 
@@ -285,6 +312,10 @@ public final class GestureController {
     private func returnCursorAndIdle(generation: UInt64) {
         guard self.generation == generation, phase == .waitingForCursorReturn,
               case .singleTouch = state else {
+            return
+        }
+        guard mapperProvider() != nil else {
+            cancelForMissingMapper()
             return
         }
 
