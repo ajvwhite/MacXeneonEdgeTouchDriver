@@ -4,16 +4,47 @@ import Foundation
 
 /// Restores focus to the exact AX window that was focused before a touch gesture.
 public final class AXFocusRestorer: FocusRestorer {
+    /// Keeps focus restoration testable without sending AX requests or cursor events.
+    struct Operations {
+        var copyAttribute: (AXUIElement, String) -> CFTypeRef?
+        var setAttribute: (AXUIElement, String, CFTypeRef) -> AXError
+        var performAction: (AXUIElement, String) -> AXError
+        var cursorPosition: () -> CGPoint?
+        var postMouseEvent: (CGEventType, CGPoint) -> Void
+        var warpCursor: (CGPoint) -> Void
+
+        static let live = Operations(
+            copyAttribute: { element, attribute in
+                var value: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
+                    return nil
+                }
+                return value
+            },
+            setAttribute: { AXUIElementSetAttributeValue($0, $1 as CFString, $2) },
+            performAction: { AXUIElementPerformAction($0, $1 as CFString) },
+            cursorPosition: { CGEvent(source: nil)?.location },
+            postMouseEvent: { AXFocusRestorer.postMouseEvent(type: $0, at: $1) },
+            warpCursor: { CGWarpMouseCursorPosition($0) }
+        )
+    }
+
     private struct CapturedWindow {
         let application: AXUIElement
         let window: AXUIElement
     }
 
     private let systemWideElement: AXUIElement
+    private let operations: Operations
     private var capturedWindow: CapturedWindow?
 
-    public init(systemWideElement: AXUIElement = AXUIElementCreateSystemWide()) {
+    public convenience init(systemWideElement: AXUIElement = AXUIElementCreateSystemWide()) {
+        self.init(systemWideElement: systemWideElement, operations: .live)
+    }
+
+    init(systemWideElement: AXUIElement, operations: Operations) {
         self.systemWideElement = systemWideElement
+        self.operations = operations
     }
 
     public func captureFocusedWindow() {
@@ -38,37 +69,42 @@ public final class AXFocusRestorer: FocusRestorer {
         }
         self.capturedWindow = nil
 
+        // Restoring an already focused window can turn a touch into a second click.
+        guard !isWindowFocused(capturedWindow) else {
+            return
+        }
+
         // Do not use app-level AXFrontmost here; it raises sibling windows from the same application.
-        let focusedWindowResult = AXUIElementSetAttributeValue(
+        let focusedWindowResult = operations.setAttribute(
             capturedWindow.application,
-            kAXFocusedWindowAttribute as CFString,
+            kAXFocusedWindowAttribute,
             capturedWindow.window
         )
-        let mainWindowResult = AXUIElementSetAttributeValue(
+        let mainWindowResult = operations.setAttribute(
             capturedWindow.application,
-            kAXMainWindowAttribute as CFString,
+            kAXMainWindowAttribute,
             capturedWindow.window
         )
-        let raiseResult = AXUIElementPerformAction(capturedWindow.window, kAXRaiseAction as CFString)
+        let raiseResult = operations.performAction(capturedWindow.window, kAXRaiseAction)
         let sessionClickResult = clickCapturedWindowTitleBar(capturedWindow)
-        let refocusedWindowResult = AXUIElementSetAttributeValue(
+        let refocusedWindowResult = operations.setAttribute(
             capturedWindow.application,
-            kAXFocusedWindowAttribute as CFString,
+            kAXFocusedWindowAttribute,
             capturedWindow.window
         )
-        let remadeMainWindowResult = AXUIElementSetAttributeValue(
+        let remadeMainWindowResult = operations.setAttribute(
             capturedWindow.application,
-            kAXMainWindowAttribute as CFString,
+            kAXMainWindowAttribute,
             capturedWindow.window
         )
-        let mainResult = AXUIElementSetAttributeValue(
+        let mainResult = operations.setAttribute(
             capturedWindow.window,
-            kAXMainAttribute as CFString,
+            kAXMainAttribute,
             kCFBooleanTrue
         )
-        let focusedResult = AXUIElementSetAttributeValue(
+        let focusedResult = operations.setAttribute(
             capturedWindow.window,
-            kAXFocusedAttribute as CFString,
+            kAXFocusedAttribute,
             kCFBooleanTrue
         )
 
@@ -87,9 +123,7 @@ public final class AXFocusRestorer: FocusRestorer {
     }
 
     private func copyElementAttribute(_ element: AXUIElement, attribute: String) -> AXUIElement? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
-        guard result == .success, let value else {
+        guard let value = operations.copyAttribute(element, attribute) else {
             return nil
         }
 
@@ -118,17 +152,17 @@ public final class AXFocusRestorer: FocusRestorer {
             return false
         }
 
-        let originalPosition = CGEvent(source: nil)?.location
-        postMouseEvent(type: .leftMouseDown, at: clickPoint)
-        postMouseEvent(type: .leftMouseUp, at: clickPoint)
+        let originalPosition = operations.cursorPosition()
+        operations.postMouseEvent(.leftMouseDown, clickPoint)
+        operations.postMouseEvent(.leftMouseUp, clickPoint)
 
         if let originalPosition {
-            CGWarpMouseCursorPosition(originalPosition)
+            operations.warpCursor(originalPosition)
         }
         return true
     }
 
-    private func postMouseEvent(type: CGEventType, at point: CGPoint) {
+    private static func postMouseEvent(type: CGEventType, at point: CGPoint) {
         guard let event = CGEvent(
             mouseEventSource: CGEventSource(stateID: .privateState),
             mouseType: type,
@@ -167,9 +201,7 @@ public final class AXFocusRestorer: FocusRestorer {
     }
 
     private func copyCGPointAttribute(_ element: AXUIElement, attribute: String) -> CGPoint? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
-        guard result == .success, let value, CFGetTypeID(value) == AXValueGetTypeID() else {
+        guard let value = operations.copyAttribute(element, attribute), CFGetTypeID(value) == AXValueGetTypeID() else {
             return nil
         }
 
@@ -186,9 +218,7 @@ public final class AXFocusRestorer: FocusRestorer {
     }
 
     private func copyCGSizeAttribute(_ element: AXUIElement, attribute: String) -> CGSize? {
-        var value: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
-        guard result == .success, let value, CFGetTypeID(value) == AXValueGetTypeID() else {
+        guard let value = operations.copyAttribute(element, attribute), CFGetTypeID(value) == AXValueGetTypeID() else {
             return nil
         }
 
