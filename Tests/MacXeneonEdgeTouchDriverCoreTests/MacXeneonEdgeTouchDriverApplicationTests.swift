@@ -3,7 +3,7 @@ import CoreGraphics
 import XCTest
 
 final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
-    func testDeviceMatchRefreshesDisplayMapper() {
+    func testTouchDownDropsStaleMappingWhenPreviouslyMatchedDisplayIsMissing() {
         var displays = [xeneonDisplay()]
         let resolver = DisplayResolver(activeDisplayProvider: { displays })
         let input = ApplicationRecordingInputSink()
@@ -21,8 +21,9 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
         application.handleTouchEvent(touchEvent(.down, rawX: 0, rawY: 0))
         application.handleTouchEvent(touchEvent(.up, rawX: 0, rawY: 0))
 
-        XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200)), .returnToOrigin])
-        XCTAssertEqual(input.calls, [.mouseDown(CGPoint(x: 100, y: 200)), .mouseUp(CGPoint(x: 100, y: 200))])
+        XCTAssertEqual(cursor.calls, [.forceShow])
+        XCTAssertTrue(input.calls.isEmpty)
+        XCTAssertNil(resolver.currentMapper)
     }
 
     func testTouchEventRefreshesMissingDisplayMapperBeforeDropping() {
@@ -42,6 +43,45 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
 
         XCTAssertEqual(cursor.calls, [.borrow(CGPoint(x: 100, y: 200)), .returnToOrigin])
         XCTAssertEqual(input.calls, [.mouseDown(CGPoint(x: 100, y: 200)), .mouseUp(CGPoint(x: 100, y: 200))])
+    }
+
+    func testTouchDownRefreshesDisplayMapperAfterDisplayMoves() {
+        var displays = [xeneonDisplay()]
+        let resolver = DisplayResolver(activeDisplayProvider: { displays })
+        let input = ApplicationRecordingInputSink()
+        let cursor = ApplicationRecordingCursorController()
+        let application = MacXeneonEdgeTouchDriverApplication(
+            configuration: immediateConfiguration(),
+            displayResolver: resolver,
+            inputSink: input,
+            cursorController: cursor
+        )
+
+        application.handleDeviceMatched()
+        application.handleTouchEvent(touchEvent(.down, rawX: 0, rawY: 0))
+        application.handleTouchEvent(touchEvent(.up, rawX: 0, rawY: 0))
+
+        // Simulate the user moving the panel in System Settings > Displays > Arrange without any
+        // reconfiguration callback being delivered to the driver.
+        displays = [xeneonDisplay(origin: CGPoint(x: -300, y: 1_440))]
+
+        application.handleTouchEvent(touchEvent(.down, rawX: 0, rawY: 0))
+        application.handleTouchEvent(touchEvent(.up, rawX: 0, rawY: 0))
+
+        XCTAssertEqual(
+            cursor.calls,
+            [
+                .borrow(CGPoint(x: 100, y: 200)), .returnToOrigin,
+                .forceShow, .borrow(CGPoint(x: -300, y: 1_440)), .returnToOrigin,
+            ]
+        )
+        XCTAssertEqual(
+            input.calls,
+            [
+                .mouseDown(CGPoint(x: 100, y: 200)), .mouseUp(CGPoint(x: 100, y: 200)),
+                .mouseDown(CGPoint(x: -300, y: 1_440)), .mouseUp(CGPoint(x: -300, y: 1_440)),
+            ]
+        )
     }
 
     func testFocusAndCursorOptionsIndependentlyPreserveTapInput() {
@@ -317,13 +357,13 @@ final class MacXeneonEdgeTouchDriverApplicationTests: XCTestCase {
         return configuration
     }
 
-    private func xeneonDisplay() -> DisplaySnapshot {
+    private func xeneonDisplay(origin: CGPoint = CGPoint(x: 100, y: 200)) -> DisplaySnapshot {
         DisplaySnapshot(
             displayID: 42,
             vendorNumber: CapturedXeneonDisplay.vendorNumber,
             modelNumber: CapturedXeneonDisplay.modelNumber,
             serialNumber: CapturedXeneonDisplay.observedSerialNumber,
-            bounds: CGRect(x: 100, y: 200, width: 2_560, height: 720),
+            bounds: CGRect(origin: origin, size: CGSize(width: 2_560, height: 720)),
             pixelsWide: CapturedXeneonDisplay.expectedWidth,
             pixelsHigh: CapturedXeneonDisplay.expectedHeight
         )
