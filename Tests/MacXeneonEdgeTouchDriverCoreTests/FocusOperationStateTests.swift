@@ -3,6 +3,41 @@ import Foundation
 import XCTest
 
 final class FocusOperationStateTests: XCTestCase {
+    func testRepeatedCleanupReleaseKeepsFirstFreezeAndRestorationDeadline() {
+        var now: UInt64 = 0
+        let token = FocusOperationToken(now: { now })
+        XCTAssertTrue(token.beginTouch())
+        XCTAssertTrue(token.inputDidEnd())
+        XCTAssertFalse(token.inputDidEnd(), "Synthetic release must not freeze again.")
+        XCTAssertTrue(token.isPermitted)
+        XCTAssertTrue(token.beginRestore())
+        now = 100_000_000
+        XCTAssertFalse(token.inputDidEnd(), "Cancellation cleanup cannot restart restoration.")
+        XCTAssertTrue(token.isPermitted)
+        now = 150_000_000
+        XCTAssertFalse(token.isPermitted, "Repeated release must not extend the restoration deadline.")
+        XCTAssertFalse(token.inputDidEnd())
+        XCTAssertFalse(token.beginRestore())
+    }
+
+    func testReleaseDuringPreparationCannotBeRevivedByCaptureOrRepeatedCleanup() {
+        let token = FocusOperationToken(now: { 0 })
+        XCTAssertFalse(token.inputDidEnd())
+        XCTAssertFalse(token.beginTouch())
+        XCTAssertFalse(token.inputDidEnd())
+        XCTAssertFalse(token.isPermitted)
+    }
+
+    func testRepeatedReleaseCannotRevivePostReleaseFocusInvalidation() {
+        let token = FocusOperationToken(now: { 0 })
+        XCTAssertTrue(token.beginTouch())
+        XCTAssertTrue(token.inputDidEnd())
+        token.observe(.focusChanged)
+        XCTAssertFalse(token.inputDidEnd())
+        XCTAssertFalse(token.isPermitted)
+        XCTAssertFalse(token.beginRestore())
+    }
+
     func testPreparationDeadlineCannotBeRevivedByLateCompletion() {
         var now: UInt64 = 0
         let token = FocusOperationToken(now: { now })

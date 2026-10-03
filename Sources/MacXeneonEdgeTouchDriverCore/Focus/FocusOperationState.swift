@@ -96,12 +96,21 @@ final class FocusOperationToken {
         return true
     }
 
-    /// A late enrollment cannot authorize restoration after this release boundary.
+    /// Freeze once at the accepted HID release. Synthetic release and cancellation
+    /// may repeat this call, but cannot replace the baseline or revoke a valid freeze.
     @discardableResult func inputDidEnd() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard phase == .touching, certifiedRevision == focusRevision,
-              permittedWhileLocked() else {
+        switch phase {
+        case .released, .restoring, .invalidated:
+            return false
+        case .preparing:
+            phase = .invalidated
+            return false
+        case .touching:
+            break
+        }
+        guard certifiedRevision == focusRevision, permittedWhileLocked() else {
             phase = .invalidated
             return false
         }

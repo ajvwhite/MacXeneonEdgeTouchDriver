@@ -4,6 +4,112 @@ import Foundation
 import XCTest
 
 final class AXFocusCoordinatorTests: XCTestCase {
+    func testAcceptedPhysicalUpPreventsPostReleaseEnrollmentDuringSyntheticUpDelay() {
+        for upDelay in [0, 20, 1_000] {
+            let f = CoordinatorGestureFixture(upDelay: upDelay)
+            f.send(.down, at: 0)
+            f.focus.pump()
+            XCTAssertEqual(f.effects.actions, [.borrow, .down])
+            f.send(.up, at: 100)
+
+            // A deliberate B/B2 choice follows physical finger release, while a
+            // nonzero synthetic-up delay still owns the pressed mouse button.
+            f.advance(to: upDelay == 1_000 ? 200 : 105)
+            let chosen = coordinatorTarget(pid: 20, window: "chosen-after-finger-release")
+            f.focus.backend.focused = chosen
+            f.focus.workspace.frontmost = chosen.workspaceApplication
+            f.focus.workspace.emit(.focusChanged)
+            f.focus.backend.emit(.focusChanged, processIdentifier: 20)
+            f.focus.pump()
+            XCTAssertEqual(f.focus.backend.attemptCount, 0)
+            XCTAssertEqual(f.effects.actions, upDelay == 0 ? [.borrow, .down, .up] : [.borrow, .down])
+            f.focus.backend.onAttempt = {
+                f.focus.backend.focused = f.focus.captured
+                f.focus.workspace.frontmost = f.focus.captured.workspaceApplication
+            }
+
+            f.advance(to: 100 + UInt64(upDelay) + 100)
+            f.focus.pump()
+            XCTAssertEqual(f.focus.backend.attemptCount, 0,
+                           "Physical release must forbid later enrollment during a \(upDelay) ms synthetic-up delay.")
+            XCTAssertEqual(f.focus.backend.relationship(f.focus.backend.focused, chosen), .same)
+            XCTAssertEqual(f.effects.actions, [.borrow, .down, .up, .release(true)])
+            XCTAssertEqual(f.controller.state, .idle)
+        }
+    }
+
+    func testCertifiedDuringTouchFocusSurvivesDelayedSyntheticUpWithoutExtraActions() {
+        for upDelay in [0, 20, 1_000] {
+            let f = CoordinatorGestureFixture(upDelay: upDelay)
+            f.send(.down, at: 0)
+            f.focus.pump()
+            f.advance(to: 50)
+            f.focus.changeFocusDuringTouch()
+            XCTAssertEqual(f.focus.backend.observers.count, 2)
+            f.focus.backend.onAttempt = {
+                f.focus.backend.focused = f.focus.captured
+                f.focus.workspace.frontmost = f.focus.captured.workspaceApplication
+            }
+            f.send(.up, at: 100)
+            f.focus.pump()
+            if upDelay > 0 {
+                f.advance(to: 100 + UInt64(upDelay) - 1)
+                f.focus.pump()
+                XCTAssertEqual(f.effects.actions, [.borrow, .down])
+                XCTAssertEqual(f.focus.backend.attemptCount, 0)
+            }
+            f.advance(to: 100 + UInt64(upDelay))
+            f.focus.pump()
+            XCTAssertEqual(f.effects.actions, [.borrow, .down, .up])
+            XCTAssertEqual(f.focus.backend.attemptCount, 0, "Focus must wait for cursor cleanup.")
+            f.advance(to: 100 + UInt64(upDelay) + 99)
+            f.focus.pump()
+            XCTAssertEqual(f.effects.actions, [.borrow, .down, .up])
+            XCTAssertEqual(f.focus.backend.attemptCount, 0)
+
+            f.advance(to: 100 + UInt64(upDelay) + 100)
+            f.focus.pump()
+            XCTAssertEqual(f.focus.backend.attemptCount, 1,
+                           "Synthetic mouse-up must not erase the physical-release baseline.")
+            XCTAssertEqual(f.focus.backend.relationship(f.focus.backend.focused, f.focus.captured), .same)
+            XCTAssertEqual(f.effects.actions, [.borrow, .down, .up, .release(true)])
+            XCTAssertEqual(f.controller.state, .idle)
+            f.advance(to: 100 + UInt64(upDelay) + 500)
+            f.focus.pump()
+            XCTAssertEqual(f.focus.backend.attemptCount, 1)
+            XCTAssertEqual(f.effects.actions, [.borrow, .down, .up, .release(true)])
+        }
+    }
+
+    func testPhysicalReleaseFreezesFocusBeforeForcingDelayedMouseDown() {
+        for upDelay in [20, 1_000] {
+            let f = CoordinatorGestureFixture(upDelay: upDelay, warpDelay: 200)
+            f.send(.down, at: 0)
+            f.focus.pump()
+            XCTAssertEqual(f.effects.actions, [.borrow])
+            let chosen = coordinatorTarget(pid: 20, window: "activated-by-forced-down")
+            f.effects.onMouseDown = {
+                f.focus.backend.focused = chosen
+                f.focus.workspace.frontmost = chosen.workspaceApplication
+                f.focus.workspace.emit(.focusChanged)
+                f.focus.backend.emit(.focusChanged, processIdentifier: 20)
+            }
+
+            // This up forces the still-delayed down. Its synchronous focus side
+            // effect must already be outside the physical-touch enrollment window.
+            f.send(.up, at: 100)
+            f.focus.pump()
+            XCTAssertEqual(f.effects.actions, [.borrow, .down])
+            XCTAssertEqual(f.focus.backend.attemptCount, 0)
+            f.advance(to: 100 + UInt64(upDelay) + 100)
+            f.focus.pump()
+            XCTAssertEqual(f.focus.backend.attemptCount, 0)
+            XCTAssertEqual(f.focus.backend.relationship(f.focus.backend.focused, chosen), .same)
+            XCTAssertEqual(f.effects.actions, [.borrow, .down, .up, .release(true)])
+            XCTAssertEqual(f.controller.state, .idle)
+        }
+    }
+
     func testPreparationUsesFreshReadsThenDeliversOnCallbackQueue() {
         let f = FocusCoordinatorFixture()
         var completed = false
@@ -486,12 +592,13 @@ private final class FocusCoordinatorFixture {
     let workspace: CoordinatorWorkspaceFake
     let restorer: AXFocusRestorer
 
-    init() {
+    init(now: (() -> UInt64)? = nil) {
         backend = CoordinatorBackendFake(focused: captured)
         workspace = CoordinatorWorkspaceFake(application: captured.workspaceApplication)
         let clock = self.clock
         restorer = AXFocusRestorer(backend: backend, workspace: workspace,
-            onMain: main.enqueue, onWorker: worker.enqueue, onCallback: callbacks.enqueue, now: { clock.nanoseconds })
+            onMain: main.enqueue, onWorker: worker.enqueue, onCallback: callbacks.enqueue,
+            now: now ?? { clock.nanoseconds })
     }
 
     func prepare() {
@@ -522,6 +629,49 @@ private final class FocusCoordinatorFixture {
         }
         XCTFail("Focus pipeline did not quiesce within its bounded stages")
     }
+}
+
+/// Exercises the actual gesture/coordinator release boundary with one virtual clock.
+private final class CoordinatorGestureFixture {
+    let scheduler: TestGestureScheduler
+    let focus: FocusCoordinatorFixture
+    let effects = CoordinatorGestureEffects()
+    let controller: GestureController
+
+    init(upDelay: Int, warpDelay: Int = 0) {
+        let scheduler = TestGestureScheduler()
+        let focus = FocusCoordinatorFixture(now: { scheduler.now.uptimeNanoseconds })
+        let mapper = CoordinateMapper(displayBounds: CGRect(x: 100, y: 200, width: 2_560, height: 720))
+        self.scheduler = scheduler
+        self.focus = focus
+        controller = GestureController(
+            mapperProvider: { mapper }, inputSink: effects, cursorController: effects,
+            focusRestorer: focus.restorer,
+            timing: GestureTiming(warpToClickDelayMs: warpDelay, downToUpDelayMs: upDelay,
+                                  clickToWarpBackDelayMs: 100, tapDebounceMs: 0),
+            scheduler: scheduler)
+    }
+
+    func advance(to milliseconds: UInt64) { scheduler.advance(toMilliseconds: milliseconds) }
+
+    func send(_ kind: TouchEvent.Kind, at milliseconds: UInt64) {
+        advance(to: milliseconds)
+        controller.handle(TouchEvent(kind: kind, contactID: 0, rawX: 0, rawY: 0, timestamp: scheduler.now))
+    }
+}
+
+private final class CoordinatorGestureEffects: SyntheticInputSink, CursorController {
+    enum Action: Equatable { case borrow, down, drag, up, update, release(Bool), show }
+    var actions: [Action] = []
+    var onMouseDown: (() -> Void)?
+    func borrow(warpingTo point: CGPoint) -> Bool { actions.append(.borrow); return true }
+    func updatePosition(_ point: CGPoint) { actions.append(.update) }
+    func returnToOrigin() { releaseBorrow(returnToPreviousPosition: true) }
+    func releaseBorrow(returnToPreviousPosition: Bool) { actions.append(.release(returnToPreviousPosition)) }
+    func forceShow() { actions.append(.show) }
+    func postMouseDown(at point: CGPoint) { actions.append(.down); onMouseDown?() }
+    func postMouseUp(at point: CGPoint) { actions.append(.up) }
+    func postMouseDragged(to point: CGPoint) { actions.append(.drag) }
 }
 
 private func coordinatorTarget(pid: pid_t, window: String) -> AXFocusTarget {

@@ -4,6 +4,117 @@ import Foundation
 import XCTest
 
 final class FocusPreparationGestureTests: XCTestCase {
+    func testAcceptedRawUpFreezesFocusBeforeForcedMouseDownAndSyntheticUpDelay() {
+        for upDelay in [20, 1_000] {
+            let fixture = PreparationFixture(timing: releaseBoundaryTiming(upDelay: upDelay))
+            fixture.send(.down, at: 0)
+            fixture.focus.complete(0)
+            XCTAssertTrue(fixture.effects.input.isEmpty)
+            fixture.send(.up, at: 1)
+
+            XCTAssertEqual(fixture.focus.boundarySnapshots.first, [.prepare, .borrow(start)],
+                           "The release boundary must precede the quick tap's forced mouse-down.")
+            XCTAssertEqual(fixture.focus.semanticBoundaryCount, 1)
+            XCTAssertEqual(fixture.effects.input, [.down(start)])
+            fixture.clock.advance(toMilliseconds: UInt64(upDelay))
+            XCTAssertEqual(fixture.effects.input, [.down(start)])
+            fixture.clock.advance(toMilliseconds: UInt64(upDelay + 1))
+            XCTAssertEqual(fixture.effects.input, [.down(start), .up(start)])
+            fixture.clock.advance(toMilliseconds: UInt64(upDelay + 11))
+
+            XCTAssertEqual(fixture.focus.semanticBoundaryCount, 1,
+                           "Defensive synthetic-up hooks must not freeze a second baseline.")
+            XCTAssertEqual(fixture.effects.restoredCaptures, [0])
+            fixture.assertFinished()
+        }
+    }
+
+    func testEarlyRawUpDuringPendingCaptureFreezesBeforeBorrowAndForcedDown() {
+        for upDelay in [20, 1_000] {
+            let fixture = PreparationFixture(timing: releaseBoundaryTiming(upDelay: upDelay))
+            fixture.send(.down, at: 0)
+            fixture.send(.up, at: 1)
+
+            XCTAssertEqual(fixture.focus.boundarySnapshots.first, [.prepare],
+                           "An accepted up ends eligibility before continuing the pending gesture.")
+            XCTAssertEqual(fixture.focus.semanticBoundaryCount, 1)
+            XCTAssertEqual(fixture.effects.input, [.down(start)])
+            fixture.focus.complete(0)
+            fixture.clock.advance(toMilliseconds: UInt64(upDelay + 11))
+
+            XCTAssertEqual(fixture.focus.semanticBoundaryCount, 1)
+            XCTAssertEqual(fixture.effects.input, [.down(start), .up(start)])
+            XCTAssertTrue(fixture.effects.restoredCaptures.isEmpty)
+            fixture.assertFinished()
+        }
+    }
+
+    func testForeignContactUpCannotFreezePendingOrAcceptedGesture() {
+        let fixture = PreparationFixture(timing: releaseBoundaryTiming(upDelay: 20))
+        fixture.send(.down, at: 0)
+        fixture.send(.up, at: 1, contactID: 1)
+        XCTAssertEqual(fixture.focus.semanticBoundaryCount, 0)
+        XCTAssertTrue(fixture.effects.borrows.isEmpty)
+        fixture.clock.advance(toMilliseconds: 2)
+        fixture.focus.complete(0)
+        fixture.send(.down, at: 3, contactID: 1)
+        fixture.send(.up, at: 4, contactID: 1)
+        XCTAssertEqual(fixture.focus.semanticBoundaryCount, 0)
+        XCTAssertTrue(fixture.effects.input.isEmpty)
+
+        fixture.send(.up, at: 5)
+        XCTAssertEqual(fixture.focus.semanticBoundaryCount, 1)
+        XCTAssertEqual(fixture.focus.boundarySnapshots.first, [.prepare, .borrow(start)])
+        fixture.clock.advance(toMilliseconds: 35)
+        XCTAssertEqual(fixture.effects.input, [.down(start), .up(start)])
+        XCTAssertEqual(fixture.effects.restoredCaptures, [0])
+        fixture.assertFinished()
+    }
+
+    func testCancelAfterRawUpKeepsTheFirstReleaseBoundaryAndBalancesInput() {
+        let fixture = PreparationFixture(timing: releaseBoundaryTiming(upDelay: 1_000))
+        fixture.send(.down, at: 0)
+        fixture.focus.complete(0)
+        fixture.send(.up, at: 1)
+        let firstBoundary = fixture.focus.boundarySnapshots.first
+        XCTAssertEqual(firstBoundary, [.prepare, .borrow(start)])
+        fixture.clock.advance(toMilliseconds: 2)
+        fixture.controller.forceCancel()
+        fixture.controller.forceCancel()
+        fixture.clock.advance(toMilliseconds: 2_000)
+
+        XCTAssertEqual(fixture.focus.semanticBoundaryCount, 1)
+        XCTAssertEqual(fixture.focus.boundarySnapshots.first, firstBoundary)
+        XCTAssertEqual(fixture.effects.input, [.down(start), .up(start)])
+        XCTAssertEqual(fixture.effects.restoredCaptures, [0])
+        fixture.assertFinished()
+    }
+
+    func testRawUpAfterMapperLossEndsPendingEligibilityBeforeDroppingInput() {
+        let fixture = PreparationFixture(timing: releaseBoundaryTiming(upDelay: 20))
+        fixture.send(.down, at: 0)
+        fixture.hasMapper = false
+        fixture.send(.up, at: 1)
+
+        XCTAssertEqual(fixture.focus.boundarySnapshots.first, [.prepare])
+        XCTAssertEqual(fixture.focus.semanticBoundaryCount, 1)
+        XCTAssertTrue(fixture.effects.borrows.isEmpty)
+        XCTAssertTrue(fixture.effects.input.isEmpty)
+        fixture.controller.forceCancel()
+        let canceled = fixture.effects.events
+        fixture.focus.complete(0)
+        fixture.clock.advance(toMilliseconds: 2_000)
+
+        XCTAssertEqual(fixture.effects.events, canceled)
+        XCTAssertTrue(fixture.effects.restoredCaptures.isEmpty)
+        XCTAssertEqual(fixture.controller.state, .idle)
+    }
+
+    private func releaseBoundaryTiming(upDelay: Int) -> GestureTiming {
+        GestureTiming(warpToClickDelayMs: 1_000, downToUpDelayMs: upDelay,
+                      clickToWarpBackDelayMs: 10, tapDebounceMs: 0)
+    }
+
     func testDeadlineDeliversAndCleansUpTouchWhenFocusNeverCompletes() {
         let fixture = PreparationFixture()
         fixture.send(.down, at: 0)
@@ -219,6 +330,7 @@ final class FocusPreparationGestureTests: XCTestCase {
             XCTAssertTrue(fixture.effects.input.isEmpty)
             XCTAssertTrue(fixture.effects.releases.isEmpty)
             XCTAssertTrue(fixture.effects.restoredCaptures.isEmpty)
+            XCTAssertEqual(fixture.focus.semanticBoundaryCount, 0)
             XCTAssertGreaterThanOrEqual(fixture.focus.discardCount, 1)
             XCTAssertEqual(fixture.controller.state, .idle)
         }
@@ -237,6 +349,7 @@ final class FocusPreparationGestureTests: XCTestCase {
         XCTAssertTrue(fixture.effects.borrows.isEmpty)
         XCTAssertTrue(fixture.effects.input.isEmpty)
         XCTAssertTrue(fixture.effects.restoredCaptures.isEmpty)
+        XCTAssertEqual(fixture.focus.semanticBoundaryCount, 0)
         XCTAssertGreaterThanOrEqual(fixture.focus.discardCount, 1)
         XCTAssertEqual(fixture.controller.state, .idle)
     }
@@ -252,13 +365,16 @@ final class FocusPreparationGestureTests: XCTestCase {
         XCTAssertTrue(fixture.effects.borrows.isEmpty)
         XCTAssertTrue(fixture.effects.input.isEmpty)
         XCTAssertEqual(fixture.focus.preparationCount, 1)
+        XCTAssertEqual(fixture.focus.semanticBoundaryCount, 0)
 
         fixture.send(.up, at: 31, rawX: 16_383, rawY: 9_599)
+        XCTAssertEqual(fixture.focus.semanticBoundaryCount, 0, "A quarantined up must not freeze focus eligibility.")
         fixture.send(.down, at: 32, rawX: 16_383, rawY: 9_599)
         fixture.focus.complete(1)
         fixture.send(.up, at: 33, rawX: 16_383, rawY: 9_599)
         XCTAssertEqual(fixture.effects.input, [.down(end), .up(end)])
         XCTAssertEqual(fixture.effects.restoredCaptures, [1])
+        XCTAssertEqual(fixture.focus.semanticBoundaryCount, 1)
         XCTAssertEqual(fixture.controller.state, .idle)
         fixture.effects.assertBalanced()
     }
@@ -284,6 +400,7 @@ final class FocusPreparationGestureTests: XCTestCase {
                 XCTAssertEqual(fixture.effects.input, [.down(start), .up(start)])
                 XCTAssertEqual(fixture.effects.releases, [returnCursor])
                 XCTAssertEqual(fixture.effects.restoredCaptures, restoreFocus ? [0] : [])
+                XCTAssertEqual(fixture.focus.semanticBoundaryCount, restoreFocus ? 1 : 0)
                 fixture.assertFinished()
             }
         }
@@ -336,32 +453,39 @@ private final class PreparationFixture {
     let cursor: PreparationCursor
     let controller: GestureController
     let mapper = CoordinateMapper(displayBounds: CGRect(x: 100, y: 200, width: 2_560, height: 720))
+    private let mapperAvailability: PreparationMapperAvailability
+    var hasMapper: Bool {
+        get { mapperAvailability.isAvailable }
+        set { mapperAvailability.isAvailable = newValue }
+    }
     var idleCount = 0
 
-    init(restoreFocus: Bool = true, returnCursor: Bool = true) {
+    init(restoreFocus: Bool = true, returnCursor: Bool = true, timing: GestureTiming = .immediate) {
         let clock = TestGestureScheduler(executeCancelledActions: true)
         let effects = PreparationEffects()
         let focus = PendingPreparationFocus(effects: effects)
         let cursor = PreparationCursor(effects: effects)
+        let mapperAvailability = PreparationMapperAvailability()
         let selectedFocus: FocusRestorer = restoreFocus ? focus : NoOpFocusRestorer()
         let mapper = CoordinateMapper(displayBounds: CGRect(x: 100, y: 200, width: 2_560, height: 720))
         self.clock = clock
         self.effects = effects
         self.focus = focus
         self.cursor = cursor
+        self.mapperAvailability = mapperAvailability
         controller = GestureController(
-            mapperProvider: { mapper }, inputSink: PreparationInput(effects: effects),
+            mapperProvider: { mapperAvailability.isAvailable ? mapper : nil }, inputSink: PreparationInput(effects: effects),
             cursorController: cursor, focusRestorer: selectedFocus,
-            returnCursorToPreviousPosition: returnCursor, timing: .immediate, scheduler: clock
+            returnCursorToPreviousPosition: returnCursor, timing: timing, scheduler: clock
         )
         controller.onBecameIdle = { [weak self] in self?.idleCount += 1 }
     }
 
     func point(rawX: Int, rawY: Int) -> CGPoint { mapper.map(rawX: rawX, rawY: rawY) }
 
-    func send(_ kind: TouchEvent.Kind, at time: UInt64, rawX: Int = 0, rawY: Int = 0) {
+    func send(_ kind: TouchEvent.Kind, at time: UInt64, rawX: Int = 0, rawY: Int = 0, contactID: Int = 0) {
         clock.advance(toMilliseconds: time)
-        controller.handle(TouchEvent(kind: kind, contactID: 0, rawX: rawX, rawY: rawY, timestamp: clock.now))
+        controller.handle(TouchEvent(kind: kind, contactID: contactID, rawX: rawX, rawY: rawY, timestamp: clock.now))
     }
 
     func assertFinished(expectedGestures: Int = 1, file: StaticString = #filePath, line: UInt = #line) {
@@ -370,6 +494,10 @@ private final class PreparationFixture {
         XCTAssertEqual(effects.releases.count, expectedGestures, file: file, line: line)
         effects.assertBalanced(file: file, line: line)
     }
+}
+
+private final class PreparationMapperAvailability {
+    var isAvailable = true
 }
 
 private final class PreparationEffects {
@@ -412,6 +540,9 @@ private final class PendingPreparationFocus: FocusRestorer {
     private var completed: Set<Int> = []
     private(set) var discardCount = 0
     private(set) var restoreRequests = 0
+    private(set) var boundarySnapshots: [[PreparationEffects.Event]] = []
+    private(set) var semanticBoundaryCount = 0
+    private var didEndInput = false
     var onPreparationStarted: (() -> Void)?
     var preparationCount: Int { pending.count }
 
@@ -420,6 +551,7 @@ private final class PendingPreparationFocus: FocusRestorer {
     func prepareFocusedWindow(completion: @escaping () -> Void) {
         generation += 1
         capturedID = nil
+        didEndInput = false
         effects.events.append(.prepare)
         pending.append((generation, completion))
         onPreparationStarted?()
@@ -439,6 +571,13 @@ private final class PendingPreparationFocus: FocusRestorer {
     }
 
     func captureFocusedWindow() { XCTFail("Asynchronous preparation must use its completion contract") }
+
+    func inputDidEnd() {
+        boundarySnapshots.append(effects.events)
+        guard !didEndInput else { return }
+        didEndInput = true
+        semanticBoundaryCount += 1
+    }
 
     func restoreCapturedWindow() {
         restoreRequests += 1

@@ -9,8 +9,9 @@ public protocol FocusRestorer: AnyObject {
     /// Captures the currently focused window, if one is available.
     func captureFocusedWindow()
 
-    /// Marks mouse-button release; observed focus changes now revoke restoration eligibility.
-    /// This must not wait for or begin an AX mutation.
+    /// Marks receipt of the accepted HID touch-up, before delayed synthetic mouse-up.
+    /// Observed focus changes now revoke restoration eligibility. Repeated cleanup
+    /// calls must be idempotent. This must not wait for or begin an AX mutation.
     func inputDidEnd()
 
     /// Restores the captured focused window and clears the capture.

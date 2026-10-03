@@ -81,6 +81,13 @@ public final class GestureController {
             return
         }
 
+        // Freeze focus restoration eligibility at the accepted HID release, even
+        // if preparation, a missing mapper, or mouse delays postpone cleanup.
+        if event.kind == .up, case .singleTouch(let context) = state,
+           context.contactID == event.contactID {
+            focusRestorer.inputDidEnd()
+        }
+
         if let preparation {
             guard event.contactID == preparation.contactID else {
                 if event.kind == .down { rejectedPreparationContacts.insert(event.contactID) }
