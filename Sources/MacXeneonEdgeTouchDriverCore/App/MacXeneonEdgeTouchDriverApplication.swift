@@ -10,21 +10,28 @@ public final class MacXeneonEdgeTouchDriverApplication {
     private let displayResolver: DisplayResolver
     private let mapperStore = CoordinateMapperStore()
     private let gestureQueue: DispatchQueue
+    private let scheduler: GestureScheduler
     private let inputSink: SyntheticInputSink
     private let cursorController: CursorController
     private let focusRestorer: FocusRestorer
 
-    private lazy var gestureController = GestureController(
-        mapperProvider: { [mapperStore] in
-            mapperStore.currentMapper
-        },
-        inputSink: inputSink,
-        cursorController: cursorController,
-        focusRestorer: focusRestorer,
-        returnCursorToPreviousPosition: configuration.cursor.returnToPreviousPosition,
-        timing: GestureTiming(configuration: configuration.timing),
-        schedulingQueue: gestureQueue
-    )
+    private lazy var gestureController: GestureController = {
+        let controller = GestureController(
+            mapperProvider: { [mapperStore] in
+                mapperStore.currentMapper
+            },
+            inputSink: inputSink,
+            cursorController: cursorController,
+            focusRestorer: focusRestorer,
+            returnCursorToPreviousPosition: configuration.cursor.returnToPreviousPosition,
+            timing: GestureTiming(configuration: configuration.timing),
+            scheduler: scheduler
+        )
+        controller.onBecameIdle = { [weak self] in
+            self?.cancelStuckGestureTimer()
+        }
+        return controller
+    }()
 
     private lazy var hidMonitor = HIDDeviceMonitor(
         eventQueue: gestureQueue,
@@ -40,7 +47,8 @@ public final class MacXeneonEdgeTouchDriverApplication {
         }
     )
 
-    private var stuckGestureTimer: DispatchSourceTimer?
+    private var stuckGestureTimer: GestureScheduledTask?
+    private var stuckGestureTimerGeneration: UInt64 = 0
     private var signalSources: [DispatchSourceSignal] = []
     private var didRegisterDisplayCallback = false
     private var isRunning = false
@@ -52,7 +60,8 @@ public final class MacXeneonEdgeTouchDriverApplication {
             displayResolver: DisplayResolver(configuration: configuration.display),
             inputSink: CGEventInputSink(),
             cursorController: CGCursorController(),
-            focusFactory: { AXFocusRestorer(callbackQueue: $0) }
+            focusFactory: { AXFocusRestorer(callbackQueue: $0) },
+            scheduler: nil
         )
     }
 
@@ -69,7 +78,27 @@ public final class MacXeneonEdgeTouchDriverApplication {
             displayResolver: displayResolver,
             inputSink: inputSink,
             cursorController: cursorController,
-            focusFactory: { _ in focusRestorer }
+            focusFactory: { _ in focusRestorer },
+            scheduler: nil
+        )
+    }
+
+    /// Supplies deterministic scheduling without starting HID or requesting permissions.
+    convenience init(
+        configuration: DriverConfiguration,
+        displayResolver: DisplayResolver,
+        inputSink: SyntheticInputSink,
+        cursorController: CursorController,
+        focusRestorer: FocusRestorer = NoOpFocusRestorer(),
+        scheduler: GestureScheduler?
+    ) {
+        self.init(
+            configuration: configuration,
+            displayResolver: displayResolver,
+            inputSink: inputSink,
+            cursorController: cursorController,
+            focusFactory: { _ in focusRestorer },
+            scheduler: scheduler
         )
     }
 
@@ -78,10 +107,12 @@ public final class MacXeneonEdgeTouchDriverApplication {
         displayResolver: DisplayResolver,
         inputSink: SyntheticInputSink,
         cursorController: CursorController,
-        focusFactory: (DispatchQueue) -> FocusRestorer
+        focusFactory: (DispatchQueue) -> FocusRestorer,
+        scheduler: GestureScheduler?
     ) {
         let gestureQueue = DispatchQueue(label: "\(DriverLoggers.subsystem).gesture-queue")
         self.gestureQueue = gestureQueue
+        self.scheduler = scheduler ?? DispatchGestureScheduler(queue: gestureQueue)
         self.configuration = configuration
         self.displayResolver = displayResolver
         self.inputSink = inputSink
@@ -102,10 +133,6 @@ public final class MacXeneonEdgeTouchDriverApplication {
 
         isRunning = true
         DriverLoggers.log(.notice, category: .lifecycle, "Starting Mac Xeneon Edge Touch Driver in single-touch mode.")
-        gestureController.onBecameIdle = { [weak self] in
-            self?.cancelStuckGestureTimer()
-        }
-
         guard verifySyntheticEventPermission() else {
             stop()
             return EXIT_FAILURE
@@ -129,7 +156,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
 
     /// Stops monitoring and restores cursor/input state.
     public func stop() {
-        // Invalidation must not wait for the gesture queue or an outstanding AX request.
+        // Invalidate without waiting for the gesture queue or an outstanding AX request.
         focusRestorer.shutdown()
         guard isRunning else {
             return
@@ -137,8 +164,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
 
         hidMonitor.stop()
         gestureQueue.sync {
-            cancelStuckGestureTimer()
-            gestureController.forceCancel()
+            cancelActiveGesture()
         }
         unregisterDisplayReconfigurationCallback()
         signalSources.removeAll()
@@ -167,9 +193,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
         } else {
             DriverLoggers.log(.error, category: .display, "Could not resolve Xeneon Edge display after \(reason). Touch events will be dropped.")
             gestureQueue.async { [weak self] in
-                self?.focusRestorer.discardCapturedWindow()
-                self?.cancelStuckGestureTimer()
-                self?.gestureController.forceCancel()
+                self?.cancelActiveGesture()
             }
         }
     }
@@ -194,7 +218,13 @@ public final class MacXeneonEdgeTouchDriverApplication {
         refreshDisplayMapping(reason: "HID device match")
     }
 
-    private func handleDeviceRemoval() {
+    func handleDeviceRemoval() {
+        cancelActiveGesture()
+    }
+
+    /// Gesture teardown shared by stop, device removal, and display loss.
+    /// Called on the gesture queue in production; tests can exercise it without starting HID.
+    func cancelActiveGesture() {
         focusRestorer.discardCapturedWindow()
         cancelStuckGestureTimer()
         gestureController.forceCancel()
@@ -203,20 +233,27 @@ public final class MacXeneonEdgeTouchDriverApplication {
     private func scheduleStuckGestureTimer() {
         cancelStuckGestureTimer()
 
-        let timer = DispatchSource.makeTimerSource(queue: gestureQueue)
-        timer.schedule(deadline: .now() + .milliseconds(configuration.timing.stuckGestureTimeoutMs))
-        timer.setEventHandler { [weak self] in
+        let generation = stuckGestureTimerGeneration
+        let timer = scheduler.schedule(afterMilliseconds: configuration.timing.stuckGestureTimeoutMs) { [weak self] in
+            guard let self, self.stuckGestureTimerGeneration == generation else {
+                return
+            }
+            self.stuckGestureTimer = nil
+            self.stuckGestureTimerGeneration &+= 1
             DriverLoggers.log(.warning, category: .gesture, "Touch gesture timed out without an up event; forcing cleanup.")
-            self?.focusRestorer.discardCapturedWindow()
-            self?.gestureController.handleIdleTimeout()
-            self?.stuckGestureTimer = nil
+            self.focusRestorer.discardCapturedWindow()
+            self.gestureController.handleIdleTimeout()
         }
-        timer.resume()
-        stuckGestureTimer = timer
+        if stuckGestureTimerGeneration == generation {
+            stuckGestureTimer = timer
+        } else {
+            // A scheduler may execute a zero-delay timeout before returning its task.
+            timer.cancel()
+        }
     }
 
     private func cancelStuckGestureTimer() {
-        stuckGestureTimer?.setEventHandler {}
+        stuckGestureTimerGeneration &+= 1
         stuckGestureTimer?.cancel()
         stuckGestureTimer = nil
     }
