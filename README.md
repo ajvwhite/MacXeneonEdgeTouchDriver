@@ -190,6 +190,7 @@ This wait addresses the synthetic-permission restart loop reported in [issue #1]
 ## Known Caveats
 
 - This version targets a single Xeneon Edge panel in landscape orientation. The revised touch, focus and cursor behavior still needs on-device acceptance testing; rotations and multiple matching panels have not been validated.
+- A stationary hold can hit the safety timeout. Repeated HID reports at the same position currently don't reset `timing.stuckGestureTimeoutMs` (2,000 ms by default), so the driver can release the mouse button while your finger is still down. Lift and touch again to start a new gesture after a timeout. Hold behavior still needs on-device testing.
 - Focus restoration is best effort. An intentional app or window selection made during a touch may be restored over, as with the previous behavior. Changes observed after the accepted touch-up report, a newer gesture, shutdown, target invalidation, or a Space/session change stop further restoration work. HID reports and focus notifications can arrive late, so the software boundary cannot establish the exact physical finger-lift time. An AX request already sent to another app can still finish afterward; invalidation cannot undo it.
 - With cursor return enabled, physical mouse movement during a touch does not change the saved return position. With it disabled, cleanup leaves the cursor at its current position rather than warping to an assumed final touch point.
 - Multi-contact gestures are not supported as the hardware doesn't report this information back.
