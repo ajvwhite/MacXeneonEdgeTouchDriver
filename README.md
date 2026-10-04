@@ -179,6 +179,18 @@ The configured gesture delays are unchanged; enabling focus restoration can add 
 
 `gesture.multiTouchEnabled` is always forced to `false` as the hardware only exposes single touch information, if this ever changes we will look to see how to support multi-touch gestures.
 
+## Touch report liveness and source ownership
+
+Valid pressed reports from the accepted endpoint/contact renew `timing.stuckGestureTimeoutMs`, including identical stationary reports. They do not become moves, update the cursor, flush focus preparation, or change tap/drag classification. Accepted touch-up closes pressed liveness before focus eligibility freezes; delayed mouse-up and cursor return have a separate fixed cleanup bound using the same timeout. Default delays and restoration options are unchanged.
+
+Each HID registration has its own parser and contact epochs. Only the source/contact accepted by the gesture controller can move, end, or renew that gesture. A contact that begins on another endpoint while the button/cursor cleanup lease is occupied stays rejected until its own release. A silent rejected endpoint does not block later fresh taps on another endpoint. Merely matching or seizing another interface does not select, reject, or cancel the reporting source. No usage-page/usage pair is hard-coded as the reporting endpoint.
+
+Removing an idle source, or one whose accepted touch-up has already arrived, allows ordinary first-down admission on a replacement registration. If the currently accepted source disappears while still pressed, a prospective source must report release and then a fresh down before it can be accepted. Recovery uses reports and does not require restarting the driver. If a finger was lifted while disconnected and the device emits no neutral report on reconnect, this safeguard may consume the first real tap; that tap's release enables the next one. It is limited to interrupted accepted contacts. Reconnection behavior still requires hardware acceptance testing.
+
+Endpoint registration identity does not establish physical-finger or panel identity. A previously silent endpoint beginning a stream after the prior gesture and debounce have ended may be admitted; the driver cannot distinguish a genuine new touch from an unobserved delayed alias using the available report format. This repair does not claim physical endpoint grouping or multiple-panel support.
+
+The watchdog measures inactivity as processed on the serial gesture queue. When heartbeat and timeout compete, the first processed operation wins: a committed timeout cannot be reversed by a late report, even one captured earlier. Queued valid reports can keep a still-open gesture alive until one timeout after the last processed report, and queue starvation can delay cleanup. This is not a hardware-time or hard real-time guarantee.
+
 ## Permission startup
 
 If synthetic event access is missing, the driver stays alive and waits before opening HID or starting gestures. It installs signal handlers first, makes at most one initial permission request sequence per process, and checks readiness without prompting every two seconds with 500 ms of timer leeway. Grant access to the executable or launcher identified in the log; startup continues automatically. SIGINT, SIGTERM, and normal stop cancel the wait and exit successfully. Cancellation cannot dismiss a dialog macOS has already shown.
@@ -190,7 +202,7 @@ This wait addresses the synthetic-permission restart loop reported in [issue #1]
 ## Known Caveats
 
 - This version targets a single Xeneon Edge panel in landscape orientation. The revised touch, focus and cursor behavior still needs on-device acceptance testing; rotations and multiple matching panels have not been validated.
-- A stationary hold can hit the safety timeout. Repeated HID reports at the same position currently don't reset `timing.stuckGestureTimeoutMs` (2,000 ms by default), so the driver can release the mouse button while your finger is still down. Lift and touch again to start a new gesture after a timeout. Hold behavior still needs on-device testing.
+- A silent or interrupted accepted contact still reaches the safety timeout (`timing.stuckGestureTimeoutMs`, 2,000 ms by default). Continued held reports after cancellation cannot restart that contact; release and touch again. Stationary-report liveness and interrupted-contact recovery still need on-device acceptance testing.
 - Focus restoration is best effort. An intentional app or window selection made during a touch may be restored over, as with the previous behavior. Changes observed after the accepted touch-up report, a newer gesture, shutdown, target invalidation, or a Space/session change stop further restoration work. HID reports and focus notifications can arrive late, so the software boundary cannot establish the exact physical finger-lift time. An AX request already sent to another app can still finish afterward; invalidation cannot undo it.
 - With cursor return enabled, physical mouse movement during a touch does not change the saved return position. With it disabled, cleanup leaves the cursor at its current position rather than warping to an assumed final touch point.
 - Multi-contact gestures are not supported as the hardware doesn't report this information back.

@@ -1,6 +1,13 @@
 import CoreGraphics
 import Foundation
 
+/// Identifies the controller generation that accepted a physical input contact.
+/// It is distinct from the hardware's reused contact ID and the cleanup lease.
+struct GestureInputSession: Equatable, Sendable {
+    let generation: UInt64
+    let contactID: Int
+}
+
 /// Handles normalized touch events and emits cursor/input side effects.
 public final class GestureController {
     /// Current controller state.
@@ -8,6 +15,18 @@ public final class GestureController {
 
     /// Called when all delayed cleanup has completed and the controller is idle.
     public var onBecameIdle: (() -> Void)?
+
+    // These queue-confined hooks only change application liveness ownership.
+    // Closing occurs before focus/cursor/input collaborators can reenter.
+    var onInputSessionEnded: ((GestureInputSession) -> Void)?
+    var onInputSessionInvalidated: ((GestureInputSession) -> Void)?
+    private var inputSession: GestureInputSession?
+    private var physicalInputIsOpen = false
+
+    func acceptsHeartbeat(for session: GestureInputSession) -> Bool {
+        inputSession == session && physicalInputIsOpen && !cancellationRequested &&
+            (phase == .preparing || phase == .tracking)
+    }
 
     private let mapperProvider: () -> CoordinateMapper?
     private let timing: GestureTiming
@@ -96,8 +115,23 @@ public final class GestureController {
         self.scheduler = scheduler
     }
 
+    /// Production admission owns endpoint/epoch quarantine. Clear the older
+    /// ID-only compatibility quarantine only for a new, independently admitted
+    /// physical contact while no global input/cleanup lease remains.
+    func prepareForNewPhysicalContact(contactID: Int) {
+        guard state == .idle, !inputOperationInFlight else { return }
+        failedInputContactIDs.remove(contactID)
+        rejectedContactIDs.remove(contactID)
+    }
+
     /// Handles one normalized touch event.
     public func handle(_ event: TouchEvent) {
+        handle(event, acceptingDown: nil)
+    }
+
+    /// Acceptance is reported before the first reentrant collaborator, never
+    /// inferred from whichever same-ID gesture happens to exist after handle.
+    func handle(_ event: TouchEvent, acceptingDown: ((GestureInputSession) -> Bool)?) {
         if event.kind == .down { contactDownVersions[event.contactID, default: 0] &+= 1 }
         let downVersionAtReceipt = contactDownVersions[event.contactID, default: 0]
         // Side effects may synchronously reenter the controller. Do not admit a
@@ -119,7 +153,11 @@ public final class GestureController {
         // Freeze focus restoration eligibility at the accepted HID release, before synthetic cleanup.
         if event.kind == .up, phase == .preparing || phase == .tracking,
            case .singleTouch(let context) = state, context.contactID == event.contactID {
+            let acceptedGeneration = generation
+            closePhysicalInput()
+            guard generation == acceptedGeneration else { return }
             focusRestorer.inputDidEnd()
+            guard generation == acceptedGeneration else { return }
         }
 
         if let preparation {
@@ -184,6 +222,14 @@ public final class GestureController {
                     hasMoved: false
                 )
             )
+            let acceptedSession = GestureInputSession(generation: generation, contactID: event.contactID)
+            inputSession = acceptedSession
+            physicalInputIsOpen = true
+            if acceptingDown?(acceptedSession) == false {
+                transitionToIdle()
+                return
+            }
+            guard inputSession == acceptedSession, phase == .preparing else { return }
             beginPreparation(contactID: event.contactID, at: point)
 
         case (.singleTouch(let context), .move):
@@ -276,19 +322,31 @@ public final class GestureController {
         forceCancel()
     }
 
+    /// Allows application cleanup to verify that its own collaborator did not
+    /// synchronously replace the generation it intended to cancel.
+    var ownershipGeneration: UInt64 { generation }
+
+    func forceCancel(ifGeneration expected: UInt64) {
+        guard generation == expected else { return }
+        forceCancel()
+    }
+
     /// Forces the controller back to idle, posting cleanup events if needed.
     public func forceCancel() {
+        invalidateInputSession()
         guard phase != .finishing, phase != .releaseBlocked else { return }
         if inputOperationInFlight {
             cancellationRequested = true
             return
         }
         generation &+= 1
+        let cancelledGeneration = generation
         cancelPendingWork()
         rejectedContactIDs.removeAll()
         if preparation != nil {
             cancelPreparation()
             focusRestorer.discardCapturedWindow()
+            guard generation == cancelledGeneration else { return }
             transitionToIdle()
             return
         }
@@ -296,6 +354,7 @@ public final class GestureController {
         switch state {
         case .idle:
             cursorController.forceShow()
+            guard generation == cancelledGeneration else { return }
             focusRestorer.discardCapturedWindow()
 
         case .singleTouch(let context):
@@ -343,19 +402,61 @@ public final class GestureController {
     private func finishPreparation(generation: UInt64, captureReady: Bool) {
         guard let preparation, preparation.generation == generation else { return }
         let captureIsTimely = captureReady && scheduler.now.uptimeNanoseconds < preparation.deadline.uptimeNanoseconds
+        let acceptedGeneration = self.generation
+        // Keep the preparation transition leased across discard and borrow.
+        // A reentrant up after preparation is cleared must still be deferred,
+        // not lost in the gap before tracking begins.
+        inputOperationInFlight = true
+        activeContactEndedDuringInput = false
         cancelPreparation()
         if !captureIsTimely {
             focusRestorer.discardCapturedWindow()
         }
-        guard mapperProvider() != nil,
-              cursorController.borrow(warpingTo: preparation.point) else {
+        guard self.generation == acceptedGeneration, phase == .preparing else {
+            inputOperationInFlight = false
+            return
+        }
+        if cancellationRequested {
+            inputOperationInFlight = false
+            // Cancellation won before any borrow. There is no cursor or button
+            // ownership to release. Keep the lease closed through focus cleanup.
+            rejectedContactIDs.removeAll()
+            phase = .finishing
+            focusRestorer.discardCapturedWindow()
+            transitionToIdle()
+            return
+        }
+        guard mapperProvider() != nil else {
+            inputOperationInFlight = false
+            invalidateInputSession()
             rejectedContactIDs.insert(preparation.contactID)
+            focusRestorer.discardCapturedWindow()
+            guard self.generation == acceptedGeneration else { return }
+            transitionToIdle()
+            return
+        }
+        // Borrow can synchronously reenter too. Retain the global lease until
+        // its result is known, just as for a synthetic post invocation.
+        let borrowed = cursorController.borrow(warpingTo: preparation.point)
+        inputOperationInFlight = false
+        // A borrow collaborator may cancel or replace this gesture. Its old
+        // return value cannot move a newer generation into tracking.
+        guard self.generation == acceptedGeneration, phase == .preparing else { return }
+        guard borrowed else {
+            invalidateInputSession()
+            if !activeContactEndedDuringInput { rejectedContactIDs.insert(preparation.contactID) }
+            phase = .finishing
             focusRestorer.discardCapturedWindow()
             transitionToIdle()
             return
         }
         phase = .tracking
+        if cancellationRequested {
+            finishDeferredInput()
+            return
+        }
         scheduleMouseDown(generation: self.generation, at: preparation.point)
+        finishDeferredInput()
     }
 
     private func cancelPreparation() {
@@ -442,15 +543,16 @@ public final class GestureController {
             let wasFailed = failedInputContactIDs.remove(event.contactID) != nil
             let wasRejected = rejectedContactIDs.remove(event.contactID) != nil
             if wasFailed || wasRejected { return }
-            if phase == .tracking, case .singleTouch(let context) = state,
+            if phase == .preparing || phase == .tracking, case .singleTouch(let context) = state,
                context.contactID == event.contactID, deferredInputEnd == nil {
                 // One terminal event is enough; never buffer an unbounded path.
                 deferredInputEnd = (generation, event)
+                closePhysicalInput()
                 focusRestorer.inputDidEnd()
             }
         } else if event.kind == .down {
             failedInputContactIDs.insert(event.contactID)
-            if phase == .tracking, case .singleTouch(let context) = state,
+            if phase == .preparing || phase == .tracking, case .singleTouch(let context) = state,
                context.contactID == event.contactID {
                 // The reused active ID is ambiguous, just like an ordinary second
                 // down. Cancel only after the in-flight result establishes ownership.
@@ -480,6 +582,7 @@ public final class GestureController {
     }
 
     private func abortFailedMouseDown(contactID: Int) {
+        invalidateInputSession()
         // No poster was invoked, so no release is owed. Block reentry until cursor
         // cleanup finishes, discard focus eligibility, and quarantine the contact.
         phase = .finishing
@@ -511,6 +614,7 @@ public final class GestureController {
             // Never hide a contract violation behind idle, a cursor warp, or retries.
             // Release visibility/association without moving the cursor; ownership
             // remains unresolved, and repeated lifecycle cleanup is a no-op.
+            invalidateInputSession()
             phase = .releaseBlocked
             cancellationRequested = false
             cancelPendingWork()
@@ -525,9 +629,11 @@ public final class GestureController {
     }
 
     private func cancelForMissingMapper() {
+        let cancelledGeneration = generation
+        invalidateInputSession()
         // Geometry loss must not use focus-restoration fallbacks at stale coordinates.
         focusRestorer.discardCapturedWindow()
-        forceCancel()
+        forceCancel(ifGeneration: cancelledGeneration)
     }
 
     private func scheduleMouseUpThenReturn(generation: UInt64, at point: CGPoint) {
@@ -598,7 +704,26 @@ public final class GestureController {
         focusRestorer.restoreCapturedWindow()
     }
 
+    private func closePhysicalInput() {
+        guard physicalInputIsOpen, let session = inputSession else { return }
+        physicalInputIsOpen = false
+        onInputSessionEnded?(session)
+    }
+
+    /// Application teardown seals liveness before its own focus collaborators.
+    func invalidatePhysicalInput() {
+        invalidateInputSession()
+    }
+
+    private func invalidateInputSession() {
+        guard let session = inputSession else { return }
+        inputSession = nil
+        physicalInputIsOpen = false
+        onInputSessionInvalidated?(session)
+    }
+
     private func transitionToIdle() {
+        invalidateInputSession()
         cancelPreparation()
         generation &+= 1
         cancelPendingWork()

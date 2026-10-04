@@ -3,13 +3,15 @@ import Foundation
 /// Parses the Xeneon Edge's observed single-touch input report format.
 public final class HIDValueParser {
     private var isTouching = false
+    private var contactEpoch: UInt64 = 0
     private var lastRawX: Int?
     private var lastRawY: Int?
 
     /// Creates a parser with no active touch state.
     public init() {}
 
-    /// Resets parser state, treating the next report as a fresh stream.
+    /// Resets normalization, treating the next report as a fresh stream.
+    /// Contact epochs remain monotonic for the lifetime of this parser.
     public func reset() {
         isTouching = false
         lastRawX = nil
@@ -18,6 +20,32 @@ public final class HIDValueParser {
 
     /// Parses one raw HID input report into zero or one normalized touch events.
     public func parseReport(reportID: Int, bytes: [UInt8], timestamp: DispatchTime = .now()) -> TouchEvent? {
+        parseValidatedReport(reportID: reportID, bytes: bytes, timestamp: timestamp)?.event
+    }
+
+    /// Production registrations call this path once per validated callback.
+    func parseObservation(
+        sourceID: HIDSourceID,
+        reportID: Int,
+        bytes: [UInt8],
+        timestamp: DispatchTime = .now()
+    ) -> HIDTouchObservation? {
+        guard let parsed = parseValidatedReport(reportID: reportID, bytes: bytes, timestamp: timestamp) else {
+            return nil
+        }
+        return HIDTouchObservation(
+            sourceID: sourceID, contactEpoch: parsed.contactEpoch,
+            isPressed: parsed.isPressed, timestamp: timestamp, event: parsed.event
+        )
+    }
+
+    private struct ParsedReport {
+        let contactEpoch: UInt64
+        let isPressed: Bool
+        let event: TouchEvent?
+    }
+
+    private func parseValidatedReport(reportID: Int, bytes: [UInt8], timestamp: DispatchTime) -> ParsedReport? {
         guard reportID == XeneonEdgeDevice.touchReportID else {
             return nil
         }
@@ -33,6 +61,8 @@ public final class HIDValueParser {
         let event: TouchEvent?
         switch (isTouching, isDown) {
         case (false, true):
+            precondition(contactEpoch < UInt64.max, "HID contact epochs exhausted.")
+            contactEpoch += 1
             event = TouchEvent(kind: .down, contactID: 0, rawX: rawX, rawY: rawY, timestamp: timestamp)
 
         case (true, true):
@@ -52,6 +82,6 @@ public final class HIDValueParser {
         isTouching = isDown
         lastRawX = rawX
         lastRawY = rawY
-        return event
+        return ParsedReport(contactEpoch: contactEpoch, isPressed: isDown, event: event)
     }
 }

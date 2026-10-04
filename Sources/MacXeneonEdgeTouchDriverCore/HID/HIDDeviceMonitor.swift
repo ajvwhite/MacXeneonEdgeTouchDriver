@@ -18,11 +18,18 @@ public enum HIDDeviceMonitorError: Error, LocalizedError, Equatable {
 /// Monitors the Xeneon Edge HID device and emits parsed single-touch events.
 /// An active monitor must be retained and stopped on main before its final release.
 /// The supplied event queue must be serial; handlers and their captured state
-/// belong to that queue. stop() closes HID ingress, but already-enqueued handlers
-/// may still run: owners must drain their event queue before releasing that state.
+/// belong to that queue. stop() closes HID ingress and retires every source before
+/// owners drain their event queue. Queued reports check their retirement fence;
+/// already-running handlers and lifecycle callbacks still require that drain.
 public final class HIDDeviceMonitor {
     /// Receives parsed touch events on the configured event queue.
     public typealias TouchEventHandler = (TouchEvent) -> Void
+
+    /// Receives each valid report and its retirement fence as one ordered operation.
+    public typealias ObservationHandler = (HIDTouchObservation, HIDSourceRetirementFence) -> Void
+
+    /// Receives the exact lifetime of a removed endpoint on the event queue.
+    public typealias SourceRemovalHandler = (HIDSourceID) -> Void
 
     /// Receives device match events on the configured event queue.
     public typealias DeviceMatchedHandler = () -> Void
@@ -33,9 +40,10 @@ public final class HIDDeviceMonitor {
     private static let defaultInputReportBufferLength = 256
 
     private let manager: IOHIDManager
-    private let parser: HIDValueParser
     private let eventQueue: DispatchQueue
     private let touchEventHandler: TouchEventHandler
+    private let observationDelivery: HIDSerialDelivery<HIDObservationDeliveryPayload>?
+    private let sourceRemovalDelivery: HIDSerialDelivery<[HIDSourceID]>?
     private let deviceMatchedHandler: DeviceMatchedHandler
     private let deviceRemovalHandler: DeviceRemovalHandler
     private let openOptions: IOOptionBits
@@ -49,18 +57,43 @@ public final class HIDDeviceMonitor {
     /// - Parameters:
     ///   - seizeDevice: Use `true` for the production driver so macOS does not
     ///     also consume the touchscreen as a generic pointer device.
+    ///   - observationHandler: When supplied, receives validated observations in
+    ///     place of `touchEventHandler`, including duplicate pressed reports.
+    ///   - sourceRemovalHandler: When supplied, receives source-specific removals
+    ///     in place of the legacy source-blind `deviceRemovalHandler`.
+    ///
+    /// Each registration owns its parser. The former shared `parser:` injection
+    /// parameter is intentionally removed; normalized callback usage is unchanged.
     public init(
-        parser: HIDValueParser = HIDValueParser(),
         eventQueue: DispatchQueue,
         seizeDevice: Bool = true,
         touchEventHandler: @escaping TouchEventHandler,
         deviceRemovalHandler: @escaping DeviceRemovalHandler,
-        deviceMatchedHandler: @escaping DeviceMatchedHandler = {}
+        deviceMatchedHandler: @escaping DeviceMatchedHandler = {},
+        observationHandler: ObservationHandler? = nil,
+        sourceRemovalHandler: SourceRemovalHandler? = nil
     ) {
         self.manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        self.parser = parser
         self.eventQueue = eventQueue
         self.touchEventHandler = touchEventHandler
+        if let observationHandler {
+            self.observationDelivery = HIDSerialDelivery<HIDObservationDeliveryPayload>(queue: eventQueue) { payload in
+                // Observation mode never invokes the legacy event callback.
+                Self.deliverObservation(
+                    payload.observation, fence: payload.fence, touchEventHandler: { _ in },
+                    observationHandler: observationHandler
+                )
+            }
+        } else {
+            self.observationDelivery = nil
+        }
+        if let sourceRemovalHandler {
+            self.sourceRemovalDelivery = HIDSerialDelivery<[HIDSourceID]>(queue: eventQueue) { sourceIDs in
+                sourceIDs.forEach(sourceRemovalHandler)
+            }
+        } else {
+            self.sourceRemovalDelivery = nil
+        }
         self.deviceMatchedHandler = deviceMatchedHandler
         self.deviceRemovalHandler = deviceRemovalHandler
         self.openOptions = seizeDevice
@@ -123,7 +156,6 @@ public final class HIDDeviceMonitor {
         IOHIDManagerClose(manager, openOptions)
         reportRegistrations.forEach { $0.unregisterCallback() }
         reportRegistrations.removeAll()
-        parser.reset()
     }
 
     fileprivate func handleDeviceMatched(_ device: IOHIDDevice) {
@@ -135,8 +167,8 @@ public final class HIDDeviceMonitor {
         let registration = HIDReportRegistration(
             device: device,
             length: maxInputReportLength(for: device),
-            receive: { [weak self] reportID, bytes, timestamp in
-                self?.handleInputReport(reportID: reportID, bytes: bytes, timestamp: timestamp)
+            receiveObservation: { [weak self] observation, fence in
+                self?.handleObservation(observation, fence: fence)
             }
         )
         reportRegistrations.append(registration)
@@ -172,25 +204,48 @@ public final class HIDDeviceMonitor {
             $0.unregisterCallback()
         }
         reportRegistrations.removeAll { $0.matches(device) }
-        parser.reset()
 
         DriverLoggers.log(.notice, category: .hid, "Xeneon Edge HID device removed; canceling active gesture if needed.")
-        eventQueue.async { [deviceRemovalHandler] in
-            deviceRemovalHandler()
+        let sourceIDs = removed.map { $0.input.sourceID }
+        if let sourceRemovalDelivery {
+            sourceRemovalDelivery.enqueue(sourceIDs)
+        } else {
+            eventQueue.async { [deviceRemovalHandler] in
+                deviceRemovalHandler()
+            }
         }
     }
 
-    private func handleInputReport(reportID: UInt32, bytes: [UInt8], timestamp: DispatchTime) {
+    private func handleObservation(_ observation: HIDTouchObservation, fence: HIDSourceRetirementFence) {
         precondition(Thread.isMainThread, "HID reports must use the main run loop.")
-        guard isStarted, let event = parser.parseReport(
-            reportID: Int(reportID),
-            bytes: bytes,
-            timestamp: timestamp
-        ) else {
-            return
-        }
+        guard isStarted, !fence.isRetired else { return }
 
-        eventQueue.async { [touchEventHandler] in
+        // Only immutable values and the locked retirement fence cross queues.
+        // Event and liveness are delivered together, never as independent tasks.
+        if let observationDelivery {
+            observationDelivery.enqueue(HIDObservationDeliveryPayload(observation: observation, fence: fence))
+        } else {
+            eventQueue.async { [touchEventHandler] in
+                Self.deliverObservation(
+                    observation, fence: fence, touchEventHandler: touchEventHandler,
+                    observationHandler: nil
+                )
+            }
+        }
+    }
+
+    /// The queue-delivery seam is shared by production and offline lifetime tests.
+    /// It has no reference to a main-only monitor, registration, buffer or parser.
+    static func deliverObservation(
+        _ observation: HIDTouchObservation,
+        fence: HIDSourceRetirementFence,
+        touchEventHandler: TouchEventHandler,
+        observationHandler: ObservationHandler?
+    ) {
+        guard !fence.isRetired else { return }
+        if let observationHandler {
+            observationHandler(observation, fence)
+        } else if let event = observation.event {
             touchEventHandler(event)
         }
     }
@@ -223,12 +278,15 @@ private final class HIDReportRegistration {
     let device: IOHIDDevice
     let input: HIDInputReportRegistration
 
-    init(device: IOHIDDevice, length: Int, receive: @escaping (UInt32, [UInt8], DispatchTime) -> Void) {
+    init(
+        device: IOHIDDevice, length: Int,
+        receiveObservation: @escaping (HIDTouchObservation, HIDSourceRetirementFence) -> Void
+    ) {
         self.device = device
         self.input = HIDInputReportRegistration(
             sender: Unmanaged.passUnretained(device).toOpaque(),
             length: length,
-            receive: receive
+            receiveObservation: receiveObservation
         )
     }
 

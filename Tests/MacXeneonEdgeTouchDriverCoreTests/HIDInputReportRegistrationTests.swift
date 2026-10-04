@@ -18,6 +18,12 @@ final class HIDInputReportRegistrationTests: XCTestCase {
             fixture.deliver()
 
             XCTAssertEqual(fixture.receivedReports, 4)
+            XCTAssertEqual(fixture.observations.count, 4)
+            XCTAssertEqual(fixture.observations.map(\.contactEpoch), [1, 1, 1, 1])
+            XCTAssertEqual(fixture.observations.map(\.isPressed), [true, true, true, false])
+            XCTAssertEqual(fixture.observations.map(\.sourceID), Array(repeating: fixture.registration.sourceID, count: 4))
+            XCTAssertNil(fixture.observations[1].event)
+            XCTAssertEqual(fixture.observations.first?.timestamp.uptimeNanoseconds, timestamp.uptimeNanoseconds)
             XCTAssertEqual(fixture.events.map(\.kind), [.down, .move, .up])
             XCTAssertEqual(fixture.events.map(\.rawX), [10, 11, 11])
             XCTAssertEqual(fixture.events.map(\.rawY), [20, 21, 21])
@@ -63,7 +69,9 @@ final class HIDInputReportRegistrationTests: XCTestCase {
             first.write(isDown: true)
             first.deliver(sender: second.sender)
             XCTAssertEqual(first.receivedReports, 0)
+            XCTAssertTrue(first.observations.isEmpty)
             XCTAssertEqual(second.receivedReports, 0)
+            XCTAssertTrue(second.observations.isEmpty)
             first.deliver()
             XCTAssertEqual(first.events.map(\.kind), [.down])
         }
@@ -87,6 +95,7 @@ final class HIDInputReportRegistrationTests: XCTestCase {
             short.deliver(length: XeneonEdgeDevice.touchReportLength + 1)
             larger.deliver(length: 32)
             XCTAssertEqual(short.receivedReports, 0)
+            XCTAssertTrue(short.observations.isEmpty)
             XCTAssertEqual(larger.receivedReports, 1)
             XCTAssertEqual(larger.lastBytes?.count, 32)
             short.deliver()
@@ -102,14 +111,9 @@ final class HIDInputReportRegistrationTests: XCTestCase {
     }
 
     func testUnknownAndMissingContextsAreRejectedWithoutDereferencingThem() {
-        onMain {
-            let fixture = InputReportFixture()
-            fixture.write(isDown: true)
+        assertRejectedWithoutParserMutation { fixture in
             fixture.deliver(context: UnsafeMutableRawPointer(bitPattern: UInt.max))
             fixture.deliver(context: nil)
-            XCTAssertEqual(fixture.receivedReports, 0)
-            fixture.deliver()
-            XCTAssertEqual(fixture.events.map(\.kind), [.down])
         }
     }
 
@@ -122,16 +126,22 @@ final class HIDInputReportRegistrationTests: XCTestCase {
             first.registration.invalidate()
             first.deliver()
             XCTAssertEqual(first.receivedReports, 0)
+            XCTAssertTrue(first.observations.isEmpty)
 
             let replacement = InputReportFixture(sender: first.sender)
             XCTAssertNotEqual(oldContext, replacement.registration.context)
+            XCTAssertNotEqual(first.registration.sourceID, replacement.registration.sourceID)
+            XCTAssertTrue(first.registration.retirementFence.isRetired)
+            XCTAssertFalse(replacement.registration.retirementFence.isRetired)
             replacement.write(isDown: true)
             // Even when every other callback argument belongs to the replacement,
             // a retired token cannot be mistaken for the replacement generation.
             replacement.deliver(context: oldContext)
             XCTAssertEqual(replacement.receivedReports, 0)
+            XCTAssertTrue(replacement.observations.isEmpty)
             replacement.deliver()
             XCTAssertEqual(replacement.events.map(\.kind), [.down])
+            XCTAssertEqual(replacement.observations.first?.contactEpoch, 1)
         }
     }
 
@@ -139,8 +149,11 @@ final class HIDInputReportRegistrationTests: XCTestCase {
         onMain {
             let sender = UnsafeMutableRawPointer(bitPattern: 0x1000)!
             var received = 0
+            var observed = 0
             var registration: HIDInputReportRegistration? = HIDInputReportRegistration(
-                sender: sender, length: 7, receive: { _, _, _ in received += 1 }
+                sender: sender, length: 7,
+                receiveObservation: { _, _ in observed += 1 },
+                receive: { _, _, _ in received += 1 }
             )
             weak var weakRegistration: HIDInputReportRegistration?
             weakRegistration = registration
@@ -156,6 +169,7 @@ final class HIDInputReportRegistrationTests: XCTestCase {
                 type: kIOHIDReportTypeInput, reportID: 7, report: report, reportLength: 7
             )
             XCTAssertEqual(received, 0)
+            XCTAssertEqual(observed, 0)
         }
     }
 
@@ -171,6 +185,9 @@ final class HIDInputReportRegistrationTests: XCTestCase {
             XCTAssertEqual(fixture.events.first?.rawX, 65_535)
             XCTAssertEqual(fixture.events.first?.rawY, 65_535)
             XCTAssertEqual(fixture.lastBytes?.count, 16)
+            XCTAssertEqual(fixture.observations.count, 1)
+            XCTAssertEqual(fixture.observations.first?.contactEpoch, 1)
+            XCTAssertEqual(fixture.observations.first?.isPressed, true)
         }
     }
 
@@ -201,6 +218,7 @@ final class HIDInputReportRegistrationTests: XCTestCase {
             worker.start()
             completed.wait()
             XCTAssertEqual(fixture.receivedReports, 0)
+            XCTAssertTrue(fixture.observations.isEmpty)
             XCTAssertTrue(fixture.events.isEmpty)
             fixture.deliver()
             XCTAssertEqual(fixture.events.map(\.kind), [.down])
@@ -214,13 +232,13 @@ final class HIDInputReportRegistrationTests: XCTestCase {
             weak var observedRegistration: HIDInputReportRegistration?
             var received = 0
             var copiedBytes: [UInt8]?
-            registration = HIDInputReportRegistration(sender: sender, length: 7) { _, bytes, _ in
+            registration = HIDInputReportRegistration(sender: sender, length: 7, receive: { _, bytes, _ in
                 received += 1
                 registration?.invalidate()
                 registration = nil
                 XCTAssertNotNil(observedRegistration)
                 copiedBytes = bytes
-            }
+            })
             observedRegistration = registration
             let context = registration!.context
             let report = registration!.buffer
@@ -242,6 +260,122 @@ final class HIDInputReportRegistrationTests: XCTestCase {
         }
     }
 
+    func testSourceParsersAndContactEpochsAreIndependent() {
+        onMain {
+            let first = InputReportFixture()
+            let second = InputReportFixture(sender: UnsafeMutableRawPointer(bitPattern: 0x2000)!)
+            first.write(isDown: true)
+            first.deliver()
+            second.write(isDown: false)
+            second.deliver()
+            first.deliver()
+            second.write(isDown: true, x: 200)
+            second.deliver()
+            second.write(isDown: false, x: 200)
+            second.deliver()
+            first.deliver()
+
+            XCTAssertEqual(first.events.map(\.kind), [.down])
+            XCTAssertEqual(first.observations.map(\.contactEpoch), [1, 1, 1])
+            XCTAssertEqual(second.events.map(\.kind), [.down, .up])
+            XCTAssertEqual(second.observations.map(\.contactEpoch), [0, 1, 1])
+            XCTAssertNotEqual(first.registration.sourceID, second.registration.sourceID)
+
+            second.registration.invalidate()
+            first.deliver()
+            XCTAssertNil(first.observations.last?.event)
+            XCTAssertEqual(first.observations.last?.contactEpoch, 1)
+            XCTAssertFalse(first.registration.retirementFence.isRetired)
+
+            first.write(isDown: false)
+            first.deliver()
+            first.write(isDown: true)
+            first.deliver()
+            XCTAssertEqual(first.events.map(\.kind), [.down, .up, .down])
+            XCTAssertEqual(first.observations.last?.contactEpoch, 2)
+        }
+    }
+
+    func testIdleReleaseProducesObservationWithoutCreatingContact() {
+        onMain {
+            let fixture = InputReportFixture()
+            fixture.write(isDown: false)
+            let timestamps = [DispatchTime(uptimeNanoseconds: 200), DispatchTime(uptimeNanoseconds: 300)]
+            fixture.deliver(timestamp: timestamps[0])
+            fixture.deliver(timestamp: timestamps[1])
+            XCTAssertEqual(fixture.observations.map(\.contactEpoch), [0, 0])
+            XCTAssertEqual(fixture.observations.map(\.isPressed), [false, false])
+            // Assert exact transport of the supplied clock values. Darwin may
+            // round the constructor's integer nanoseconds to Mach timebase ticks.
+            XCTAssertEqual(fixture.observations.map(\.timestamp), timestamps)
+            XCTAssertTrue(fixture.events.isEmpty)
+            fixture.write(isDown: true)
+            fixture.deliver()
+            XCTAssertEqual(fixture.observations.last?.contactEpoch, 1)
+            XCTAssertEqual(fixture.events.map(\.kind), [.down])
+        }
+    }
+
+    func testRetirementFenceOutlivesRegistrationWithoutRetainingIt() {
+        onMain {
+            var registration: HIDInputReportRegistration? = HIDInputReportRegistration(
+                sender: UnsafeMutableRawPointer(bitPattern: 0x1000)!, length: 7
+            )
+            weak var weakRegistration: HIDInputReportRegistration?
+            weakRegistration = registration
+            let fence = registration!.retirementFence
+            let sourceID = registration!.sourceID
+            XCTAssertEqual(fence.sourceID, sourceID)
+            XCTAssertFalse(fence.isRetired)
+            registration = nil
+            XCTAssertNil(weakRegistration)
+            XCTAssertTrue(fence.isRetired)
+
+            // Only the locked Sendable fence crosses the boundary, never the
+            // released registration or parser. The main thread waits for readers.
+            let completed = DispatchSemaphore(value: 0)
+            Thread {
+                XCTAssertTrue(fence.isRetired)
+                XCTAssertEqual(fence.sourceID, sourceID)
+                completed.signal()
+            }.start()
+            completed.wait()
+        }
+    }
+
+    func testObservationReceiverCanRetireDuringDelivery() {
+        onMain {
+            var registration: HIDInputReportRegistration?
+            weak var weakRegistration: HIDInputReportRegistration?
+            var delivered: HIDTouchObservation?
+            var deliveredFence: HIDSourceRetirementFence?
+            registration = HIDInputReportRegistration(
+                sender: UnsafeMutableRawPointer(bitPattern: 0x1000)!, length: 7,
+                receiveObservation: { observation, fence in
+                    delivered = observation
+                    deliveredFence = fence
+                    registration?.invalidate()
+                    registration = nil
+                    XCTAssertNotNil(weakRegistration)
+                    XCTAssertTrue(fence.isRetired)
+                }
+            )
+            weakRegistration = registration
+            let context = registration!.context
+            let report = registration!.buffer
+            for (index, byte) in [UInt8(7), 1, 10, 0, 20, 0, 0].enumerated() { report[index] = byte }
+            HIDInputReportRegistration.handleCallback(
+                context: context, result: kIOReturnSuccess,
+                sender: UnsafeMutableRawPointer(bitPattern: 0x1000),
+                type: kIOHIDReportTypeInput, reportID: 7, report: report, reportLength: 7
+            )
+            XCTAssertNil(weakRegistration)
+            XCTAssertEqual(delivered?.event?.kind, .down)
+            XCTAssertEqual(delivered?.contactEpoch, 1)
+            XCTAssertEqual(deliveredFence?.isRetired, true)
+        }
+    }
+
     private func assertRejectedWithoutParserMutation(
         _ sendInvalid: (InputReportFixture) -> Void,
         file: StaticString = #filePath,
@@ -250,17 +384,23 @@ final class HIDInputReportRegistrationTests: XCTestCase {
         onMain {
             let fixture = InputReportFixture()
             fixture.write(isDown: true)
+            sendInvalid(fixture)
+            XCTAssertEqual(fixture.receivedReports, 0, file: file, line: line)
+            XCTAssertTrue(fixture.observations.isEmpty, file: file, line: line)
             fixture.deliver()
             XCTAssertEqual(fixture.events.map(\.kind), [.down], file: file, line: line)
+            XCTAssertEqual(fixture.observations.first?.contactEpoch, 1, file: file, line: line)
             fixture.write(isDown: false)
             sendInvalid(fixture)
             XCTAssertEqual(fixture.receivedReports, 1, file: file, line: line)
+            XCTAssertEqual(fixture.observations.count, 1, file: file, line: line)
             XCTAssertEqual(fixture.events.map(\.kind), [.down], file: file, line: line)
 
             fixture.write(isDown: true, x: 11)
             fixture.deliver()
             // An invalid up report must not end the parser's current touch.
             XCTAssertEqual(fixture.events.map(\.kind), [.down, .move], file: file, line: line)
+            XCTAssertEqual(fixture.observations.map(\.contactEpoch), [1, 1], file: file, line: line)
         }
     }
 
@@ -272,22 +412,29 @@ final class HIDInputReportRegistrationTests: XCTestCase {
 
 private final class InputReportFixture {
     let sender: UnsafeMutableRawPointer
-    private let parser = HIDValueParser()
     private(set) var registration: HIDInputReportRegistration!
     private(set) var receivedReports = 0
     private(set) var lastBytes: [UInt8]?
     private(set) var events: [TouchEvent] = []
+    private(set) var observations: [HIDTouchObservation] = []
 
     init(capacity: Int = 16, sender: UnsafeMutableRawPointer = UnsafeMutableRawPointer(bitPattern: 0x1000)!) {
         self.sender = sender
-        registration = HIDInputReportRegistration(sender: sender, length: capacity) { [weak self] reportID, bytes, timestamp in
-            guard let self else { return }
-            receivedReports += 1
-            lastBytes = bytes
-            if let event = parser.parseReport(reportID: Int(reportID), bytes: bytes, timestamp: timestamp) {
-                events.append(event)
+        registration = HIDInputReportRegistration(
+            sender: sender, length: capacity,
+            receiveObservation: { [weak self] observation, fence in
+                guard let self else { return }
+                XCTAssertEqual(observation.sourceID, fence.sourceID)
+                XCTAssertFalse(fence.isRetired)
+                observations.append(observation)
+                if let event = observation.event { events.append(event) }
+            },
+            receive: { [weak self] _, bytes, _ in
+                guard let self else { return }
+                receivedReports += 1
+                lastBytes = bytes
             }
-        }
+        )
     }
 
     func write(isDown: Bool, x: Int = 10, y: Int = 20) {

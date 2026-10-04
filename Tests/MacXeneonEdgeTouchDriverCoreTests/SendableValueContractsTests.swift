@@ -46,6 +46,22 @@ final class SendableValueContractsTests: XCTestCase {
         }
     }
 
+    func testHIDObservationsAndRetirementFenceCanCrossQueues() {
+        let sourceID = HIDSourceID(rawValue: 123)
+        let observation = HIDTouchObservation(
+            sourceID: sourceID, contactEpoch: 456, isPressed: true,
+            timestamp: DispatchTime(uptimeNanoseconds: 789), event: nil
+        )
+        let fence = HIDSourceRetirementFence(sourceID: sourceID)
+        XCTAssertEqual(sendableSnapshot(sourceID)(), sourceID)
+        XCTAssertEqual(sendableSnapshot(observation)(), observation)
+        let capturedFence = sendableSnapshot(fence)
+        XCTAssertTrue(capturedFence() === fence)
+        XCTAssertFalse(capturedFence().isRetired)
+        fence.retire()
+        XCTAssertTrue(capturedFence().isRetired)
+    }
+
     func testWorkspaceEventHintsCanBeCapturedBySendableClosure() {
         let snapshot = sendableSnapshot(WorkspaceFocusMonitor.Event.sessionActive(false))
         guard case .sessionActive(false) = snapshot() else {

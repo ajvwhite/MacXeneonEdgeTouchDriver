@@ -25,6 +25,9 @@ final class TestGestureScheduler: GestureScheduler {
     private var tasks: [Task] = []
     private let executeCancelledActions: Bool
 
+    /// Includes canceled work, so tests can prove that ignored input did not rearm.
+    var scheduledTaskCount: Int { nextSequence }
+
     /// Delivering cancelled work simulates a callback that has already started.
     init(nowMilliseconds: UInt64 = 0, executeCancelledActions: Bool = false) {
         now = DispatchTime(uptimeNanoseconds: nowMilliseconds * 1_000_000)
@@ -52,11 +55,15 @@ final class TestGestureScheduler: GestureScheduler {
         advance(toNanoseconds: now.uptimeNanoseconds + milliseconds * 1_000_000)
     }
 
+    func advance(byNanoseconds nanoseconds: UInt64) {
+        advance(toNanoseconds: now.uptimeNanoseconds + nanoseconds)
+    }
+
     func advance(toMilliseconds milliseconds: UInt64) {
         advance(toNanoseconds: milliseconds * 1_000_000)
     }
 
-    private func advance(toNanoseconds target: UInt64) {
+    func advance(toNanoseconds target: UInt64) {
         precondition(target >= now.uptimeNanoseconds, "Virtual time cannot move backwards")
 
         while let next = tasks.min(by: {
@@ -69,5 +76,27 @@ final class TestGestureScheduler: GestureScheduler {
             }
         }
         now = DispatchTime(uptimeNanoseconds: target)
+    }
+
+    /// Linearizes one report before timers at this exact deadline. Earlier work
+    /// still runs first. Ordinary advance followed by a report gives timeout-first.
+    func advance(toNanoseconds requestedTarget: UInt64, beforeDueActions action: () -> Void) {
+        // Darwin rounds nanoseconds up to a representable Mach tick. Use that
+        // single projected instant throughout this seam so its final drain does
+        // not compare an unrepresentable raw request against the projected now.
+        let target = DispatchTime(uptimeNanoseconds: requestedTarget).uptimeNanoseconds
+        precondition(target >= now.uptimeNanoseconds, "Virtual time cannot move backwards")
+        while let next = tasks.min(by: {
+            ($0.deadline, $0.sequence) < ($1.deadline, $1.sequence)
+        }), next.deadline < target {
+            tasks.removeAll { $0 === next }
+            now = DispatchTime(uptimeNanoseconds: next.deadline)
+            if !next.isCancelled || executeCancelledActions {
+                next.action()
+            }
+        }
+        now = DispatchTime(uptimeNanoseconds: target)
+        action()
+        advance(toNanoseconds: target)
     }
 }

@@ -31,6 +31,12 @@ public final class MacXeneonEdgeTouchDriverApplication {
             timing: GestureTiming(configuration: configuration.timing),
             scheduler: scheduler
         )
+        controller.onInputSessionEnded = { [weak self] session in
+            self?.inputSessionEnded(session)
+        }
+        controller.onInputSessionInvalidated = { [weak self] session in
+            self?.inputSessionInvalidated(session)
+        }
         controller.onBecameIdle = { [weak self] in
             self?.cancelStuckGestureTimer()
         }
@@ -48,9 +54,48 @@ public final class MacXeneonEdgeTouchDriverApplication {
         },
         deviceMatchedHandler: { [weak self] in
             self?.handleDeviceMatched()
+        },
+        observationHandler: { [weak self] observation, fence in
+            self?.handleTouchObservation(observation, fence: fence)
+        },
+        sourceRemovalHandler: { [weak self] sourceID in
+            self?.handleSourceRemoval(sourceID)
         }
     )
 
+    private struct SourceContact {
+        var epoch: UInt64
+        var isPressed: Bool
+        var isClosed: Bool
+        var isRejected: Bool
+        var needsRelease: Bool
+    }
+
+    private struct HIDContact: Equatable {
+        let sourceID: HIDSourceID
+        let epoch: UInt64
+    }
+
+    private enum InputOrigin: Equatable {
+        case hid(HIDContact)
+        case normalized(UInt64)
+    }
+
+    private enum WatchdogMode: Equatable { case pressed, cleanup }
+
+    private struct InputLease {
+        let origin: InputOrigin
+        let session: GestureInputSession
+        let fence: HIDSourceRetirementFence?
+        var mode: WatchdogMode
+    }
+
+    // All session/arbitration/watchdog state belongs to the serial gesture queue.
+    private var sourceContacts: [HIDSourceID: SourceContact] = [:]
+    private var resynchronizeNewSources = false
+    private var inputLease: InputLease?
+    private var normalizedSequence: UInt64 = 0
+    private var normalizedOrigins: [Int: InputOrigin] = [:]
     private var stuckGestureTimer: GestureScheduledTask?
     private var stuckGestureTimerGeneration: UInt64 = 0
     private var currentDisplaySnapshot: DisplaySnapshot?
@@ -231,7 +276,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
         // fence a callback already selected by CoreGraphics, including on error.
         unregisterDisplayReconfigurationCallback()
         gestureQueue.sync {
-            cancelActiveGesture()
+            handleHIDStop()
         }
     }
 
@@ -309,20 +354,142 @@ public final class MacXeneonEdgeTouchDriverApplication {
         }
     }
 
+    /// Compatibility seam for normalized-event clients. HID production always
+    /// uses the source-scoped observation path below.
     func handleTouchEvent(_ event: TouchEvent) {
         if event.kind == .down {
+            normalizedSequence &+= 1
+            normalizedOrigins[event.contactID] = .normalized(normalizedSequence)
+        }
+        guard let origin = normalizedOrigins[event.contactID] else { return }
+        handleNormalizedEvent(event, origin: origin, fence: nil)
+        if event.kind == .up, normalizedOrigins[event.contactID] == origin {
+            normalizedOrigins.removeValue(forKey: event.contactID)
+        }
+    }
+
+    /// One ordered queue operation for both normalized effects and liveness.
+    /// Suppressed stationary packets never enter GestureController.handle.
+    func handleTouchObservation(_ observation: HIDTouchObservation, fence: HIDSourceRetirementFence) {
+        guard observation.sourceID == fence.sourceID, !fence.isRetired else { return }
+        let sourceID = observation.sourceID
+        var contact = sourceContacts[sourceID] ?? SourceContact(
+            epoch: 0, isPressed: false, isClosed: false, isRejected: false,
+            needsRelease: resynchronizeNewSources)
+        guard observation.contactEpoch >= contact.epoch else { return }
+        if observation.contactEpoch > contact.epoch {
+            contact.epoch = observation.contactEpoch
+            contact.isPressed = false
+            contact.isClosed = false
+            contact.isRejected = false
+        }
+        let origin = InputOrigin.hid(HIDContact(sourceID: sourceID, epoch: observation.contactEpoch))
+
+        if !observation.isPressed {
+            // Release clears only this endpoint/contact's quarantine or recovery
+            // barrier. Foreign up never enters the owner's focus/input path.
+            let wasOpen = contact.isPressed
+            contact.isPressed = false
+            contact.isClosed = true
+            contact.needsRelease = false
+            contact.isRejected = false
+            sourceContacts[sourceID] = contact
+            if wasOpen, inputLease?.origin == origin,
+               inputLease?.mode == .pressed, let event = observation.event, event.kind == .up {
+                handleNormalizedEvent(event, origin: origin, fence: fence)
+            }
+            return
+        }
+
+        guard !contact.isClosed else { return }
+        let isFreshDown = !contact.isPressed && observation.event?.kind == .down
+        contact.isPressed = true
+        if contact.needsRelease { contact.isRejected = true }
+        sourceContacts[sourceID] = contact
+        guard !contact.isRejected else { return }
+
+        if isFreshDown {
+            // The one global button/cursor cleanup lease cannot change owners.
+            // A rejected contact remains rejected through its own physical up.
+            guard inputLease == nil, gestureController.state == .idle else {
+                sourceContacts[sourceID]?.isRejected = true
+                return
+            }
+            guard let event = observation.event else { return }
+            handleNormalizedEvent(event, origin: origin, fence: fence)
+            if inputLease?.origin != origin,
+               sourceContacts[sourceID]?.epoch == observation.contactEpoch {
+                sourceContacts[sourceID]?.isRejected = true
+            }
+        } else if inputLease?.origin == origin, inputLease?.mode == .pressed {
+            if let event = observation.event, event.kind == .move {
+                handleNormalizedEvent(event, origin: origin, fence: fence)
+            } else {
+                renewPressedWatchdog(origin: origin)
+            }
+        }
+    }
+
+    private func handleNormalizedEvent(_ event: TouchEvent, origin: InputOrigin,
+                                       fence: HIDSourceRetirementFence?) {
+        if event.kind == .down {
             refreshDisplayMapping(reason: "touch down")
+            if case .hid = origin {
+                // Display resolution/cancellation can synchronously deliver up,
+                // a newer epoch or another accepted source. The earlier idle
+                // observation is not admission authority after that reentry.
+                guard isOpenHIDContact(origin), inputLease == nil,
+                      gestureController.state == .idle, fence?.isRetired != true else { return }
+                gestureController.prepareForNewPhysicalContact(contactID: event.contactID)
+            }
         }
+        guard fence?.isRetired != true else { return }
+        gestureController.handle(event, acceptingDown: { [weak self] session in
+            guard let self, fence?.isRetired != true else { return false }
+            if case .hid = origin {
+                guard self.isOpenHIDContact(origin), self.inputLease == nil else { return false }
+            }
+            self.inputLease = InputLease(origin: origin, session: session, fence: fence, mode: .pressed)
+            if case .hid = origin {
+                // A fresh accepted cycle follows that source's release barrier.
+                self.resynchronizeNewSources = false
+            }
+            return true
+        })
+        // Reentrant up/cancel/new-down may have replaced or closed this session.
+        renewPressedWatchdog(origin: origin)
+    }
 
-        gestureController.handle(event)
+    private func isOpenHIDContact(_ origin: InputOrigin) -> Bool {
+        guard case .hid(let identity) = origin,
+              let contact = sourceContacts[identity.sourceID] else { return false }
+        return contact.epoch == identity.epoch && contact.isPressed &&
+            !contact.isClosed && !contact.isRejected && !contact.needsRelease
+    }
 
-        switch gestureController.state {
-        case .idle:
-            cancelStuckGestureTimer()
-
-        case .singleTouch:
-            scheduleStuckGestureTimer()
+    private func renewPressedWatchdog(origin: InputOrigin) {
+        guard let lease = inputLease, lease.origin == origin, lease.mode == .pressed,
+              gestureController.acceptsHeartbeat(for: lease.session) else { return }
+        guard lease.fence?.isRetired != true else {
+            if case .hid(let contact) = origin { handleSourceRemoval(contact.sourceID) }
+            return
         }
+        scheduleStuckGestureTimer(for: lease)
+    }
+
+    private func inputSessionEnded(_ session: GestureInputSession) {
+        guard var lease = inputLease, lease.session == session, lease.mode == .pressed else { return }
+        // Seal pressed liveness before inputDidEnd can reenter. Cleanup gets one
+        // fixed bound; later heartbeats, ignored input and repeated up cannot renew it.
+        lease.mode = .cleanup
+        inputLease = lease
+        scheduleStuckGestureTimer(for: lease)
+    }
+
+    private func inputSessionInvalidated(_ session: GestureInputSession) {
+        guard inputLease?.session == session else { return }
+        inputLease = nil
+        cancelStuckGestureTimer()
     }
 
     func handleDeviceMatched() {
@@ -333,32 +500,68 @@ public final class MacXeneonEdgeTouchDriverApplication {
         cancelActiveGesture()
     }
 
-    /// Gesture teardown shared by stop, device removal, and display loss.
-    /// Called on the gesture queue in production; tests can exercise it without starting HID.
-    func cancelActiveGesture() {
-        focusRestorer.discardCapturedWindow()
-        cancelStuckGestureTimer()
-        gestureController.forceCancel()
+    func handleSourceRemoval(_ sourceID: HIDSourceID) {
+        sourceContacts.removeValue(forKey: sourceID)
+        if let lease = inputLease, lease.mode == .pressed,
+           case .hid(let contact) = lease.origin, contact.sourceID == sourceID {
+            // A replacement's first held packet is not proof of a new finger
+            // down. Only this exceptional owner-loss path requires up -> down.
+            resynchronizeNewSources = true
+            for source in Array(sourceContacts.keys) {
+                sourceContacts[source]?.needsRelease = true
+            }
+        }
+        if let lease = inputLease, case .hid(let contact) = lease.origin, contact.sourceID == sourceID {
+            cancelActiveGesture()
+        }
     }
 
-    private func scheduleStuckGestureTimer() {
-        cancelStuckGestureTimer()
+    /// Called only after main-thread ingress has retired every registration.
+    /// Preserve interrupted-hold recovery across a stop/start of this instance.
+    func handleHIDStop() {
+        if let lease = inputLease, lease.mode == .pressed, case .hid = lease.origin {
+            resynchronizeNewSources = true
+        }
+        sourceContacts.removeAll()
+        normalizedOrigins.removeAll()
+        cancelActiveGesture()
+    }
 
-        let generation = stuckGestureTimerGeneration
+    /// Gesture teardown shared by stop, owner removal, and display loss.
+    /// Called on the gesture queue in production; tests can exercise it without starting HID.
+    func cancelActiveGesture() {
+        inputLease = nil
+        cancelStuckGestureTimer()
+        // Invalidate ownership before either cleanup collaborator can reenter.
+        let generation = gestureController.ownershipGeneration
+        gestureController.invalidatePhysicalInput()
+        focusRestorer.discardCapturedWindow()
+        gestureController.forceCancel(ifGeneration: generation)
+    }
+
+    private func scheduleStuckGestureTimer(for lease: InputLease) {
+        cancelStuckGestureTimer()
+        let serial = stuckGestureTimerGeneration
         let timer = scheduler.schedule(afterMilliseconds: configuration.timing.stuckGestureTimeoutMs) { [weak self] in
-            guard let self, self.stuckGestureTimerGeneration == generation else {
-                return
-            }
+            guard let self, self.stuckGestureTimerGeneration == serial,
+                  let current = self.inputLease, current.origin == lease.origin,
+                  current.session == lease.session, current.mode == lease.mode else { return }
+            // Timeout wins permanently before any focus/input/cursor collaborator.
+            self.inputLease = nil
             self.stuckGestureTimer = nil
             self.stuckGestureTimerGeneration &+= 1
-            DriverLoggers.log(.warning, category: .gesture, "Touch gesture timed out without an up event; forcing cleanup.")
+            let controllerGeneration = self.gestureController.ownershipGeneration
+            self.gestureController.invalidatePhysicalInput()
+            DriverLoggers.log(.warning, category: .gesture, "Touch gesture timed out; forcing cleanup.")
             self.focusRestorer.discardCapturedWindow()
-            self.gestureController.handleIdleTimeout()
+            self.gestureController.forceCancel(ifGeneration: controllerGeneration)
         }
-        if stuckGestureTimerGeneration == generation {
+        if stuckGestureTimerGeneration == serial,
+           let current = inputLease, current.origin == lease.origin,
+           current.session == lease.session, current.mode == lease.mode {
             stuckGestureTimer = timer
         } else {
-            // A scheduler may execute a zero-delay timeout before returning its task.
+            // Inline scheduling may expire, close, or replace this exact session.
             timer.cancel()
         }
     }

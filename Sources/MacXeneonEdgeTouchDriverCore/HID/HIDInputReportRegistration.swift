@@ -61,7 +61,11 @@ final class HIDInputReportRegistration {
     let buffer: UnsafeMutablePointer<UInt8>
     let length: CFIndex
     let context: UnsafeMutableRawPointer
+    let sourceID: HIDSourceID
+    let retirementFence: HIDSourceRetirementFence
 
+    private let parser = HIDValueParser()
+    private let receiveObservation: (HIDTouchObservation, HIDSourceRetirementFence) -> Void
     private let token: UInt
     private let sender: UnsafeMutableRawPointer
     private let receive: (UInt32, [UInt8], DispatchTime) -> Void
@@ -69,11 +73,16 @@ final class HIDInputReportRegistration {
     init(
         sender: UnsafeMutableRawPointer,
         length: Int,
-        receive: @escaping (UInt32, [UInt8], DispatchTime) -> Void
+        receiveObservation: @escaping (HIDTouchObservation, HIDSourceRetirementFence) -> Void = { _, _ in },
+        receive: @escaping (UInt32, [UInt8], DispatchTime) -> Void = { _, _, _ in }
     ) {
         precondition(Thread.isMainThread, "HID registrations must use the main thread.")
         precondition(length >= XeneonEdgeDevice.touchReportLength)
         let token = Self.registry.allocateToken()
+        let sourceID = HIDSourceID(rawValue: token)
+        self.sourceID = sourceID
+        self.retirementFence = HIDSourceRetirementFence(sourceID: sourceID)
+        self.receiveObservation = receiveObservation
         self.token = token
         self.context = UnsafeMutableRawPointer(bitPattern: token)!
         self.sender = sender
@@ -93,6 +102,9 @@ final class HIDInputReportRegistration {
     /// Reject late callbacks before the caller unschedules/unregisters the device.
     func invalidate() {
         precondition(Thread.isMainThread, "HID registrations must use the main thread.")
+        // Fence queued observations before unregistering ingress or scheduling
+        // a removal notification. The fence outlives this main-only object.
+        retirementFence.retire()
         Self.registry.remove(token)
     }
 
@@ -126,6 +138,11 @@ final class HIDInputReportRegistration {
         // The local strong reference keeps it alive through copying and delivery.
         let bytes = Array(UnsafeBufferPointer(start: registration.buffer, count: Int(reportLength)))
         withExtendedLifetime(registration) {
+            guard let observation = registration.parser.parseObservation(
+                sourceID: registration.sourceID, reportID: Int(reportID),
+                bytes: bytes, timestamp: timestamp
+            ) else { return }
+            registration.receiveObservation(observation, registration.retirementFence)
             registration.receive(reportID, bytes, timestamp)
         }
     }
