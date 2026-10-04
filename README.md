@@ -112,6 +112,8 @@ The package declares macOS 13 as its minimum deployment target. A successful bui
 
 ## Configuration
 
+The experimental feature branch contains inactive, default-off foundations for explicit routing, spatial/time double-click trials, and complete-contact scrolling. Live execution remains unavailable pending source and hardware qualification; see [Experimental touch foundations](Docs/ExperimentalTouchFoundations.md). Normal driver configuration and behavior are unchanged when no experimental option is supplied.
+
 Optional config file:
 
 ```text

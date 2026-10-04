@@ -27,7 +27,7 @@ struct MouseInputEnvironment {
 /// managed reporting API; that API reserves one release before posting a down.
 /// The original Void API retains single-event behavior, without reserve guarantees.
 /// Do not mix raw and managed calls within a press. Requires serial use.
-public final class CGEventInputSink: ReportingSyntheticInputSink {
+public final class CGEventInputSink: ExperimentalClickCountInputSink {
     private let environment: MouseInputEnvironment
     private let eventTap: CGEventTapLocation
     private var operationInFlight = false
@@ -37,6 +37,9 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
         // Strongly retained, distinct, and never posted before the one release attempt.
         let emergencyUp: MouseInputEvent
         let eventNumber: Int64
+        // Nil preserves original managed metadata semantics. Only the explicit
+        // experimental overload freezes click count and pairs a fresh release.
+        let experimentalClickCount: ExperimentalMouseClickCount?
     }
 
     /// The normal default remains a private source. Managed/reporting calls fail
@@ -83,6 +86,16 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
     public func postMouseDragged(to point: CGPoint) { postLegacyEvent(type: .leftMouseDragged, at: point) }
 
     public func tryPostMouseDown(at point: CGPoint) -> SyntheticInputResult {
+        beginManagedPress(at: point, experimentalClickCount: nil)
+    }
+
+    public func tryPostMouseDown(at point: CGPoint, clickCount: ExperimentalMouseClickCount) -> SyntheticInputResult {
+        beginManagedPress(at: point, experimentalClickCount: clickCount)
+    }
+
+    private func beginManagedPress(
+        at point: CGPoint, experimentalClickCount: ExperimentalMouseClickCount?
+    ) -> SyntheticInputResult {
         guard !operationInFlight, press == nil else { return .busy }
         operationInFlight = true
         defer { operationInFlight = false }
@@ -104,8 +117,12 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
             return .sourceUnavailable
         }
         configureButton(down, click: true)
+        if let experimentalClickCount {
+            down.setIntegerValueField(.mouseEventClickState, value: experimentalClickCount.rawValue)
+        }
         press = Press(emergencyUp: emergencyUp,
-                      eventNumber: down.getIntegerValueField(.mouseEventNumber))
+                      eventNumber: down.getIntegerValueField(.mouseEventNumber),
+                      experimentalClickCount: experimentalClickCount)
         environment.post(down, eventTap)
         return .postInvoked
     }
@@ -130,6 +147,10 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
             event.setIntegerValueField(.mouseEventNumber, value: ownedPress.eventNumber)
         }
         configureButton(event, click: true)
+        if let clickCount = ownedPress.experimentalClickCount {
+            event.setIntegerValueField(.mouseEventClickState, value: clickCount.rawValue)
+            event.setIntegerValueField(.mouseEventNumber, value: ownedPress.eventNumber)
+        }
         environment.post(event, eventTap)
         return .postInvoked
     }

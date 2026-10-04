@@ -5,6 +5,12 @@ import MacXeneonEdgeTouchDriverCore
 @main
 struct MacXeneonEdgeTouchDriverMain {
     static func main() {
+        exit(ExperimentalStartupGate.run(arguments: Array(CommandLine.arguments.dropFirst())) {
+            runLegacy()
+        })
+    }
+
+    private static func runLegacy() -> Int32 {
         let loadResult = DriverConfiguration.load()
         do {
             try DriverFileLog.shared.configure(
@@ -21,6 +27,6 @@ struct MacXeneonEdgeTouchDriverMain {
         }
 
         let application = MacXeneonEdgeTouchDriverApplication(configuration: loadResult.configuration)
-        exit(application.run())
+        return application.run()
     }
 }
