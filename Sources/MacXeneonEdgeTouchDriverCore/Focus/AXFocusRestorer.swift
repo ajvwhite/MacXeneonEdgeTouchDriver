@@ -31,10 +31,15 @@ public final class AXFocusRestorer: FocusRestorer {
     private let onWorker: Enqueue
     private var onCallback: Enqueue
     private let now: () -> UInt64
+    private let preparationMilliseconds: UInt64
+    private let captureInputPermit: () -> PhysicalInputGuard.Permit
     private let state = FocusOperationState()
     private let sessionLock = NSLock()
     private var session: Session?
     private var hasStarted = false
+    private var independentTargetActivation = false
+    private var isShutdown = false
+    private var independentActivationGeneration: UInt64 = 0
 
     /// Callback delivery belongs to the caller's serial gesture queue. Use the same
     /// queue for gesture handling, timers and final cancellation. Do not supply a
@@ -43,10 +48,12 @@ public final class AXFocusRestorer: FocusRestorer {
         let worker = DispatchQueue(label: "\(DriverLoggers.subsystem).focus-ax")
         self.init(
             backend: AXFocusBackend(), workspace: WorkspaceFocusMonitor(),
-            onMain: { DispatchQueue.main.async(execute: $0) },
-            onWorker: { worker.async(execute: $0) },
-            onCallback: { callbackQueue.async(execute: $0) },
-            now: { DispatchTime.now().uptimeNanoseconds }
+            onMain: { DispatchQueue.main.async(execute: DispatchWorkItem(block: $0)) },
+            onWorker: { worker.async(execute: DispatchWorkItem(block: $0)) },
+            onCallback: { callbackQueue.async(execute: DispatchWorkItem(block: $0)) },
+            now: { DispatchTime.now().uptimeNanoseconds },
+            preparationMilliseconds: 150,
+            captureInputPermit: { PhysicalInputGuard.system.capture() }
         )
     }
 
@@ -55,13 +62,17 @@ public final class AXFocusRestorer: FocusRestorer {
     /// designated queues. Captured dependencies must outlive pending queued work.
     init(backend: AXFocusBackendProtocol, workspace: WorkspaceFocusMonitoring,
          onMain: @escaping Enqueue, onWorker: @escaping Enqueue,
-         onCallback: @escaping Enqueue, now: @escaping () -> UInt64) {
+         onCallback: @escaping Enqueue, now: @escaping () -> UInt64,
+         preparationMilliseconds: UInt64 = 30,
+         captureInputPermit: @escaping () -> PhysicalInputGuard.Permit = { { true } }) {
         self.backend = backend
         self.workspace = workspace
         self.onMain = onMain
         self.onWorker = onWorker
         self.onCallback = onCallback
         self.now = now
+        self.preparationMilliseconds = preparationMilliseconds
+        self.captureInputPermit = captureInputPermit
     }
 
     deinit {
@@ -89,9 +100,12 @@ public final class AXFocusRestorer: FocusRestorer {
     }
 
     public func prepareFocusedWindow(completion: @escaping () -> Void) {
-        let next = Session(token: FocusOperationToken(now: now))
+        let next = Session(token: FocusOperationToken(preparationMilliseconds: preparationMilliseconds, now: now,
+                                                     inputPermit: captureInputPermit()))
         sessionLock.lock()
         hasStarted = true
+        independentTargetActivation = false
+        independentActivationGeneration &+= 1
         let previous = session
         let admitted = state.beginPreparation(token: next.token)
         session = admitted ? next : nil
@@ -114,7 +128,42 @@ public final class AXFocusRestorer: FocusRestorer {
         sessionLock.lock()
         defer { sessionLock.unlock() }
         precondition(!hasStarted, "Bind the focus callback queue before preparing a gesture")
-        onCallback = { queue.async(execute: $0) }
+        onCallback = { queue.async(execute: DispatchWorkItem(block: $0)) }
+    }
+
+    public func beginTargetActivation() -> Bool {
+        sessionLock.lock(); defer { sessionLock.unlock() }
+        guard !isShutdown else { return false }
+        guard let current = session, current.captured != nil else {
+            // Unavailable original focus disables restoration, not a separately
+            // verified target click. The native target preparer still confirms
+            // its exact application/window and physical-input permit.
+            independentTargetActivation = true
+            return true
+        }
+        independentTargetActivation = false
+        return current.token.beginTargetActivation()
+    }
+
+    public func confirmTargetActivation(completion: @escaping (Bool) -> Void) {
+        sessionLock.lock()
+        if independentTargetActivation && !isShutdown {
+            independentTargetActivation = false
+            let generation = independentActivationGeneration
+            sessionLock.unlock()
+            onCallback {
+                self.sessionLock.lock()
+                let valid = !self.isShutdown && self.independentActivationGeneration == generation
+                self.sessionLock.unlock()
+                completion(valid)
+            }
+            return
+        }
+        let current = session
+        let eligible = current?.token.endTargetActivation() == true
+        sessionLock.unlock()
+        guard eligible, let current else { onCallback { completion(false) }; return }
+        onMain { self.startEnrollment(current, completion: completion) }
     }
 
     public func inputDidEnd() {
@@ -151,7 +200,7 @@ public final class AXFocusRestorer: FocusRestorer {
                     self.finish(current)
                     return
                 }
-                guard self.backend.relationship(baseline, confirmed) == .same else {
+                guard self.backend.windowRelationship(baseline, confirmed) == .same else {
                     self.log("Focus changed from the certified pre-release baseline; restoration skipped.")
                     self.finish(current)
                     return
@@ -171,6 +220,7 @@ public final class AXFocusRestorer: FocusRestorer {
                         return
                     }
                     self.onWorker {
+                        guard current.token.beginRestoreMutation() else { self.finish(current); return }
                         let result = self.backend.attemptRestore(
                             captured: captured, baseline: baseline,
                             workspace: refreshedWorkspace.application, capturedApplication: capturedApplication,
@@ -197,6 +247,9 @@ public final class AXFocusRestorer: FocusRestorer {
     private func invalidate(shutdown: Bool) {
         sessionLock.lock()
         state.invalidate(shutdown: shutdown)
+        independentTargetActivation = false
+        independentActivationGeneration &+= 1
+        if shutdown { isShutdown = true }
         let previous = session
         let cleanup = previous != nil && state.beginCleanup()
         if cleanup { session = nil }
@@ -292,50 +345,50 @@ public final class AXFocusRestorer: FocusRestorer {
 
     /// One attempt per touch, sharing the actual-operation slot with all AX work.
     /// If release wins any stage, its invalidated permit prevents late certification.
-    private func startEnrollment(_ current: Session) {
+    private func startEnrollment(_ current: Session, completion: ((Bool) -> Void)? = nil) {
         sessionLock.lock()
         let captured = current.captured
         let revision = session === current && captured != nil ? state.beginEnrollment(token: current.token) : nil
         sessionLock.unlock()
-        guard let revision, let captured else { return }
+        guard let revision, let captured else { if let completion { onCallback { completion(false) } }; return }
         let permit = { current.token.permitsEnrollment(revision: revision) }
         let before = workspace.snapshot()
-        guard before.sessionActive, permit() else { finish(current); return }
+        guard before.sessionActive, permit() else { finish(current, completion: completion.map { callback in { callback(false) } }); return }
         onWorker {
-            guard permit() else { self.finish(current); return }
+            guard permit() else { self.finish(current, completion: completion.map { callback in { callback(false) } }); return }
             let resolution = self.backend.resolve(workspace: before.application, permit: permit)
             guard case let .known(target) = resolution else {
                 self.logUnknown(resolution, context: "During-touch focus baseline unavailable")
-                self.finish(current)
+                self.finish(current, completion: completion.map { callback in { callback(false) } })
                 return
             }
-            guard permit() else { self.finish(current); return }
+            guard permit() else { self.finish(current, completion: completion.map { callback in { callback(false) } }); return }
             // The original observer already watches its application's focused-window
             // changes. A different application needs one additional observer.
             if !target.workspaceApplication.isSameApplication(as: captured.workspaceApplication) {
                 guard let observation = self.backend.prepareObservation(
                     target: target, permit: permit, onChange: self.observationHandler(current)) else {
                     self.log("During-touch baseline observation unavailable; restoration skipped.")
-                    self.finish(current)
+                    self.finish(current, completion: completion.map { callback in { callback(false) } })
                     return
                 }
                 current.observations.append(observation)
             }
             self.onMain {
-                guard permit() else { self.finish(current); return }
+                guard permit() else { self.finish(current, completion: completion.map { callback in { callback(false) } }); return }
                 self.attachSources(current)
                 let observed = self.workspace.snapshot()
-                guard self.sameWorkspace(before, observed), permit() else { self.finish(current); return }
+                guard self.sameWorkspace(before, observed), permit() else { self.finish(current, completion: completion.map { callback in { callback(false) } }); return }
                 self.onWorker {
-                    guard permit() else { self.finish(current); return }
+                    guard permit() else { self.finish(current, completion: completion.map { callback in { callback(false) } }); return }
                     let confirmation = self.backend.resolve(workspace: observed.application, permit: permit)
                     guard case let .known(confirmed) = confirmation else {
                         self.logUnknown(confirmation, context: "During-touch focus confirmation unavailable")
-                        self.finish(current)
+                        self.finish(current, completion: completion.map { callback in { callback(false) } })
                         return
                     }
-                    guard self.backend.relationship(target, confirmed) == .same, permit() else {
-                        self.finish(current)
+                    guard self.backend.windowRelationship(target, confirmed) == .same, permit() else {
+                        self.finish(current, completion: completion.map { callback in { callback(false) } })
                         return
                     }
                     self.onMain {
@@ -348,7 +401,10 @@ public final class AXFocusRestorer: FocusRestorer {
                             self.state.finishOperation()
                         }
                         self.sessionLock.unlock()
-                        if !accepted { self.finish(current) }
+                        if accepted, let completion {
+                            self.onCallback { completion(current.token.isPermitted) }
+                        }
+                        if !accepted { self.finish(current, completion: completion.map { callback in { callback(false) } }) }
                     }
                 }
             }

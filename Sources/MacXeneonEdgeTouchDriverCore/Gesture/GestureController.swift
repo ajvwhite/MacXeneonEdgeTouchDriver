@@ -18,6 +18,7 @@ public final class GestureController {
 
     // These queue-confined hooks only change application liveness ownership.
     // Closing occurs before focus/cursor/input collaborators can reenter.
+    var onMouseButtonReleased: (() -> Void)?
     var onInputSessionEnded: ((GestureInputSession) -> Void)?
     var onInputSessionInvalidated: ((GestureInputSession) -> Void)?
     private var inputSession: GestureInputSession?
@@ -34,6 +35,9 @@ public final class GestureController {
     private let inputSink: SyntheticInputSink
     private let cursorController: CursorController
     private let focusRestorer: FocusRestorer
+    private let targetPreparer: TouchTargetPreparing
+    private var preparedInput: [TouchEvent] = []
+    private var targetReady = false
     private let returnCursorToPreviousPosition: Bool
     private var pendingMouseDown: GestureScheduledTask?
     private var pendingMouseUp: GestureScheduledTask?
@@ -104,12 +108,14 @@ public final class GestureController {
         focusRestorer: FocusRestorer = NoOpFocusRestorer(),
         returnCursorToPreviousPosition: Bool = true,
         timing: GestureTiming = .immediate,
-        scheduler: GestureScheduler
+        scheduler: GestureScheduler,
+        targetPreparer: TouchTargetPreparing = NoOpTouchTargetPreparer()
     ) {
         self.mapperProvider = mapperProvider
         self.inputSink = inputSink
         self.cursorController = cursorController
         self.focusRestorer = focusRestorer
+        self.targetPreparer = targetPreparer
         self.returnCursorToPreviousPosition = returnCursorToPreviousPosition
         self.timing = timing
         self.scheduler = scheduler
@@ -147,6 +153,18 @@ public final class GestureController {
                 failedInputContactIDs.remove(event.contactID)
                 rejectedContactIDs.remove(event.contactID)
             }
+            return
+        }
+
+        if let preparing = preparation, targetPreparer.requiresPreparation,
+           preparing.contactID == event.contactID, event.kind != .down {
+            guard preparedInput.count < 256 else {
+                forceCancel()
+                if event.kind != .up { rejectedContactIDs.insert(event.contactID) }
+                return
+            }
+            preparedInput.append(event)
+            if event.kind == .up { closePhysicalInput() }
             return
         }
 
@@ -322,6 +340,24 @@ public final class GestureController {
         forceCancel()
     }
 
+    /// A fresh contact can end only the cursor-return delay. Never shorten the
+    /// mouse press or transfer an in-flight release to another owner.
+    @discardableResult func finishReleasedCursorDelay() -> Bool {
+        guard !physicalInputIsOpen, !inputOperationInFlight, phase == .waitingForCursorReturn,
+              case .singleTouch(let context) = state, !context.isMouseDownPosted else { return false }
+        let finishingGeneration = generation
+        phase = .finishing
+        cancelPendingWork()
+        // A new contact supersedes the old restoration request. Keep the lease
+        // while collaborators run, then let idle invalidate the old ownership.
+        focusRestorer.discardCapturedWindow()
+        guard generation == finishingGeneration, phase == .finishing else { return false }
+        cursorController.releaseBorrow(returnToPreviousPosition: returnCursorToPreviousPosition)
+        guard generation == finishingGeneration, phase == .finishing else { return false }
+        transitionToIdle()
+        return state == .idle && !inputOperationInFlight
+    }
+
     /// Allows application cleanup to verify that its own collaborator did not
     /// synchronously replace the generation it intended to cancel.
     var ownershipGeneration: UInt64 { generation }
@@ -372,18 +408,39 @@ public final class GestureController {
     private func beginPreparation(contactID: Int, at point: CGPoint) {
         preparationGeneration &+= 1
         let generation = preparationGeneration
+        preparedInput.removeAll(keepingCapacity: true)
+        targetReady = !targetPreparer.requiresPreparation
         preparation = Preparation(
             generation: generation,
             contactID: contactID,
             point: point,
             deadline: DispatchTime(uptimeNanoseconds:
-                scheduler.now.uptimeNanoseconds + UInt64(Self.focusPreparationTimeoutMs) * 1_000_000)
+                scheduler.now.uptimeNanoseconds + UInt64(targetPreparer.requiresPreparation ? 150 : Self.focusPreparationTimeoutMs) * 1_000_000)
         )
 
         // Offer inline/no-op capture before installing a timer: the queue-less scheduler
         // intentionally executes even delayed tasks synchronously.
+        targetPreparer.beginContact()
         focusRestorer.prepareFocusedWindow { [weak self] in
-            self?.finishPreparation(generation: generation, captureReady: true)
+            guard let self, self.preparation?.generation == generation else { return }
+            guard !self.targetPreparer.requiresPreparation || self.focusRestorer.beginTargetActivation() else {
+                self.finishPreparation(generation: generation, captureReady: true)
+                return
+            }
+            self.targetPreparer.prepare(at: point) { [weak self] accepted in
+                guard let self, self.preparation?.generation == generation else { return }
+                guard accepted else { self.finishPreparation(generation: generation, captureReady: true); return }
+                if !self.targetPreparer.requiresPreparation {
+                    self.targetReady = true
+                    self.finishPreparation(generation: generation, captureReady: true)
+                    return
+                }
+                self.focusRestorer.confirmTargetActivation { [weak self] confirmed in
+                    guard let self, self.preparation?.generation == generation else { return }
+                    self.targetReady = confirmed
+                    self.finishPreparation(generation: generation, captureReady: true)
+                }
+            }
         }
         guard let preparation, preparation.generation == generation else { return }
         let deadline = preparation.deadline.uptimeNanoseconds
@@ -403,6 +460,14 @@ public final class GestureController {
         guard let preparation, preparation.generation == generation else { return }
         let captureIsTimely = captureReady && scheduler.now.uptimeNanoseconds < preparation.deadline.uptimeNanoseconds
         let acceptedGeneration = self.generation
+        let pendingInput = preparedInput
+        if targetPreparer.requiresPreparation && (!targetReady || !captureIsTimely) {
+            // No speculative down if activation failed or exceeded its deadline.
+            let ended = pendingInput.contains { $0.kind == .up }
+            forceCancel()
+            if !ended { rejectedContactIDs.insert(preparation.contactID) }
+            return
+        }
         // Keep the preparation transition leased across discard and borrow.
         // A reentrant up after preparation is cleared must still be deferred,
         // not lost in the gap before tracking begins.
@@ -457,11 +522,17 @@ public final class GestureController {
         }
         scheduleMouseDown(generation: self.generation, at: preparation.point)
         finishDeferredInput()
+        for event in pendingInput {
+            guard self.generation == acceptedGeneration else { break }
+            handle(event)
+        }
     }
 
     private func cancelPreparation() {
         preparationGeneration &+= 1
         preparation = nil
+        preparedInput.removeAll(keepingCapacity: true)
+        targetPreparer.cancel()
         preparationDeadline?.cancel()
         preparationDeadline = nil
     }
@@ -665,6 +736,8 @@ public final class GestureController {
         guard releaseOwnedMouseDown(at: point) else { return }
         phase = .waitingForCursorReturn
         finishDeferredInput()
+        guard self.generation == generation, phase == .waitingForCursorReturn else { return }
+        onMouseButtonReleased?()
         guard self.generation == generation, phase == .waitingForCursorReturn else { return }
         pendingCursorReturn?.cancel()
         let task = schedule(after: timing.clickToWarpBackDelayMs) { [weak self] in

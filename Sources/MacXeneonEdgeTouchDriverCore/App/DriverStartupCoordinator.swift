@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import IOKit
 
 protocol StartupRunLoop {
     func run()
@@ -53,6 +54,7 @@ final class DriverStartupCoordinator {
     private var generation: UInt64 = 0
     private var didAttemptHardware = false
     private var isStartingHardware = false
+    private var waitingForHIDGrant = false
     private var lastSnapshot: SyntheticPermissionSnapshot?
     private(set) var state: State = .idle
     private(set) var exitStatus: Int32 = EXIT_SUCCESS
@@ -99,16 +101,10 @@ final class DriverStartupCoordinator {
         checkReadiness()
         guard state == .waitingForPermission else { return }
 
+        ensurePermissionPoll()
+        guard state == .waitingForPermission, !waitingForHIDGrant,
+              lastSnapshot?.hasRequiredSyntheticAccess != true else { return }
         let currentGeneration = generation
-        let task = dependencies.polling.schedule(everySeconds: 2, leewayMilliseconds: 500) { [weak self] in
-            self?.checkReadiness(generation: currentGeneration)
-        }
-        // Also tolerate a scheduler that invokes its callback before returning.
-        guard state == .waitingForPermission, generation == currentGeneration else {
-            task.cancel()
-            return
-        }
-        poll = task
         let permissions = dependencies.permissions
         let cancellation = requestCancellation
         dependencies.requestWorker.submit({
@@ -117,6 +113,16 @@ final class DriverStartupCoordinator {
         }, completion: { [weak self] in
             self?.checkReadiness(generation: currentGeneration)
         })
+    }
+
+    private func ensurePermissionPoll() {
+        guard state == .waitingForPermission, poll == nil else { return }
+        let currentGeneration = generation
+        let task = dependencies.polling.schedule(everySeconds: 2, leewayMilliseconds: 500) { [weak self] in
+            self?.checkReadiness(generation: currentGeneration)
+        }
+        guard state == .waitingForPermission, generation == currentGeneration else { task.cancel(); return }
+        poll = task
     }
 
     func stop() {
@@ -131,12 +137,17 @@ final class DriverStartupCoordinator {
         let snapshot = dependencies.permissions.snapshot()
         // A dependency may deliver stop while a check is in progress.
         guard state == .waitingForPermission else { return }
-        if snapshot != lastSnapshot {
+        let snapshotChanged = snapshot != lastSnapshot
+        if snapshotChanged {
             lastSnapshot = snapshot
-            log(.notice, "Synthetic permission state: CG post-event access=\(snapshot.postEventAccess), AX trusted=\(snapshot.accessibilityTrusted).")
+            log(.notice, "Synthetic permission state: CG post-event access=\(snapshot.postEventAccess), AX trusted=\(snapshot.accessibilityTrusted), HID listen access=\(snapshot.hidInputAccess.rawValue).")
         }
-        guard snapshot.isReady else {
-            if expectedGeneration == nil {
+        guard snapshot.isReady, !waitingForHIDGrant || snapshot.hidInputAccess == .granted else {
+            if snapshot.hasRequiredSyntheticAccess {
+                if snapshotChanged || expectedGeneration == nil {
+                    log(.notice, "Waiting for HID Input Monitoring access. Grant access to the executable or launcher; startup will continue automatically.")
+                }
+            } else if snapshotChanged || expectedGeneration == nil {
                 log(.notice, "Waiting for synthetic event permission. Grant Accessibility to the executable or launcher; startup will continue automatically.")
             }
             return
@@ -159,9 +170,19 @@ final class DriverStartupCoordinator {
             state = .running
             log(.notice, "Permission readiness accepted; driver monitoring started.")
         case .failure(let error):
-            // HID/Input Monitoring failures and exclusive-access conflicts are
-            // startup errors, not evidence that synthetic permission is missing.
-            fail("Could not start driver monitoring: \(error.localizedDescription)")
+            if case HIDDeviceMonitorError.openFailed(kIOReturnNotPermitted) = error {
+                // Release any partial acquisition before waiting in this process.
+                // A positive HID preflight is required before another open attempt;
+                // unknown/denied state never loops through permission prompts.
+                stopAttemptedHardware()
+                guard state == .startingHardware else { return }
+                waitingForHIDGrant = true
+                state = .waitingForPermission
+                log(.notice, "HID access denied; waiting for Input Monitoring permission without restarting: \(error.localizedDescription)")
+                ensurePermissionPoll()
+            } else {
+                fail("Could not start driver monitoring: \(error.localizedDescription)")
+            }
         }
     }
 

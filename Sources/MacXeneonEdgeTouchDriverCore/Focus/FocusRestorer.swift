@@ -6,12 +6,18 @@ public protocol FocusRestorer: AnyObject {
     /// The caller may discard this preparation before completion; that must invalidate late results.
     func prepareFocusedWindow(completion: @escaping () -> Void)
 
+    /// Brackets the driver's verified target activation before synthetic input.
+    func beginTargetActivation() -> Bool
+    func confirmTargetActivation(completion: @escaping (Bool) -> Void)
+
     /// Captures the currently focused window, if one is available.
     func captureFocusedWindow()
 
     /// Marks receipt of the accepted HID touch-up, before delayed synthetic mouse-up.
-    /// Observed focus changes now revoke restoration eligibility. Repeated cleanup
-    /// calls must be idempotent. This must not wait for or begin an AX mutation.
+    /// App/window changes revoke a pending restoration. The live AX coordinator
+    /// separately guards later physical mouse/keyboard input, so a touch-generated
+    /// control focus change does not discard the captured typing destination.
+    /// Repeated cleanup calls must be idempotent; this never waits for AX.
     func inputDidEnd()
 
     /// Restores the captured focused window and clears the capture.
@@ -28,6 +34,9 @@ public protocol FocusRestorer: AnyObject {
 }
 
 public extension FocusRestorer {
+    func beginTargetActivation() -> Bool { true }
+    func confirmTargetActivation(completion: @escaping (Bool) -> Void) { completion(true) }
+
     /// Synchronous implementations keep their existing ordering and timing.
     func prepareFocusedWindow(completion: @escaping () -> Void) {
         captureFocusedWindow()

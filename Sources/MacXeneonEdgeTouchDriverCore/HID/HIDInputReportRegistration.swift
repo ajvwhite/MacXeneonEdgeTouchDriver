@@ -65,6 +65,8 @@ final class HIDInputReportRegistration {
     let retirementFence: HIDSourceRetirementFence
 
     private let parser = HIDValueParser()
+    private var neutralState: HIDNeutralState?
+    private(set) var hasParsedPressedReport = false
     private let receiveObservation: (HIDTouchObservation, HIDSourceRetirementFence) -> Void
     private let token: UInt
     private let sender: UnsafeMutableRawPointer
@@ -108,6 +110,17 @@ final class HIDInputReportRegistration {
         Self.registry.remove(token)
     }
 
+    /// A cache certificate may precede queued older raw packets. It is installed
+    /// only before this registration has admitted a pressed report.
+    @discardableResult
+    func installNeutralState(_ state: HIDNeutralState) -> Bool {
+        precondition(Thread.isMainThread)
+        guard !retirementFence.isRetired, !hasParsedPressedReport,
+              state.reportTimestamp > 0 else { return false }
+        neutralState = state
+        return true
+    }
+
     /// The production C callback and deterministic tests share this exact ingress.
     static func handleCallback(
         context: UnsafeMutableRawPointer?,
@@ -117,7 +130,8 @@ final class HIDInputReportRegistration {
         reportID: UInt32,
         report: UnsafeMutablePointer<UInt8>,
         reportLength: CFIndex,
-        timestamp: DispatchTime = .now()
+        timestamp: DispatchTime = .now(),
+        providerTimestamp: UInt64? = nil
     ) {
         // The manager is scheduled only on the main run loop. Do not access the
         // registry or parser if a callback unexpectedly arrives elsewhere.
@@ -134,6 +148,18 @@ final class HIDInputReportRegistration {
             return
         }
 
+        if let neutral = registration.neutralState {
+            guard let providerTimestamp else { return }
+            if providerTimestamp == 0 {
+                // Old IOKit providers may omit timestamps. Never infer ordering
+                // for a held packet; an explicit raw release restores that path.
+                guard registration.buffer[1] == 0 else { return }
+                registration.neutralState = nil
+            } else {
+                guard providerTimestamp > neutral.reportTimestamp else { return }
+            }
+        }
+
         // Both the pointer and its bound now refer to a live owned allocation.
         // The local strong reference keeps it alive through copying and delivery.
         let bytes = Array(UnsafeBufferPointer(start: registration.buffer, count: Int(reportLength)))
@@ -142,6 +168,7 @@ final class HIDInputReportRegistration {
                 sourceID: registration.sourceID, reportID: Int(reportID),
                 bytes: bytes, timestamp: timestamp
             ) else { return }
+            if observation.isPressed { registration.hasParsedPressedReport = true }
             registration.receiveObservation(observation, registration.retirementFence)
             registration.receive(reportID, bytes, timestamp)
         }

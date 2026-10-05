@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-- Prevent early mouse-button release during a stationary hold while touch reports continue. Keep other HID interfaces from interrupting the active touch. Silent input still uses the default two-second safety timeout. A disconnect during a touch may require lifting and tapping again after reconnect. A single-panel hardware session verified stationary hold, drag, fresh taps and recovery after a neutral release.
+- Prepare and confirm the touched application/window before posting its first click. Buffer contact movement and release during preparation; reject an unconfirmed target without a speculative click. Physical acceptance of inactive-window first clicks remains open.
+- Capture the exact keyboard-focus control for restoration. Revoke restoration after observed physical mouse-down, typing or scrolling. Restore a captured control only through supported operations; do not substitute a window-only raise. Demo Stream Deck focus behavior still needs physical validation.
+- Check coherent cached release values on supported replacement HID endpoints after source loss, and reject raw packets older than that release. Retain the release barrier when evidence is unavailable. Interrupted-hold reconnect first-tap acceptance remains open.
+- Buffer fresh contacts during synthetic mouse-up cleanup within fixed event/contact limits. Preserve their moves and releases without shortening the previous press, and let them finish cursor cleanup after mouse-up. Renew held-contact watchdog deadlines without allocating a delayed task for every report.
+- Keep the same driver process waiting after Input Monitoring denial. Retry HID open only after access is positively granted, and expose read-only permission and cached-input diagnostics.
+
+- Prevent early mouse-button release during a stationary hold while touch reports continue. Keep other HID interfaces from interrupting the active touch. Silent input still uses the default two-second safety timeout. A disconnect during a touch may require lifting and tapping again after reconnect. A single-panel hardware session verified stationary hold, drag, fresh taps and recovery after a neutral release. See [hardware validation](docs/HARDWARE-VALIDATION-2026-10-05.md) for results and limits.
 
 - Stop routing touch input when multiple valid displays are equally preferred, including duplicate reported serials. Detected ambiguity cancels any active gesture and clears stale mapping; routing resumes when a unique best match is found. Configured serial filtering stays strict and expected-size preference is unchanged.
 - Keep mapped touch points inside the target rectangle by clamping the final global coordinates below its excluded maximum edges. Existing interior coordinates stay unchanged. Reject bounds whose positive dimensions round to equal minimum and maximum edges. This establishes mathematical containment; live click routing at display boundaries remains unverified.

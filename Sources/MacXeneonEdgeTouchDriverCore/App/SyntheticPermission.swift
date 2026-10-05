@@ -2,13 +2,29 @@ import ApplicationServices
 import AppKit
 import CoreGraphics
 import Foundation
+import IOKit.hidsystem
+
+enum HIDInputAccess: String { case unknown, denied, granted }
 
 struct SyntheticPermissionSnapshot: Equatable {
     let postEventAccess: Bool
     let accessibilityTrusted: Bool
 
-    // Preserve the driver's compatibility rule. Neither fact proves event delivery.
-    var isReady: Bool { postEventAccess || accessibilityTrusted }
+    let hidInputAccess: HIDInputAccess
+    let requiresAccessibility: Bool
+
+    init(postEventAccess: Bool, accessibilityTrusted: Bool, hidInputAccess: HIDInputAccess = .unknown,
+         requiresAccessibility: Bool = false) {
+        self.postEventAccess = postEventAccess
+        self.accessibilityTrusted = accessibilityTrusted
+        self.hidInputAccess = hidInputAccess
+        self.requiresAccessibility = requiresAccessibility
+    }
+
+    // Preserve the synthetic compatibility rule. Neither fact proves delivery.
+    var hasSyntheticAccess: Bool { postEventAccess || accessibilityTrusted }
+    var hasRequiredSyntheticAccess: Bool { hasSyntheticAccess && (!requiresAccessibility || accessibilityTrusted) }
+    var isReady: Bool { hasRequiredSyntheticAccess && hidInputAccess != .denied }
 }
 
 protocol SyntheticPermissionProviding: AnyObject {
@@ -45,7 +61,15 @@ final class SystemSyntheticPermissionProvider: SyntheticPermissionProviding {
             readSnapshot: {
                 SyntheticPermissionSnapshot(
                     postEventAccess: CGPreflightPostEventAccess(),
-                    accessibilityTrusted: AXIsProcessTrusted()
+                    accessibilityTrusted: AXIsProcessTrusted(),
+                    hidInputAccess: {
+                        switch IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) {
+                        case kIOHIDAccessTypeGranted: return .granted
+                        case kIOHIDAccessTypeDenied: return .denied
+                        default: return .unknown
+                        }
+                    }(),
+                    requiresAccessibility: true
                 )
             },
             requestPostEventAccess: { CGRequestPostEventAccess() },
@@ -76,13 +100,15 @@ final class SystemSyntheticPermissionProvider: SyntheticPermissionProviding {
     func snapshot() -> SyntheticPermissionSnapshot { readSnapshot() }
 
     func requestInitialAccess(cancellation: StartupCancellation) {
-        guard !cancellation.isCancelled, !snapshot().isReady else { return }
+        guard !cancellation.isCancelled else { return }
+        let before = snapshot()
+        guard !before.hasRequiredSyntheticAccess else { return }
         logIdentity()
         // CG does not document AX's asynchronous prompt contract. This entire
         // sequence runs off the lifecycle queue; its return value is not readiness.
         guard !cancellation.isCancelled else { return }
-        if requestPostEventAccess() { return }
-        guard !cancellation.isCancelled, !snapshot().isReady else { return }
+        if !before.postEventAccess, requestPostEventAccess(), !before.requiresAccessibility { return }
+        guard !cancellation.isCancelled, !snapshot().hasRequiredSyntheticAccess else { return }
         guard !cancellation.isCancelled else { return }
         requestAccessibilityTrust()
     }

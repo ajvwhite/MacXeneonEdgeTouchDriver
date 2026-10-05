@@ -13,6 +13,130 @@ final class AXFocusBackendTests: XCTestCase {
         XCTAssertTrue(fixture.operations.timeouts.allSatisfy { $0 > 0 && $0 <= 0.05 })
     }
 
+    func testResolverRetainsExactKeyboardRecipientInCapturedWindow() {
+        let f = FocusBackendFixture()
+        f.operations.owners["text"] = 11
+        f.operations.reads["A:AXFocusedUIElement"] = AXFocusRead(error: .success, value: .element(f.operations.element("text")))
+        f.operations.reads["text:AXWindow"] = AXFocusRead(error: .success, value: .element(f.operations.element("a")))
+        let captured = known(f.backend.resolve(workspace: f.appA, permit: { true }))
+        XCTAssertEqual(captured?.focusedElement.map(f.operations.id), "text")
+    }
+
+    func testSameWindowDifferentKeyboardRecipientRestoresTextInsteadOfSkipping() {
+        let f = FocusBackendFixture()
+        for name in ["text", "url"] { f.operations.owners[name] = 11 }
+        f.operations.reads["A:AXFocusedUIElement"] = AXFocusRead(error: .success, value: .element(f.operations.element("url")))
+        f.operations.reads["url:AXWindow"] = AXFocusRead(error: .success, value: .element(f.operations.element("a")))
+        f.operations.reads["text:AXWindow"] = AXFocusRead(error: .success, value: .element(f.operations.element("a")))
+        let baseline = AXFocusTarget(application: f.targetA.application, window: f.targetA.window,
+            workspaceApplication: f.appA, focusedElement: f.operations.element("url"))
+        let captured = AXFocusTarget(application: f.targetA.application, window: f.targetA.window,
+            workspaceApplication: f.appA, focusedElement: f.operations.element("text"))
+        XCTAssertEqual(f.backend.relationship(captured, baseline), .different)
+        guard case .attempted(.success) = f.backend.attemptRestore(captured: captured, baseline: baseline,
+            workspace: f.appA, capturedApplication: f.appA, permit: { true }) else { return XCTFail("Text recipient must be restored") }
+        XCTAssertEqual(f.operations.mutations, ["focused:text"])
+    }
+
+    func testFocusedRecipientReadFailureIsNotDowngradedToWindowOnlyCapture() {
+        let f = FocusBackendFixture()
+        f.operations.reads["A:AXFocusedUIElement"] = AXFocusRead(error: .cannotComplete, value: nil)
+        XCTAssertEqual(unknown(f.backend.resolve(workspace: f.appA, permit: { true }))?.stage, "focused element unavailable")
+        XCTAssertTrue(f.operations.mutations.isEmpty)
+    }
+
+    func testMalformedFocusedRecipientIsNotAcceptedAsNoRecipient() {
+        let f = FocusBackendFixture()
+        f.operations.reads["A:AXFocusedUIElement"] = AXFocusRead(error: .success, value: .string("text"))
+        XCTAssertEqual(unknown(f.backend.resolve(workspace: f.appA, permit: { true }))?.stage, "focused element type")
+    }
+
+    func testFocusedRecipientFromAnotherWindowCannotBecomeACapture() {
+        let f = FocusBackendFixture()
+        f.operations.owners["text"] = 11
+        f.operations.reads["A:AXFocusedUIElement"] = AXFocusRead(error: .success, value: .element(f.operations.element("text")))
+        f.operations.reads["text:AXWindow"] = AXFocusRead(error: .success, value: .element(f.operations.element("sibling")))
+        XCTAssertEqual(unknown(f.backend.resolve(workspace: f.appA, permit: { true }))?.stage, "focused element window")
+    }
+
+    func testApplicationRecipientSetterIsUsedOnlyWhenAdvertised() {
+        for supported in [false, true] {
+            let f = FocusBackendFixture(); f.selectB()
+            f.operations.owners["text"] = 11
+            f.operations.reads["text:AXWindow"] = AXFocusRead(error: .success, value: .element(f.operations.element("a")))
+            f.operations.onSettable = { name, attribute in
+                (.success, name == "A" && attribute == kAXFocusedUIElementAttribute && supported)
+            }
+            let captured = AXFocusTarget(application: f.targetA.application, window: f.targetA.window,
+                workspaceApplication: f.appA, focusedElement: f.operations.element("text"))
+            let result = f.backend.attemptRestore(captured: captured, baseline: f.targetB,
+                workspace: f.appB, capturedApplication: f.appA, permit: { true })
+            if supported {
+                guard case .attempted(.success) = result else { return XCTFail("Advertised recipient setter must be used") }
+                XCTAssertEqual(f.operations.mutations, ["recipient:A:text"])
+            } else {
+                guard case .unknown = result else { return XCTFail("Window-only fallback cannot promise text restoration") }
+                XCTAssertTrue(f.operations.mutations.isEmpty)
+            }
+        }
+    }
+
+    func testTouchControlFocusDoesNotMakeTheWindowBaselineStale() {
+        let f = FocusBackendFixture(); f.selectB()
+        for name in ["button", "prior"] {
+            f.operations.owners[name] = 22
+            f.operations.reads["\(name):AXWindow"] = AXFocusRead(error: .success, value: .element(f.operations.element("b")))
+        }
+        f.operations.reads["B:AXFocusedUIElement"] = AXFocusRead(error: .success, value: .element(f.operations.element("button")))
+        let baseline = AXFocusTarget(application: f.targetB.application, window: f.targetB.window,
+            workspaceApplication: f.appB, focusedElement: f.operations.element("prior"))
+        XCTAssertEqual(f.backend.windowRelationship(baseline, f.targetB), .same)
+        let result = f.backend.attemptRestore(captured: f.targetA, baseline: baseline,
+            workspace: f.appB, capturedApplication: f.appA, permit: { true })
+        guard case .attempted(.success) = result else { return XCTFail("The same touch window must remain a valid baseline") }
+        XCTAssertEqual(f.operations.mutations, ["focused:a"])
+    }
+
+    func testKeyboardRecipientChangeBetweenSamplesCannotBecomeACapture() {
+        let f = FocusBackendFixture()
+        for name in ["text", "url"] {
+            f.operations.owners[name] = 11
+            f.operations.reads["\(name):AXWindow"] = AXFocusRead(error: .success, value: .element(f.operations.element("a")))
+        }
+        var samples = 0
+        f.operations.onRead = { name, attribute in
+            guard name == "A", attribute == kAXFocusedUIElementAttribute else { return nil }
+            samples += 1
+            return AXFocusRead(error: .success, value: .element(f.operations.element(samples == 1 ? "text" : "url")))
+        }
+        XCTAssertEqual(unknown(f.backend.resolve(workspace: f.appA, permit: { true }))?.stage, "changed observation")
+        XCTAssertTrue(f.operations.mutations.isEmpty)
+    }
+
+    func testCapturedKeyboardRecipientCannotBeReusedByAnotherProcess() {
+        let f = FocusBackendFixture()
+        f.selectB()
+        f.operations.owners["text"] = 22
+        f.operations.reads["text:AXWindow"] = AXFocusRead(error: .success, value: .element(f.operations.element("a")))
+        let captured = AXFocusTarget(application: f.targetA.application, window: f.targetA.window,
+            workspaceApplication: f.appA, focusedElement: f.operations.element("text"))
+        _ = f.backend.attemptRestore(captured: captured, baseline: f.targetB, workspace: f.appB,
+            capturedApplication: f.appA, permit: { true })
+        XCTAssertTrue(f.operations.mutations.isEmpty)
+    }
+
+    func testCapturedKeyboardRecipientMovedToDifferentWindowCannotBeFocused() {
+        let f = FocusBackendFixture()
+        f.selectB()
+        f.operations.owners["text"] = 11
+        f.operations.reads["text:AXWindow"] = AXFocusRead(error: .success, value: .element(f.operations.element("sibling")))
+        let captured = AXFocusTarget(application: f.targetA.application, window: f.targetA.window,
+            workspaceApplication: f.appA, focusedElement: f.operations.element("text"))
+        _ = f.backend.attemptRestore(captured: captured, baseline: f.targetB, workspace: f.appB,
+            capturedApplication: f.appA, permit: { true })
+        XCTAssertTrue(f.operations.mutations.isEmpty)
+    }
+
     func testOnlyCannotCompleteUsesCorroboratedWorkspaceFallback() {
         let fixture = FocusBackendFixture()
         fixture.operations.systemError = .cannotComplete
@@ -270,6 +394,7 @@ private final class FakeAXFocusOperations: AXFocusOperations {
     var reads: [String: AXFocusRead] = [:]
     var onRead: ((String, String) -> AXFocusRead?)?
     var onCall: ((String) -> Void)?
+    var onSettable: ((String, String) -> (AXError, Bool))?
     var calls: [String] = []
     var mutations: [String] = []
     var applicationCreations: [pid_t] = []
@@ -300,9 +425,10 @@ private final class FakeAXFocusOperations: AXFocusOperations {
         default: return AXFocusRead(error: .attributeUnsupported, value: nil)
         }
     }
-    func isSettable(_ element: AXFocusElement, attribute: String) -> (AXError, Bool) { record("settable:\(id(element))"); return settable }
+    func isSettable(_ element: AXFocusElement, attribute: String) -> (AXError, Bool) { record("settable:\(id(element))"); return onSettable?(id(element), attribute) ?? settable }
     func actions(_ element: AXFocusElement) -> (AXError, [String]) { record("actions:\(id(element))"); return actionNames }
     func setFocused(_ element: AXFocusElement) -> AXError { mutate("focused:\(id(element))") }
+    func setFocusedElement(_ element: AXFocusElement, application: AXFocusElement) -> AXError { mutate("recipient:\(id(application)):\(id(element))") }
     func raise(_ element: AXFocusElement) -> AXError { mutate("raise:\(id(element))") }
     private func mutate(_ call: String) -> AXError { record(call); mutations.append(call); return mutationError }
     func observe(_ target: AXFocusTarget, permit: () -> Bool,

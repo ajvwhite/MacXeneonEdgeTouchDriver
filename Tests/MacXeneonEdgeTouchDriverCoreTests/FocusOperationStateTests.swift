@@ -3,6 +3,69 @@ import Foundation
 import XCTest
 
 final class FocusOperationStateTests: XCTestCase {
+    func testOwnedRestoreNotificationsPermitVerificationButPhysicalChoiceRevokesIt() {
+        var unchanged = true
+        let token = FocusOperationToken(now: { 0 }, inputPermit: { unchanged })
+        XCTAssertTrue(token.beginTouch())
+        XCTAssertTrue(token.inputDidEnd())
+        XCTAssertTrue(token.beginRestore())
+        XCTAssertTrue(token.beginRestoreMutation())
+        XCTAssertFalse(token.observe(.focusChanged))
+        XCTAssertFalse(token.observe(.keyboardFocusChanged))
+        XCTAssertTrue(token.isPermitted)
+        unchanged = false
+        XCTAssertFalse(token.isPermitted)
+    }
+
+    func testWindowChoiceBeforeRestoreCommitStillInvalidatesToken() {
+        let token = FocusOperationToken(now: { 0 })
+        XCTAssertTrue(token.beginTouch())
+        XCTAssertTrue(token.inputDidEnd())
+        XCTAssertTrue(token.beginRestore())
+        token.observe(.focusChanged)
+        XCTAssertFalse(token.beginRestoreMutation())
+    }
+
+    func testControlFocusChangesDuringTouchDoNotConsumeWindowEnrollment() {
+        let token = FocusOperationToken(now: { 0 })
+        XCTAssertTrue(token.beginTouch())
+        XCTAssertFalse(token.observe(.keyboardFocusChanged))
+        XCTAssertTrue(token.inputDidEnd())
+        XCTAssertTrue(token.beginRestore())
+    }
+
+    func testTargetActivationHintsWaitForExplicitConfirmation() {
+        let token = FocusOperationToken(now: { 0 })
+        XCTAssertTrue(token.beginTouch())
+        XCTAssertTrue(token.beginTargetActivation())
+        XCTAssertFalse(token.observe(.focusChanged))
+        XCTAssertFalse(token.observe(.keyboardFocusChanged))
+        XCTAssertNil(token.beginEnrollment())
+        XCTAssertTrue(token.endTargetActivation())
+        let revision = token.beginEnrollment()!
+        XCTAssertTrue(token.certifyEnrollment(revision: revision))
+        XCTAssertTrue(token.inputDidEnd())
+    }
+
+    func testPhysicalChoiceDuringPreparationPermanentlyRevokesToken() {
+        var unchanged = true
+        let token = FocusOperationToken(now: { 0 }, inputPermit: { unchanged })
+        unchanged = false
+        XCTAssertFalse(token.beginTouch())
+        unchanged = true
+        XCTAssertFalse(token.isPermitted)
+    }
+
+    func testPhysicalChoiceAfterLiftPreventsRestoreEvenWithoutAXNotification() {
+        var unchanged = true
+        let token = FocusOperationToken(now: { 0 }, inputPermit: { unchanged })
+        XCTAssertTrue(token.beginTouch())
+        XCTAssertTrue(token.inputDidEnd())
+        unchanged = false
+        XCTAssertFalse(token.beginRestore())
+        XCTAssertFalse(token.isPermitted)
+    }
+
     func testRepeatedCleanupReleaseKeepsFirstFreezeAndRestorationDeadline() {
         var now: UInt64 = 0
         let token = FocusOperationToken(now: { now })

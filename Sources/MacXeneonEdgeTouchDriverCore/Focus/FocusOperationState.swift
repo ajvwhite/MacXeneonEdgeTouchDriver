@@ -3,15 +3,17 @@ import Foundation
 /// Observations invalidate work; they never establish the current focused window.
 enum FocusObservationEvent {
     case focusChanged
+    case keyboardFocusChanged
     case lifecycleChanged
 }
 
 /// A short lock protects eligibility only. It is never held across a main/AX call.
 /// Invalidating this token cannot cancel an AX mutation already in progress.
 final class FocusOperationToken {
-    private enum Phase { case preparing, touching, released, restoring, invalidated }
+    private enum Phase { case preparing, targetPreparing, touching, released, restoring, mutatingRestore, invalidated }
     private let lock = NSLock()
     private let now: () -> UInt64
+    private let inputPermit: () -> Bool
     private var phase: Phase = .preparing
     private var deadline: UInt64?
     private var focusRevision: UInt64 = 0
@@ -19,8 +21,10 @@ final class FocusOperationToken {
     private var enrollmentRequested = false
     private var enrollmentStarted = false
 
-    init(preparationMilliseconds: UInt64 = 30, now: @escaping () -> UInt64) {
+    init(preparationMilliseconds: UInt64 = 30, now: @escaping () -> UInt64,
+         inputPermit: @escaping () -> Bool = { true }) {
         self.now = now
+        self.inputPermit = inputPermit
         deadline = now() &+ preparationMilliseconds * 1_000_000
     }
 
@@ -40,6 +44,19 @@ final class FocusOperationToken {
     @discardableResult func observe(_ event: FocusObservationEvent) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        if event == .keyboardFocusChanged && (phase == .touching || phase == .targetPreparing || phase == .released || phase == .mutatingRestore) {
+            return false
+        }
+        if event == .focusChanged && phase == .mutatingRestore {
+            // The committed action can change its own app/window focus. Physical
+            // input still revokes the permit; final AX/Workspace verification is mandatory.
+            return false
+        }
+        if event == .focusChanged && phase == .targetPreparing {
+            focusRevision &+= 1
+            certifiedRevision = nil
+            return false
+        }
         if event == .lifecycleChanged || phase != .touching {
             phase = .invalidated
             return false
@@ -58,6 +75,22 @@ final class FocusOperationToken {
         phase = .touching
         deadline = nil
         certifiedRevision = focusRevision
+        return true
+    }
+
+    func beginTargetActivation() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard phase == .touching, permittedWhileLocked(), !enrollmentStarted else { return false }
+        phase = .targetPreparing
+        deadline = now() &+ 150_000_000
+        return true
+    }
+
+    func endTargetActivation() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard phase == .targetPreparing, permittedWhileLocked() else { return false }
+        phase = .touching
+        enrollmentRequested = true
         return true
     }
 
@@ -96,15 +129,22 @@ final class FocusOperationToken {
         return true
     }
 
+    func beginRestoreMutation() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard phase == .restoring, permittedWhileLocked() else { return false }
+        phase = .mutatingRestore
+        return true
+    }
+
     /// Freeze once at the accepted HID release. Synthetic release and cancellation
     /// may repeat this call, but cannot replace the baseline or revoke a valid freeze.
     @discardableResult func inputDidEnd() -> Bool {
         lock.lock()
         defer { lock.unlock() }
         switch phase {
-        case .released, .restoring, .invalidated:
+        case .released, .restoring, .mutatingRestore, .invalidated:
             return false
-        case .preparing:
+        case .preparing, .targetPreparing:
             phase = .invalidated
             return false
         case .touching:
@@ -120,6 +160,7 @@ final class FocusOperationToken {
 
     private func permittedWhileLocked() -> Bool {
         guard phase != .invalidated else { return false }
+        guard inputPermit() else { phase = .invalidated; return false }
         if let deadline, now() >= deadline {
             phase = .invalidated
             return false

@@ -328,8 +328,41 @@ final class DriverStartupCoordinatorTests: XCTestCase {
         assertHardwareFailure(result: kIOReturnExclusiveAccess)
     }
 
-    func testHIDNotPermittedFailureDoesNotBecomeSyntheticPermissionWaitOrRetry() {
-        assertHardwareFailure(result: kIOReturnNotPermitted)
+    func testHIDDenialWaitsInSameProcessAndRetriesOnlyAfterPositiveGrant() {
+        let harness = StartupTestHarness(snapshot: .cgReady)
+        harness.hardwareError = HIDDeviceMonitorError.openFailed(kIOReturnNotPermitted)
+        harness.coordinator.start()
+        XCTAssertEqual(harness.coordinator.state, .waitingForPermission)
+        XCTAssertEqual(harness.hardwareStartCount, 1)
+        XCTAssertEqual(harness.hardwareStopCount, 1)
+        harness.polling.advance(bySeconds: 20)
+        XCTAssertEqual(harness.hardwareStartCount, 1, "Unknown HID access must not retry or restart")
+        harness.permissions.currentSnapshot = SyntheticPermissionSnapshot(postEventAccess: true,
+            accessibilityTrusted: false, hidInputAccess: .denied)
+        harness.polling.advance(bySeconds: 20)
+        XCTAssertEqual(harness.hardwareStartCount, 1)
+        harness.hardwareError = nil
+        harness.permissions.currentSnapshot = SyntheticPermissionSnapshot(postEventAccess: true,
+            accessibilityTrusted: false, hidInputAccess: .granted)
+        harness.polling.advance(bySeconds: 2)
+        XCTAssertEqual(harness.coordinator.state, .running)
+        XCTAssertEqual(harness.hardwareStartCount, 2)
+        XCTAssertEqual(harness.permissions.requestCount, 0)
+        XCTAssertEqual(harness.worker.submissionCount, 0)
+        harness.coordinator.stop()
+        XCTAssertEqual(harness.hardwareStopCount, 2)
+    }
+
+    func testKnownHIDDenialDoesNotAttemptHardwareOrRequestSyntheticAccess() {
+        let harness = StartupTestHarness(snapshot: SyntheticPermissionSnapshot(postEventAccess: true,
+            accessibilityTrusted: false, hidInputAccess: .denied))
+        harness.coordinator.start()
+        XCTAssertEqual(harness.coordinator.state, .waitingForPermission)
+        XCTAssertEqual(harness.hardwareStartCount, 0)
+        XCTAssertEqual(harness.worker.submissionCount, 0)
+        harness.signals.send(SIGTERM)
+        XCTAssertEqual(harness.coordinator.state, .stopped)
+        XCTAssertEqual(harness.coordinator.exitStatus, EXIT_SUCCESS)
     }
 
     func testRunReturnsFailureWhenGrantLaterRevealsHardwareError() {

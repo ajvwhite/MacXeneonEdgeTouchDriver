@@ -2,6 +2,40 @@
 import XCTest
 
 final class SyntheticPermissionTests: XCTestCase {
+    func testTargetActivationCannotStartWithCGAccessButNoAXTrust() {
+        let snapshot = SyntheticPermissionSnapshot(postEventAccess: true, accessibilityTrusted: false,
+            requiresAccessibility: true)
+        XCTAssertTrue(snapshot.hasSyntheticAccess)
+        XCTAssertFalse(snapshot.isReady)
+        var calls: [String] = []
+        let provider = SystemSyntheticPermissionProvider(readSnapshot: { snapshot },
+            requestPostEventAccess: { calls.append("CG"); return true },
+            requestAccessibilityTrust: { calls.append("AX") })
+        provider.requestInitialAccess(cancellation: StartupCancellation())
+        XCTAssertEqual(calls, ["AX"])
+    }
+
+    func testSuccessfulCGRequestCannotSkipRequiredAXTrust() {
+        var calls: [String] = []
+        let provider = SystemSyntheticPermissionProvider(readSnapshot: {
+            SyntheticPermissionSnapshot(postEventAccess: false, accessibilityTrusted: false,
+                requiresAccessibility: true)
+        }, requestPostEventAccess: { calls.append("CG"); return true },
+        requestAccessibilityTrust: { calls.append("AX") })
+        provider.requestInitialAccess(cancellation: StartupCancellation())
+        XCTAssertEqual(calls, ["CG", "AX"])
+    }
+
+    func testHIDOnlyDenialDoesNotRequestAlreadyGrantedSyntheticPermissions() {
+        let provider = SystemSyntheticPermissionProvider(readSnapshot: {
+            SyntheticPermissionSnapshot(postEventAccess: true, accessibilityTrusted: true,
+                hidInputAccess: .denied, requiresAccessibility: true)
+        }, requestPostEventAccess: { XCTFail("CG is already granted"); return true },
+        requestAccessibilityTrust: { XCTFail("AX is already granted") })
+        XCTAssertFalse(provider.snapshot().isReady)
+        provider.requestInitialAccess(cancellation: StartupCancellation())
+    }
+
     func testSnapshotsReadBothFactsWithoutRequests() {
         var reads = 0
         var requests = 0

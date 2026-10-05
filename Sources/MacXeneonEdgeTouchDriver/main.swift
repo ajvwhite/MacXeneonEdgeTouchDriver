@@ -5,6 +5,20 @@ import MacXeneonEdgeTouchDriverCore
 @main
 struct MacXeneonEdgeTouchDriverMain {
     static func main() {
+        if CommandLine.arguments.dropFirst().elementsEqual(["--check-permissions"]) {
+            let status = DriverPermissionStatus.inspect()
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            do {
+                let bytes = try encoder.encode(status)
+                FileHandle.standardOutput.write(bytes)
+                FileHandle.standardOutput.write(Data([10]))
+                exit(status.readyForUnattendedStart ? EXIT_SUCCESS : EX_NOPERM)
+            } catch {
+                FileHandle.standardError.write(Data("Could not encode permission diagnostics: \(error.localizedDescription)\n".utf8))
+                exit(EXIT_FAILURE)
+            }
+        }
         let loadResult = DriverConfiguration.load()
         do {
             try DriverFileLog.shared.configure(

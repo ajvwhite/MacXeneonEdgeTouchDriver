@@ -3,6 +3,7 @@ import Foundation
 import HIDDumpSupport
 import IOKit
 import IOKit.hid
+import IOKit.hidsystem
 
 private let touchscreenVendorID = 0x27c0
 private let touchscreenProductID = 0x0859
@@ -334,4 +335,75 @@ private func formatIOReturn(_ value: IOReturn) -> String {
     String(format: "0x%08X", UInt32(bitPattern: value))
 }
 
+/// Enumerates descriptor metadata and cached input values. The optional open
+/// requires an existing HID grant and uses non-seize access. Neither mode requests
+/// permissions, registers callbacks, posts input or queries feature reports.
+private func describeInputCache(openDevice: Bool = false) -> Int32 {
+    guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else {
+        fputs("HID listen access is not granted; no permission request was made.\n", stderr)
+        return EX_NOPERM
+    }
+    let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+    IOHIDManagerSetDeviceMatching(manager, [kIOHIDVendorIDKey: touchscreenVendorID,
+                                          kIOHIDProductIDKey: touchscreenProductID] as CFDictionary)
+    if openDevice {
+        let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard result == kIOReturnSuccess else {
+            fputs("Could not open HID for cached reads: \(formatIOReturn(result))\n", stderr)
+            return EXIT_FAILURE
+        }
+    }
+    defer { if openDevice { _ = IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone)) } }
+    let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> ?? []
+    var snapshots: [[String: Any]] = []
+    for device in devices {
+        var registryID: UInt64 = 0
+        _ = IORegistryEntryGetRegistryEntryID(IOHIDDeviceGetService(device), &registryID)
+        let elements = IOHIDDeviceCopyMatchingElements(device, nil, IOOptionBits(kIOHIDOptionsTypeNone)) as? [IOHIDElement] ?? []
+        var values: [[String: Any]] = []
+        for element in elements {
+            let type = IOHIDElementGetType(element)
+            guard type == kIOHIDElementTypeInput_Misc || type == kIOHIDElementTypeInput_Button
+                    || type == kIOHIDElementTypeInput_Axis || type == kIOHIDElementTypeInput_ScanCodes else { continue }
+            // This header's nonnull out parameter imports as Unmanaged. Read
+            // it only on success; Get returns a borrowed value owned by IOKit.
+            let output = UnsafeMutablePointer<Unmanaged<IOHIDValue>>.allocate(capacity: 1)
+            defer { output.deallocate() }
+            let result = IOHIDDeviceGetValueWithOptions(device, element, output,
+                                                        IOHIDDeviceGetValueOptions.withoutUpdate.rawValue)
+            var row: [String: Any] = ["cookie": IOHIDElementGetCookie(element),
+                "reportID": IOHIDElementGetReportID(element), "usagePage": IOHIDElementGetUsagePage(element),
+                "usage": IOHIDElementGetUsage(element), "logicalMin": IOHIDElementGetLogicalMin(element),
+                "logicalMax": IOHIDElementGetLogicalMax(element), "result": formatIOReturn(result)]
+            if result == kIOReturnSuccess {
+                let value = output.pointee.takeUnretainedValue()
+                let length = IOHIDValueGetLength(value)
+                if length > 0 && length <= MemoryLayout<CFIndex>.size {
+                    row["value"] = IOHIDValueGetIntegerValue(value)
+                }
+                row["timestampMachTicks"] = IOHIDValueGetTimeStamp(value)
+                row["length"] = length
+            }
+            values.append(row)
+        }
+        snapshots.append(["registryID": registryID, "inputElements": values])
+    }
+    do {
+        let bytes = try JSONSerialization.data(withJSONObject: ["cachedValuesOnly": true, "hidOpened": openDevice, "devices": snapshots],
+                                               options: [.prettyPrinted, .sortedKeys])
+        FileHandle.standardOutput.write(bytes)
+        FileHandle.standardOutput.write(Data([10]))
+        return devices.isEmpty ? EXIT_FAILURE : EXIT_SUCCESS
+    } catch {
+        fputs("Could not encode input-cache diagnostics: \(error.localizedDescription)\n", stderr)
+        return EXIT_FAILURE
+    }
+}
+
+if CommandLine.arguments.dropFirst().elementsEqual(["--describe-input-cache"]) {
+    exit(describeInputCache())
+}
+if CommandLine.arguments.dropFirst().elementsEqual(["--describe-input-cache", "--open"]) {
+    exit(describeInputCache(openDevice: true))
+}
 exit(HIDDumpApplication().run())

@@ -35,6 +35,14 @@ final class TestGestureScheduler: GestureScheduler {
     }
 
     @discardableResult
+    func schedule(at deadline: DispatchTime, action: @escaping () -> Void) -> GestureScheduledTask {
+        let task = Task(deadline: deadline.uptimeNanoseconds, sequence: nextSequence, action: action)
+        nextSequence += 1
+        if deadline <= now { action() } else { tasks.append(task) }
+        return task
+    }
+
+    @discardableResult
     func schedule(afterMilliseconds milliseconds: Int, action: @escaping () -> Void) -> GestureScheduledTask {
         let task = Task(
             deadline: now.uptimeNanoseconds + UInt64(max(0, milliseconds)) * 1_000_000,

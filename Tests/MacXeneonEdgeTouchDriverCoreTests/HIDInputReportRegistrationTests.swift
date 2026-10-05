@@ -31,6 +31,54 @@ final class HIDInputReportRegistrationTests: XCTestCase {
         }
     }
 
+    func testCachedReleaseRejectsOlderHeldPacketsAndPreservesFirstFreshDown() {
+        onMain {
+            let f = InputReportFixture()
+            XCTAssertTrue(f.registration.installNeutralState(HIDNeutralState(reportTimestamp: 100)))
+            f.write(isDown: true)
+            for timestamp: UInt64 in [0, 99, 100] { f.deliver(providerTimestamp: timestamp) }
+            f.deliver() // Missing provider timestamp cannot prove ordering.
+            XCTAssertTrue(f.events.isEmpty)
+            XCTAssertEqual(f.receivedReports, 0)
+            f.deliver(providerTimestamp: 101)
+            XCTAssertEqual(f.events.map(\.kind), [.down])
+            XCTAssertEqual(f.observations.first?.contactEpoch, 1)
+            f.write(isDown: false)
+            f.deliver(providerTimestamp: 102)
+            XCTAssertEqual(f.events.map(\.kind), [.down, .up])
+        }
+    }
+
+    func testCacheCannotReplaceAnAdmittedContactOrRetiredRegistration() {
+        onMain {
+            let f = InputReportFixture()
+            f.write(isDown: true)
+            f.deliver(providerTimestamp: 80)
+            XCTAssertFalse(f.registration.installNeutralState(HIDNeutralState(reportTimestamp: 100)))
+            f.write(isDown: false)
+            f.deliver(providerTimestamp: 81)
+            XCTAssertEqual(f.events.map(\.kind), [.down, .up])
+            let retired = InputReportFixture()
+            retired.registration.invalidate()
+            XCTAssertFalse(retired.registration.installNeutralState(HIDNeutralState(reportTimestamp: 100)))
+        }
+    }
+
+    func testProviderWithoutTimestampsRequiresExplicitRawRelease() {
+        onMain {
+            let f = InputReportFixture()
+            XCTAssertTrue(f.registration.installNeutralState(HIDNeutralState(reportTimestamp: 100)))
+            f.write(isDown: true)
+            f.deliver(providerTimestamp: 0)
+            XCTAssertTrue(f.events.isEmpty)
+            f.write(isDown: false)
+            f.deliver(providerTimestamp: 0)
+            f.write(isDown: true)
+            f.deliver(providerTimestamp: 0)
+            XCTAssertEqual(f.events.map(\.kind), [.down])
+        }
+    }
+
     func testFailedCompletionDoesNotReachParser() {
         assertRejectedWithoutParserMutation { fixture in
             fixture.deliver(result: kIOReturnError)
@@ -451,10 +499,11 @@ private final class InputReportFixture {
         reportID: UInt32 = 7,
         report: UnsafeMutablePointer<UInt8>? = nil,
         length: CFIndex = XeneonEdgeDevice.touchReportLength,
-        timestamp: DispatchTime = .now()
+        timestamp: DispatchTime = .now(),
+        providerTimestamp: UInt64? = nil
     ) {
         deliver(context: registration.context, sender: sender, result: result, type: type,
-                reportID: reportID, report: report, length: length, timestamp: timestamp)
+                reportID: reportID, report: report, length: length, timestamp: timestamp, providerTimestamp: providerTimestamp)
     }
 
     func deliver(sender: UnsafeMutableRawPointer?) {
@@ -473,11 +522,12 @@ private final class InputReportFixture {
         reportID: UInt32 = 7,
         report: UnsafeMutablePointer<UInt8>? = nil,
         length: CFIndex = XeneonEdgeDevice.touchReportLength,
-        timestamp: DispatchTime = .now()
+        timestamp: DispatchTime = .now(),
+        providerTimestamp: UInt64? = nil
     ) {
         HIDInputReportRegistration.handleCallback(
             context: context, result: result, sender: sender, type: type, reportID: reportID,
-            report: report ?? registration.buffer, reportLength: length, timestamp: timestamp
+            report: report ?? registration.buffer, reportLength: length, timestamp: timestamp, providerTimestamp: providerTimestamp
         )
     }
 }

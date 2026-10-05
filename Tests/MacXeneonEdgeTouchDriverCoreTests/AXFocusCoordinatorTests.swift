@@ -4,6 +4,107 @@ import Foundation
 import XCTest
 
 final class AXFocusCoordinatorTests: XCTestCase {
+    func testUnavailableCaptureDoesNotBlockSeparatelyVerifiedTargetActivation() {
+        let f = FocusCoordinatorFixture()
+        f.backend.observationSucceeds = false
+        f.prepare()
+        XCTAssertTrue(f.restorer.beginTargetActivation())
+        var accepted: Bool?
+        f.restorer.confirmTargetActivation { accepted = $0 }
+        f.pump()
+        XCTAssertEqual(accepted, true)
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
+    func testIndependentConfirmationQueuedBeforeDiscardIsInvalidated() {
+        let f = FocusCoordinatorFixture()
+        f.backend.observationSucceeds = false
+        f.prepare()
+        XCTAssertTrue(f.restorer.beginTargetActivation())
+        var accepted: Bool?
+        f.restorer.confirmTargetActivation { accepted = $0 }
+        f.restorer.discardCapturedWindow()
+        f.pump()
+        XCTAssertEqual(accepted, false)
+    }
+
+    func testShutdownCannotAcceptIndependentTargetActivation() {
+        let f = FocusCoordinatorFixture()
+        f.backend.observationSucceeds = false
+        f.prepare()
+        XCTAssertTrue(f.restorer.beginTargetActivation())
+        f.restorer.shutdown()
+        var accepted: Bool?
+        f.restorer.confirmTargetActivation { accepted = $0 }
+        f.pump()
+        XCTAssertEqual(accepted, false)
+        XCTAssertFalse(f.restorer.beginTargetActivation())
+    }
+
+    func testOwnRestorationNotificationsDoNotSuppressFreshVerification() {
+        let f = FocusCoordinatorFixture()
+        f.prepare(); f.changeFocusDuringTouch()
+        f.backend.onAttempt = {
+            f.backend.focused = f.captured
+            f.workspace.frontmost = f.captured.workspaceApplication
+            f.workspace.emit(.focusChanged)
+            f.backend.emit(.keyboardFocusChanged, processIdentifier: 10)
+        }
+        let before = f.backend.resolveCount
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.attemptCount, 1)
+        XCTAssertGreaterThan(f.backend.resolveCount, before + 1, "An issued action must receive fresh verification")
+        XCTAssertEqual(f.backend.relationship(f.backend.focused, f.captured), .same)
+    }
+
+    func testOwnedTargetActivationIsCertifiedBeforeTouchDelivery() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        XCTAssertTrue(f.restorer.beginTargetActivation())
+        f.changeFocusDuringTouch(enroll: false)
+        var accepted: Bool?
+        f.restorer.confirmTargetActivation { accepted = $0 }
+        XCTAssertNil(accepted)
+        f.pump()
+        XCTAssertEqual(accepted, true)
+        XCTAssertEqual(f.backend.observers.count, 2)
+        f.backend.onAttempt = {
+            f.backend.focused = f.captured
+            f.workspace.frontmost = f.captured.workspaceApplication
+        }
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.attemptCount, 1)
+    }
+
+    func testTargetActivationCannotOutliveWorkspaceSessionLoss() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        XCTAssertTrue(f.restorer.beginTargetActivation())
+        f.workspace.emit(.lifecycleChanged)
+        var accepted: Bool?
+        f.restorer.confirmTargetActivation { accepted = $0 }
+        f.pump()
+        XCTAssertEqual(accepted, false)
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
+    func testReleaseDuringTargetCertificationCannotCreateALateBaseline() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        XCTAssertTrue(f.restorer.beginTargetActivation())
+        f.changeFocusDuringTouch(enroll: false)
+        var accepted: Bool?
+        f.restorer.confirmTargetActivation { accepted = $0 }
+        _ = f.main.runAll()
+        f.restorer.inputDidEnd()
+        f.pump()
+        XCTAssertEqual(accepted, false)
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
     func testAcceptedPhysicalUpPreventsPostReleaseEnrollmentDuringSyntheticUpDelay() {
         for upDelay in [0, 20, 1_000] {
             let f = CoordinatorGestureFixture(upDelay: upDelay)

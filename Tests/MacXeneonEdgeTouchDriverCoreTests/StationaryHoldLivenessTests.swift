@@ -75,6 +75,245 @@ final class StationaryHoldLivenessTests: XCTestCase {
         }
     }
 
+    func testFiveCompleteFreshTapsDuringMouseUpDelayAreReplayedInOrder() {
+        onMain {
+            var configuration = holdConfiguration(timeout: 500)
+            configuration.timing.downToUpDelayMs = 20
+            let f = HoldFixture(configuration: configuration)
+            let source = f.makeSource()
+            for index in 0..<5 {
+                f.clock.advance(toMilliseconds: UInt64(index * 2))
+                source.pressed(at: f.clock.now, x: index * 100, y: index * 100)
+                f.clock.advance(byMilliseconds: 1)
+                source.released(at: f.clock.now, x: index * 100, y: index * 100)
+            }
+            XCTAssertEqual(f.effects.downs.count, 1)
+            f.clock.advance(toMilliseconds: 20)
+            XCTAssertTrue(f.effects.ups.isEmpty, "The first configured release delay is preserved")
+            f.clock.advance(toMilliseconds: 121)
+            XCTAssertEqual(f.effects.downs, (0..<5).map { f.point($0 * 100, $0 * 100) })
+            XCTAssertEqual(f.effects.ups, f.effects.downs)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testBufferedDragPreservesEveryPointAndItsRelease() {
+        onMain {
+            var configuration = holdConfiguration(timeout: 500)
+            configuration.timing.downToUpDelayMs = 20
+            let f = HoldFixture(configuration: configuration)
+            let source = f.makeSource()
+            source.pressed(at: f.clock.now); source.released(at: f.clock.now)
+            f.clock.advance(toMilliseconds: 5)
+            source.pressed(at: f.clock.now, x: 100, y: 100)
+            source.pressed(at: f.clock.now, x: 200, y: 200)
+            source.pressed(at: f.clock.now, x: 300, y: 300)
+            source.released(at: f.clock.now, x: 300, y: 300)
+            f.clock.advance(toMilliseconds: 100)
+            XCTAssertEqual(f.effects.downs, [f.point(0, 0), f.point(100, 100)])
+            XCTAssertEqual(f.effects.drags, [f.point(200, 200), f.point(300, 300)])
+            XCTAssertEqual(f.effects.ups, [f.point(0, 0), f.point(300, 300)])
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testPendingEventOverflowRejectsOnlyThatContactUntilItsRelease() {
+        onMain {
+            var configuration = holdConfiguration(timeout: 500)
+            configuration.timing.downToUpDelayMs = 20
+            let f = HoldFixture(configuration: configuration)
+            let source = f.makeSource()
+            source.pressed(at: f.clock.now); source.released(at: f.clock.now)
+            f.clock.advance(toMilliseconds: 5)
+            source.pressed(at: f.clock.now, x: 1, y: 1)
+            for coordinate in 2...300 { source.pressed(at: f.clock.now, x: coordinate, y: coordinate) }
+            source.released(at: f.clock.now)
+            f.clock.advance(toMilliseconds: 50)
+            XCTAssertEqual(f.effects.downs.count, 1)
+            source.pressed(at: f.clock.now, x: 500, y: 500)
+            source.released(at: f.clock.now, x: 500, y: 500)
+            f.clock.advance(toMilliseconds: 100)
+            XCTAssertEqual(f.effects.downs.count, 2)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testPendingContactCapacityDoesNotGrowWithAnUnboundedTapStream() {
+        onMain {
+            var configuration = holdConfiguration(timeout: 500)
+            configuration.timing.downToUpDelayMs = 1
+            let f = HoldFixture(configuration: configuration)
+            let source = f.makeSource()
+            for coordinate in 0..<100 {
+                source.pressed(at: f.clock.now, x: coordinate, y: coordinate)
+                source.released(at: f.clock.now, x: coordinate, y: coordinate)
+            }
+            f.clock.advance(toMilliseconds: 100)
+            XCTAssertEqual(f.effects.downs.count, 17, "One active plus sixteen buffered contacts")
+            XCTAssertEqual(f.effects.ups.count, 17)
+            source.pressed(at: f.clock.now); source.released(at: f.clock.now)
+            f.clock.advance(byMilliseconds: 2)
+            XCTAssertEqual(f.effects.downs.count, 18)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testCancellationDuringPendingDisplayResolutionCannotAdmitItsOldDown() {
+        onMain {
+            var configuration = holdConfiguration(timeout: 500)
+            configuration.timing.downToUpDelayMs = 20
+            let f = HoldFixture(configuration: configuration)
+            let source = f.makeSource()
+            source.pressed(at: f.clock.now); source.released(at: f.clock.now)
+            f.clock.advance(toMilliseconds: 5)
+            source.pressed(at: f.clock.now); source.released(at: f.clock.now)
+            f.displays.onNextRead = { f.application.cancelActiveGesture() }
+            f.clock.advance(toMilliseconds: 100)
+            XCTAssertEqual(f.effects.downs.count, 1)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testCancelledPendingReplayCannotSendItsBufferedUpToANewOwner() {
+        onMain {
+            var configuration = holdConfiguration(timeout: 500)
+            configuration.timing.downToUpDelayMs = 20
+            let f = HoldFixture(configuration: configuration)
+            let old = f.makeSource()
+            let replacement = f.makeSource(sender: UnsafeMutableRawPointer(bitPattern: 0x2000)!)
+            old.pressed(at: f.clock.now); old.released(at: f.clock.now)
+            f.clock.advance(toMilliseconds: 5)
+            old.pressed(at: f.clock.now, x: 100, y: 100)
+            old.released(at: f.clock.now, x: 100, y: 100)
+            f.focus.onPrepare = {
+                f.focus.onPrepare = nil
+                f.application.cancelActiveGesture()
+                replacement.pressed(at: f.clock.now, x: 500, y: 500)
+            }
+            f.clock.advance(toMilliseconds: 100)
+            XCTAssertEqual(f.effects.downs, [f.point(0, 0), f.point(500, 500)])
+            XCTAssertEqual(f.effects.ups, [f.point(0, 0)], "Old buffered up must not end the replacement")
+            replacement.released(at: f.clock.now, x: 500, y: 500)
+            f.clock.advance(byMilliseconds: 20)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testPendingContactsAreAbandonedOnCancelRetirementExpiryOrPhysicalChoice() {
+        onMain {
+            for reason in ["cancel", "retirement", "expiry", "physical choice"] {
+                var configuration = holdConfiguration(timeout: 500)
+                configuration.timing.downToUpDelayMs = reason == "expiry" ? 200 : 20
+                var permit = true
+                let f = HoldFixture(configuration: configuration, capturePendingInputPermit: { { permit } })
+                let old = f.makeSource()
+                let pending = f.makeSource(sender: UnsafeMutableRawPointer(bitPattern: 0x2000)!)
+                old.pressed(at: f.clock.now); old.released(at: f.clock.now)
+                f.clock.advance(toMilliseconds: 5)
+                pending.pressed(at: f.clock.now); pending.released(at: f.clock.now)
+                if reason == "cancel" { f.application.cancelActiveGesture() }
+                if reason == "retirement" {
+                    pending.registration.invalidate()
+                    f.application.handleSourceRemoval(pending.registration.sourceID)
+                }
+                if reason == "physical choice" { permit = false }
+                f.clock.advance(toMilliseconds: 300)
+                XCTAssertEqual(f.effects.downs.count, 1, reason)
+                XCTAssertEqual(f.effects.ups.count, 1, reason)
+                f.effects.assertBalanced()
+            }
+        }
+    }
+
+    func testReplacementReleaseEvidencePreservesItsFirstTapAfterInterruptedOwnerRemoval() {
+        onMain {
+            let f = HoldFixture(timeout: 100)
+            let old = f.makeSource()
+            old.pressed(at: f.clock.now)
+            old.registration.invalidate()
+            f.application.handleSourceRemoval(old.registration.sourceID)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            let replacement = f.makeSource()
+            f.application.handleSourceNeutralState(replacement.registration.sourceID,
+                fence: replacement.registration.retirementFence)
+            replacement.pressed(at: f.clock.now, x: 500, y: 500)
+            replacement.released(at: f.clock.now, x: 500, y: 500)
+            XCTAssertEqual(f.effects.downs.count, 2)
+            XCTAssertEqual(f.effects.ups.count, 2)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testReplacementReleaseEvidenceCannotClearAnAliasBarrierOrAlterAnActiveContact() {
+        onMain {
+            let f = HoldFixture(timeout: 100)
+            let old = f.makeSource()
+            old.pressed(at: f.clock.now)
+            old.registration.invalidate()
+            f.application.handleSourceRemoval(old.registration.sourceID)
+            let proven = f.makeSource()
+            let alias = f.makeSource(sender: UnsafeMutableRawPointer(bitPattern: 0x2000)!)
+            f.application.handleSourceNeutralState(proven.registration.sourceID,
+                fence: proven.registration.retirementFence)
+            alias.pressed(at: f.clock.now)
+            XCTAssertEqual(f.effects.downs.count, 1, "Only the proven registration is recovered")
+            proven.pressed(at: f.clock.now)
+            let active = f.effects.events
+            f.application.handleSourceNeutralState(proven.registration.sourceID,
+                fence: proven.registration.retirementFence)
+            XCTAssertEqual(f.effects.events, active)
+            proven.released(at: f.clock.now)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testRetiredOrMismatchedReleaseEvidenceCannotRecoverANewSource() {
+        onMain {
+            let f = HoldFixture(timeout: 100)
+            let old = f.makeSource()
+            old.pressed(at: f.clock.now)
+            old.registration.invalidate()
+            f.application.handleSourceRemoval(old.registration.sourceID)
+            let replacement = f.makeSource()
+            f.application.handleSourceNeutralState(replacement.registration.sourceID,
+                fence: old.registration.retirementFence)
+            replacement.pressed(at: f.clock.now)
+            XCTAssertEqual(f.effects.downs.count, 1)
+            replacement.released(at: f.clock.now)
+            replacement.pressed(at: f.clock.now)
+            replacement.released(at: f.clock.now)
+            XCTAssertEqual(f.effects.downs.count, 2)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testDenseStationaryHeartbeatsKeepOnePendingWatchdogTask() {
+        onMain {
+            let f = HoldFixture(timeout: 100)
+            let source = f.makeSource()
+            source.pressed(at: f.clock.now)
+            let tasks = f.clock.scheduledTaskCount
+            for milliseconds in 1...99 {
+                f.clock.advance(toMilliseconds: UInt64(milliseconds))
+                source.pressed(at: f.clock.now)
+            }
+            XCTAssertEqual(f.clock.scheduledTaskCount, tasks,
+                           "Ninety-nine heartbeats must not allocate ninety-nine timers")
+            f.clock.advance(toMilliseconds: 100)
+            XCTAssertEqual(f.clock.scheduledTaskCount, tasks + 1,
+                           "The original callback schedules only the remaining deadline")
+            XCTAssertTrue(f.effects.ups.isEmpty)
+            f.clock.advance(toMilliseconds: 198)
+            XCTAssertTrue(f.effects.ups.isEmpty)
+            f.clock.advance(toMilliseconds: 199)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            f.clock.advance(byMilliseconds: 200)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            f.effects.assertBalanced()
+        }
+    }
+
     func testSilentOwnerExpiresFromLastProcessedHeartbeat() {
         onMain {
             let f = HoldFixture()
@@ -255,7 +494,56 @@ final class StationaryHoldLivenessTests: XCTestCase {
         }
     }
 
-    func testRejectedHeldContactCannotTakeOverAfterOwnerCleanup() {
+    func testFreshContactEndsOnlyReleasedCursorDelayWithoutLosingTap() {
+        onMain {
+            var configuration = holdConfiguration(timeout: 500)
+            configuration.timing.downToUpDelayMs = 20
+            configuration.timing.clickToWarpBackDelayMs = 100
+            let f = HoldFixture(configuration: configuration)
+            let source = f.makeSource()
+            source.pressed(at: f.clock.now)
+            source.released(at: f.clock.now)
+            f.clock.advance(toMilliseconds: 25)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            XCTAssertTrue(f.effects.releases.isEmpty)
+            source.pressed(at: f.clock.now)
+            XCTAssertEqual(f.effects.downs.count, 2)
+            XCTAssertEqual(f.effects.releases, [true])
+            XCTAssertTrue(f.effects.restores.isEmpty, "Superseded focus must not race the new contact")
+            source.released(at: f.clock.now)
+            f.clock.advance(toMilliseconds: 200)
+            XCTAssertEqual(f.effects.ups.count, 2)
+            XCTAssertEqual(f.effects.releases, [true, true])
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testReleaseDuringCursorHandoffCannotAdmitAnAlreadyEndedContact() {
+        onMain {
+            var configuration = holdConfiguration(timeout: 500)
+            configuration.timing.downToUpDelayMs = 20
+            configuration.timing.clickToWarpBackDelayMs = 100
+            let f = HoldFixture(configuration: configuration)
+            let source = f.makeSource()
+            source.pressed(at: f.clock.now)
+            source.released(at: f.clock.now)
+            f.clock.advance(toMilliseconds: 25)
+            f.focus.onDiscard = { source.released(at: f.clock.now) }
+            source.pressed(at: f.clock.now)
+            f.focus.onDiscard = nil
+            f.clock.advance(toMilliseconds: 200)
+            XCTAssertEqual(f.effects.downs.count, 1)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            f.effects.assertBalanced()
+            source.pressed(at: f.clock.now)
+            source.released(at: f.clock.now)
+            f.clock.advance(toMilliseconds: 400)
+            XCTAssertEqual(f.effects.downs.count, 2)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testBufferedHeldContactOwnsOnlyItsNewLeaseAfterPriorMouseUp() {
         onMain {
             var configuration = holdConfiguration(timeout: 500)
             configuration.timing.downToUpDelayMs = 20
@@ -265,21 +553,18 @@ final class StationaryHoldLivenessTests: XCTestCase {
             source.pressed(at: f.clock.now)
             source.released(at: f.clock.now)
             f.clock.advance(toMilliseconds: 10)
-            source.pressed(at: f.clock.now) // Epoch 2 overlaps epoch 1's cleanup lease.
-            f.clock.advance(toMilliseconds: 130)
-            let completed = f.effects.events
-            let scheduled = f.clock.scheduledTaskCount
             source.pressed(at: f.clock.now)
-            f.clock.advance(toMilliseconds: 600)
-            source.pressed(at: f.clock.now)
-            XCTAssertEqual(f.effects.events, completed)
-            XCTAssertEqual(f.clock.scheduledTaskCount, scheduled)
             XCTAssertEqual(f.effects.downs.count, 1)
-            source.released(at: f.clock.now)
-            source.pressed(at: f.clock.now)
-            source.released(at: f.clock.now)
-            f.clock.advance(byMilliseconds: 120)
+            f.clock.advance(toMilliseconds: 20)
             XCTAssertEqual(f.effects.downs.count, 2)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            f.clock.advance(toMilliseconds: 100)
+            source.pressed(at: f.clock.now, x: 500, y: 500)
+            f.clock.advance(toMilliseconds: 500) // Old contact's deadline cannot expire the new owner.
+            XCTAssertEqual(f.effects.ups.count, 1)
+            source.released(at: f.clock.now, x: 500, y: 500)
+            f.clock.advance(toMilliseconds: 620)
+            XCTAssertEqual(f.effects.ups.count, 2)
             XCTAssertEqual(f.effects.releases, [true, true])
             f.effects.assertBalanced()
         }
@@ -841,13 +1126,14 @@ final class StationaryHoldLivenessTests: XCTestCase {
                 f.input.onDown = nil
                 f.input.onUp = nil
                 foreign.pressed(at: f.clock.now, x: 6_000, y: 6_000)
-                XCTAssertEqual(f.effects.downs, [f.point(0, 0)], effect)
-                XCTAssertEqual(f.effects.ups, [f.point(0, 0)], effect)
-                XCTAssertEqual(f.focus.preparationCount, 1, effect)
+                let expectedDowns = effect == "up" ? [f.point(0, 0), f.point(5_000, 5_000)] : [f.point(0, 0)]
+                XCTAssertEqual(f.effects.downs, expectedDowns, effect)
+                XCTAssertEqual(f.effects.ups, [f.point(0, 0)], "A foreign contact cannot change the owner's release point")
+                XCTAssertEqual(f.focus.preparationCount, expectedDowns.count, effect)
                 foreign.released(at: f.clock.now)
                 foreign.pressed(at: f.clock.now)
                 foreign.released(at: f.clock.now)
-                XCTAssertEqual(f.effects.downs.count, 2, effect)
+                XCTAssertEqual(f.effects.downs.count, expectedDowns.count + 1, effect)
                 f.effects.assertBalanced()
             }
         }
@@ -868,22 +1154,37 @@ final class StationaryHoldLivenessTests: XCTestCase {
                 if duringUp { f.input.onUp = inject } else { f.input.onDown = inject }
                 source.pressed(at: f.clock.now)
                 if duringUp { source.released(at: f.clock.now) }
-                f.input.onDown = nil
-                f.input.onUp = nil
-                let completed = f.effects.events
-                let scheduled = f.clock.scheduledTaskCount
-                source.pressed(at: f.clock.now, x: 5_000, y: 5_000)
-                f.clock.advance(byMilliseconds: 200)
-                XCTAssertEqual(f.effects.events, completed)
-                XCTAssertEqual(f.clock.scheduledTaskCount, scheduled)
-                XCTAssertEqual(f.effects.downs.count, 1)
+                f.input.onDown = nil; f.input.onUp = nil
+                XCTAssertEqual(f.effects.downs.count, 2)
                 XCTAssertEqual(f.effects.ups.count, 1)
+                f.clock.advance(toMilliseconds: 50)
+                source.pressed(at: f.clock.now, x: 5_000, y: 5_000)
+                f.clock.advance(toMilliseconds: 100)
+                XCTAssertEqual(f.effects.ups.count, 1, "The old owner's deadline cannot end the buffered replacement")
+                f.clock.advance(toMilliseconds: 150)
+                XCTAssertEqual(f.effects.ups.count, 2, "Only the replacement's heartbeat sets its deadline")
                 source.released(at: f.clock.now)
                 source.pressed(at: f.clock.now)
                 source.released(at: f.clock.now)
-                XCTAssertEqual(f.effects.downs.count, 2)
+                XCTAssertEqual(f.effects.downs.count, 3)
                 f.effects.assertBalanced()
             }
+        }
+    }
+
+    func testInlineSchedulerWithFutureDeadlineCannotRecursivelyRearm() {
+        onMain {
+            let scheduler = HoldInlineReplayScheduler()
+            let f = HoldFixture(configuration: holdConfiguration(timeout: 100), schedulerOverride: scheduler)
+            let source = f.makeSource()
+            source.pressed(at: scheduler.now)
+            XCTAssertEqual(f.effects.downs.count, 1)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            XCTAssertEqual(scheduler.tasks.count, 2, "One watchdog and one forced input-cleanup task")
+            XCTAssertTrue(scheduler.tasks.allSatisfy { $0.isCancelled })
+            scheduler.replayEveryActionIncludingCancelled()
+            XCTAssertEqual(f.effects.ups.count, 1)
+            f.effects.assertBalanced()
         }
     }
 
@@ -1011,7 +1312,7 @@ final class StationaryHoldLivenessTests: XCTestCase {
                                    "Historical \(oldOutcome) source removal must not quarantine the current owner")
                     XCTAssertEqual(f.effects.ups.count, oldUpCount, oldOutcome)
                 }
-                XCTAssertEqual(f.clock.scheduledTaskCount, scheduledBeforeRemoval + 6, oldOutcome)
+                XCTAssertEqual(f.clock.scheduledTaskCount, scheduledBeforeRemoval + 5, "Only reached watchdog deadlines schedule another task: \(oldOutcome)")
                 current.released(at: f.clock.now, x: 500, y: 500)
                 XCTAssertEqual(f.effects.ups.count, oldUpCount + 1, oldOutcome)
                 XCTAssertEqual(f.effects.ups.last, f.point(500, 500), oldOutcome)
@@ -1135,7 +1436,7 @@ final class StationaryHoldLivenessTests: XCTestCase {
                 let scheduled = f.clock.scheduledTaskCount
                 f.clock.advance(toMilliseconds: 50)
                 replacement.pressed(at: f.clock.now, x: 500, y: 500)
-                XCTAssertEqual(f.clock.scheduledTaskCount, scheduled + 1)
+                XCTAssertEqual(f.clock.scheduledTaskCount, scheduled, "A heartbeat updates the existing watchdog deadline")
                 f.clock.advance(toMilliseconds: 100)
                 XCTAssertEqual(f.effects.events, active, "The stale outer admission must not cancel the accepted replacement")
                 replacement.released(at: f.clock.now, x: 500, y: 500)
@@ -1365,14 +1666,16 @@ private final class HoldFixture {
     private var sources: [HoldSource] = []
     var normalizedKinds: [TouchEvent.Kind] { observations.compactMap { $0.observation.event?.kind } }
 
-    init(configuration: DriverConfiguration = holdConfiguration(), schedulerOverride: GestureScheduler? = nil) {
+    init(configuration: DriverConfiguration = holdConfiguration(), schedulerOverride: GestureScheduler? = nil,
+         capturePendingInputPermit: @escaping () -> PhysicalInputGuard.Permit = { { true } }) {
         input = HoldInput(effects: effects)
         cursor = HoldCursor(effects: effects)
         focus = HoldFocus(effects: effects)
         let displays = self.displays
         application = MacXeneonEdgeTouchDriverApplication(
             configuration: configuration, displayResolver: DisplayResolver(activeDisplayProvider: { displays.read() }),
-            inputSink: input, cursorController: cursor, focusRestorer: focus, scheduler: schedulerOverride ?? clock)
+            inputSink: input, cursorController: cursor, focusRestorer: focus, scheduler: schedulerOverride ?? clock,
+            capturePendingInputPermit: capturePendingInputPermit)
     }
 
     convenience init(timeout: Int) { self.init(configuration: holdConfiguration(timeout: timeout)) }
