@@ -4,13 +4,19 @@ import Foundation
 /// Borrows the system cursor while a touch gesture is active.
 public final class CGCursorController: CursorController {
     private let displayIDProvider: () -> CGDirectDisplayID
+    private let operations: Operations
     private var savedCursorPosition: CGPoint?
     private var isCursorHidden = false
     private var isCursorAssociated = true
 
     /// Creates a CoreGraphics cursor controller.
-    public init(displayIDProvider: @escaping () -> CGDirectDisplayID = CGMainDisplayID) {
+    public convenience init(displayIDProvider: @escaping () -> CGDirectDisplayID = CGMainDisplayID) {
+        self.init(displayIDProvider: displayIDProvider, operations: .live)
+    }
+
+    init(displayIDProvider: @escaping () -> CGDirectDisplayID, operations: Operations) {
         self.displayIDProvider = displayIDProvider
+        self.operations = operations
     }
 
     public func borrow(warpingTo point: CGPoint) -> Bool {
@@ -49,29 +55,28 @@ public final class CGCursorController: CursorController {
     }
 
     public func returnToOrigin() {
-        guard let savedCursorPosition else {
-            forceShow()
-            return
-        }
+        releaseBorrow(returnToPreviousPosition: true)
+    }
 
+    public func releaseBorrow(returnToPreviousPosition: Bool) {
         setCursorAssociation(true)
-        _ = warp(to: savedCursorPosition)
+        if returnToPreviousPosition, let savedCursorPosition {
+            _ = warp(to: savedCursorPosition)
+        }
         self.savedCursorPosition = nil
         showCursor()
     }
 
     public func forceShow() {
-        setCursorAssociation(true)
-        savedCursorPosition = nil
-        showCursor()
+        releaseBorrow(returnToPreviousPosition: false)
     }
 
     private func currentCursorPosition() -> CGPoint? {
-        CGEvent(source: nil)?.location
+        operations.currentPosition()
     }
 
     private func warp(to point: CGPoint) -> Bool {
-        let result = CGWarpMouseCursorPosition(point)
+        let result = operations.warp(point)
         if result != .success {
             DriverLoggers.log(.error, category: .cursor, "CGWarpMouseCursorPosition failed with \(result.rawValue).")
             return false
@@ -84,7 +89,7 @@ public final class CGCursorController: CursorController {
             return
         }
 
-        let result = CGDisplayHideCursor(displayIDProvider())
+        let result = operations.hide(displayIDProvider())
         if result == .success {
             isCursorHidden = true
         } else {
@@ -97,7 +102,7 @@ public final class CGCursorController: CursorController {
             return
         }
 
-        let result = CGDisplayShowCursor(displayIDProvider())
+        let result = operations.show(displayIDProvider())
         if result == .success {
             isCursorHidden = false
         } else {
@@ -110,13 +115,32 @@ public final class CGCursorController: CursorController {
             return
         }
 
-        let associationValue = shouldAssociate ? boolean_t(1) : boolean_t(0)
-        let result = CGAssociateMouseAndMouseCursorPosition(associationValue)
+        let result = operations.associate(shouldAssociate)
 
         if result == .success {
             isCursorAssociated = shouldAssociate
         } else {
             DriverLoggers.log(.error, category: .cursor, "CGAssociateMouseAndMouseCursorPosition failed with \(result.rawValue).")
+        }
+    }
+
+    /// CoreGraphics calls are injectable so ownership and recovery can be tested without moving a cursor.
+    struct Operations {
+        var currentPosition: () -> CGPoint?
+        var warp: (CGPoint) -> CGError
+        var hide: (CGDirectDisplayID) -> CGError
+        var show: (CGDirectDisplayID) -> CGError
+        var associate: (Bool) -> CGError
+
+        // Construct per controller; the injected closures are not shared Sendable state.
+        static var live: Operations {
+            Operations(
+                currentPosition: { CGEvent(source: nil)?.location },
+                warp: { CGWarpMouseCursorPosition($0) },
+                hide: { CGDisplayHideCursor($0) },
+                show: { CGDisplayShowCursor($0) },
+                associate: { CGAssociateMouseAndMouseCursorPosition($0 ? boolean_t(1) : boolean_t(0)) }
+            )
         }
     }
 }

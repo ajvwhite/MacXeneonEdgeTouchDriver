@@ -1,0 +1,39 @@
+name: Installer safety
+
+on:
+  push:
+    paths:
+      - Scripts/install.sh
+      - Scripts/prepare-install.swift
+      - Scripts/test-install.py
+      - Scripts/uninstall.sh
+      - Scripts/test-uninstall.py
+      - Resources/com.ajvwhite.MacXeneonEdgeTouchDriver.plist.template
+      - .github/workflows/installer.yml
+  pull_request:
+    paths:
+      - Scripts/install.sh
+      - Scripts/prepare-install.swift
+      - Scripts/test-install.py
+      - Scripts/uninstall.sh
+      - Scripts/test-uninstall.py
+      - Resources/com.ajvwhite.MacXeneonEdgeTouchDriver.plist.template
+      - .github/workflows/installer.yml
+
+permissions:
+  contents: read
+
+jobs:
+  installer-safety:
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check installer and uninstaller shell syntax
+        run: |
+          /bin/sh -n Scripts/install.sh
+          /bin/sh -n Scripts/uninstall.sh
+      - name: Check staged installation and serialization
+        run: python3 Scripts/test-install.py
+      - name: Check guarded uninstall failure handling
+        run: python3 Scripts/test-uninstall.py

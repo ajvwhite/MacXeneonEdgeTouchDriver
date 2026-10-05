@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import HIDDumpSupport
 import IOKit
 import IOKit.hid
 
@@ -9,19 +10,21 @@ private let defaultReportBufferLength = 256
 
 private final class ReportRegistration {
     let device: IOHIDDevice
-    let buffer: UnsafeMutablePointer<UInt8>
-    let length: CFIndex
+    let input: HIDDumpInputReportRegistration
 
-    init(device: IOHIDDevice, length: Int) {
+    init(
+        device: IOHIDDevice,
+        length: Int,
+        receive: @escaping (IOHIDReportType, UInt32, [UInt8]) -> Void
+    ) {
         self.device = device
-        self.length = CFIndex(length)
-        self.buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: length)
-        self.buffer.initialize(repeating: 0, count: length)
+        input = HIDDumpInputReportRegistration(
+            sender: Unmanaged.passUnretained(device).toOpaque(), length: length, receive: receive
+        )
     }
 
-    deinit {
-        buffer.deinitialize(count: Int(length))
-        buffer.deallocate()
+    func unregisterCallback() {
+        IOHIDDeviceRegisterInputReportCallback(device, input.buffer, input.length, nil, input.context)
     }
 
     func matches(_ otherDevice: IOHIDDevice) -> Bool {
@@ -32,6 +35,8 @@ private final class ReportRegistration {
 private final class HIDDumpApplication {
     private let manager: IOHIDManager
     private var reportRegistrations: [ReportRegistration] = []
+    private var managerCallbackContext: HIDDumpCallbackContext?
+    private var isRunning = false
     private var valueEventCount = 0
     private var rawReportCount = 0
 
@@ -40,6 +45,7 @@ private final class HIDDumpApplication {
     }
 
     func run() -> Int32 {
+        precondition(Thread.isMainThread, "HIDDump must run on the main thread.")
         setbuf(stdout, nil)
         printHeader()
 
@@ -48,12 +54,16 @@ private final class HIDDumpApplication {
             kIOHIDProductIDKey as String: touchscreenProductID
         ]
 
-        let context = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        let callbacks = HIDDumpCallbackContext(owner: self)
+        managerCallbackContext = callbacks
+        let context = callbacks.context
+        isRunning = true
+        defer { stop() }
 
         IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
-        IOHIDManagerRegisterDeviceMatchingCallback(manager, deviceMatchedCallback, context)
-        IOHIDManagerRegisterDeviceRemovalCallback(manager, deviceRemovedCallback, context)
-        IOHIDManagerRegisterInputValueCallback(manager, inputValueCallback, context)
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, makeDeviceMatchedCallback(), context)
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, makeDeviceRemovedCallback(), context)
+        IOHIDManagerRegisterInputValueCallback(manager, makeInputValueCallback(), context)
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
         let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -74,42 +84,59 @@ private final class HIDDumpApplication {
     }
 
     fileprivate func handleDeviceMatched(_ device: IOHIDDevice) {
-        guard !reportRegistrations.contains(where: { $0.matches(device) }) else {
+        guard isRunning, !reportRegistrations.contains(where: { $0.matches(device) }) else {
             return
         }
 
         let registration = ReportRegistration(
             device: device,
-            length: maxInputReportLength(for: device)
+            length: maxInputReportLength(for: device),
+            receive: { [weak self] type, reportID, bytes in
+                self?.handleInputReport(type: type, reportID: reportID, bytes: bytes)
+            }
         )
         reportRegistrations.append(registration)
 
         IOHIDDeviceRegisterInputReportCallback(
             device,
-            registration.buffer,
-            registration.length,
-            inputReportCallback,
-            UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+            registration.input.buffer,
+            registration.input.length,
+            makeInputReportCallback(),
+            registration.input.context
         )
 
         print("Device matched:")
         print("  manufacturer: \(deviceProperty(device, key: kIOHIDManufacturerKey) ?? "Unknown")")
         print("  product: \(deviceProperty(device, key: kIOHIDProductKey) ?? "Unknown")")
         print("  transport: \(deviceProperty(device, key: kIOHIDTransportKey) ?? "Unknown")")
-        print("  maxInputReportSize: \(registration.length)")
+        print("  maxInputReportSize: \(registration.input.length)")
         print(String(repeating: "-", count: 88))
     }
 
     fileprivate func handleDeviceRemoved(_ device: IOHIDDevice) {
+        guard isRunning else { return }
+        let removed = reportRegistrations.filter { $0.matches(device) }
+        removed.forEach { $0.input.invalidate() }
+        // IOKit can still own the device at removal. Keep its allocation alive
+        // until input is unscheduled and this exact callback token is removed.
+        removed.forEach {
+            IOHIDDeviceUnscheduleFromRunLoop($0.device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            IOHIDDeviceRegisterInputValueCallback($0.device, nil, managerCallbackContext?.context)
+            $0.unregisterCallback()
+        }
         reportRegistrations.removeAll { $0.matches(device) }
         print("Device removed.")
         print(String(repeating: "-", count: 88))
     }
 
-    fileprivate func handleInputValue(_ value: IOHIDValue) {
-        valueEventCount += 1
-
+    fileprivate func handleInputValue(_ value: IOHIDValue, sender: UnsafeMutableRawPointer?) {
+        // Manager value callbacks retain the originating device as sender.
+        guard isRunning, let registration = reportRegistrations.first(where: {
+            sender == Unmanaged.passUnretained($0.device).toOpaque()
+        }) else { return }
         let element = IOHIDValueGetElement(value)
+        guard registration.matches(IOHIDElementGetDevice(element)) else { return }
+        valueEventCount += 1
         let usagePage = IOHIDElementGetUsagePage(element)
         let usage = IOHIDElementGetUsage(element)
         let integerValue = IOHIDValueGetIntegerValue(value)
@@ -135,12 +162,11 @@ private final class HIDDumpApplication {
     fileprivate func handleInputReport(
         type: IOHIDReportType,
         reportID: UInt32,
-        report: UnsafeMutablePointer<UInt8>,
-        reportLength: CFIndex
+        bytes: [UInt8]
     ) {
+        guard isRunning else { return }
         rawReportCount += 1
 
-        let bytes = UnsafeBufferPointer(start: report, count: Int(reportLength))
         let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
 
         print(
@@ -148,10 +174,32 @@ private final class HIDDumpApplication {
                 "raw #\(rawReportCount)",
                 "type=\(reportTypeName(type))",
                 "reportID=\(reportID)",
-                "length=\(reportLength)",
+                "length=\(bytes.count)",
                 "bytes=\(hexBytes)"
             ].joined(separator: " | ")
         )
+    }
+
+    fileprivate func acceptsManagerSender(_ sender: UnsafeMutableRawPointer?) -> Bool {
+        isRunning && sender == Unmanaged.passUnretained(manager).toOpaque()
+    }
+
+    private func stop() {
+        precondition(Thread.isMainThread, "HIDDump must stop on the main thread.")
+        guard isRunning else { return }
+        isRunning = false
+        let valueCallbackContext = managerCallbackContext?.context
+        managerCallbackContext?.invalidate()
+        managerCallbackContext = nil
+        reportRegistrations.forEach { $0.input.invalidate() }
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, nil, nil)
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, nil, nil)
+        // Device callback registrations are keyed by their original context.
+        IOHIDManagerRegisterInputValueCallback(manager, nil, valueCallbackContext)
+        IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        reportRegistrations.forEach { $0.unregisterCallback() }
+        reportRegistrations.removeAll()
     }
 
     private func registerCurrentlyMatchedDevices() {
@@ -184,40 +232,41 @@ private final class HIDDumpApplication {
     }
 }
 
-private let deviceMatchedCallback: IOHIDDeviceCallback = { context, _, _, device in
-    guard let context else {
-        return
+// Build noncapturing C callbacks at registration instead of storing function values at top level.
+private func makeDeviceMatchedCallback() -> IOHIDDeviceCallback {
+    { context, result, sender, device in
+        guard let application = HIDDumpCallbackContext.owner(
+            for: context, result: result, as: HIDDumpApplication.self
+        ), application.acceptsManagerSender(sender) else { return }
+        application.handleDeviceMatched(device)
     }
-
-    let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
-    application.handleDeviceMatched(device)
 }
 
-private let deviceRemovedCallback: IOHIDDeviceCallback = { context, _, _, device in
-    guard let context else {
-        return
+private func makeDeviceRemovedCallback() -> IOHIDDeviceCallback {
+    { context, result, sender, device in
+        guard let application = HIDDumpCallbackContext.owner(
+            for: context, result: result, as: HIDDumpApplication.self
+        ), application.acceptsManagerSender(sender) else { return }
+        application.handleDeviceRemoved(device)
     }
-
-    let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
-    application.handleDeviceRemoved(device)
 }
 
-private let inputValueCallback: IOHIDValueCallback = { context, _, _, value in
-    guard let context else {
-        return
+private func makeInputValueCallback() -> IOHIDValueCallback {
+    { context, result, sender, value in
+        guard let application = HIDDumpCallbackContext.owner(
+            for: context, result: result, as: HIDDumpApplication.self
+        ) else { return }
+        application.handleInputValue(value, sender: sender)
     }
-
-    let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
-    application.handleInputValue(value)
 }
 
-private let inputReportCallback: IOHIDReportCallback = { context, _, _, type, reportID, report, reportLength in
-    guard let context else {
-        return
+private func makeInputReportCallback() -> IOHIDReportCallback {
+    { context, result, sender, type, reportID, report, reportLength in
+        HIDDumpInputReportRegistration.handleCallback(
+            context: context, result: result, sender: sender, type: type,
+            reportID: reportID, report: report, reportLength: reportLength
+        )
     }
-
-    let application = Unmanaged<HIDDumpApplication>.fromOpaque(context).takeUnretainedValue()
-    application.handleInputReport(type: type, reportID: reportID, report: report, reportLength: reportLength)
 }
 
 private func usagePageName(_ page: UInt32) -> String {

@@ -1,4 +1,4 @@
-import MacXeneonEdgeTouchDriverCore
+@testable import MacXeneonEdgeTouchDriverCore
 import XCTest
 
 final class HIDValueParserTests: XCTestCase {
@@ -35,6 +35,78 @@ final class HIDValueParserTests: XCTestCase {
         let event = parser.parseReport(reportID: 7, bytes: report(isDown: true, x: 10, y: 20))
 
         XCTAssertEqual(event?.kind, .down)
+    }
+
+    func testObservationRetainsStationaryPressAndReceiptTimestamp() {
+        let parser = HIDValueParser()
+        let sourceID = HIDSourceID(rawValue: 123)
+        let down = parser.parseObservation(sourceID: sourceID, reportID: 7,
+                                           bytes: report(isDown: true, x: 10, y: 20),
+                                           timestamp: DispatchTime(uptimeNanoseconds: 100))
+        let heartbeatTimestamp = DispatchTime(uptimeNanoseconds: 200)
+        let heartbeat = parser.parseObservation(sourceID: sourceID, reportID: 7,
+                                                bytes: report(isDown: true, x: 10, y: 20),
+                                                timestamp: heartbeatTimestamp)
+        XCTAssertEqual(down?.event?.kind, .down)
+        XCTAssertEqual(heartbeat?.sourceID, sourceID)
+        XCTAssertEqual(heartbeat?.contactEpoch, 1)
+        XCTAssertEqual(heartbeat?.isPressed, true)
+        XCTAssertEqual(heartbeat?.timestamp, heartbeatTimestamp)
+        XCTAssertNil(heartbeat?.event)
+    }
+
+    func testContactEpochAdvancesOnlyForNewPressedCycleAndSurvivesReset() {
+        let parser = HIDValueParser()
+        let sourceID = HIDSourceID(rawValue: 123)
+        func parse(_ isDown: Bool, x: Int = 10) -> HIDTouchObservation? {
+            parser.parseObservation(sourceID: sourceID, reportID: 7,
+                                    bytes: report(isDown: isDown, x: x, y: 20))
+        }
+        XCTAssertEqual(parse(false)?.contactEpoch, 0)
+        XCTAssertEqual(parse(false)?.contactEpoch, 0)
+        XCTAssertEqual(parse(true)?.contactEpoch, 1)
+        XCTAssertEqual(parse(true, x: 11)?.contactEpoch, 1)
+        XCTAssertEqual(parse(false)?.contactEpoch, 1)
+        XCTAssertEqual(parse(false)?.contactEpoch, 1)
+        XCTAssertEqual(parse(true)?.contactEpoch, 2)
+        parser.reset()
+        let fresh = parse(true)
+        XCTAssertEqual(fresh?.event?.kind, .down)
+        XCTAssertEqual(fresh?.contactEpoch, 3)
+    }
+
+    func testInvalidObservationDoesNotMutateEpochOrNormalization() {
+        let parser = HIDValueParser()
+        let sourceID = HIDSourceID(rawValue: 123)
+        XCTAssertNil(parser.parseObservation(sourceID: sourceID, reportID: 99,
+                                              bytes: report(isDown: true, x: 10, y: 20)))
+        XCTAssertNil(parser.parseObservation(sourceID: sourceID, reportID: 7, bytes: [7, 1]))
+        let down = parser.parseObservation(sourceID: sourceID, reportID: 7,
+                                           bytes: report(isDown: true, x: 10, y: 20))
+        XCTAssertEqual(down?.contactEpoch, 1)
+        XCTAssertEqual(down?.event?.kind, .down)
+        XCTAssertNil(parser.parseObservation(sourceID: sourceID, reportID: 99,
+                                              bytes: report(isDown: false, x: 50, y: 60)))
+        XCTAssertNil(parser.parseObservation(sourceID: sourceID, reportID: 7, bytes: [7, 0]))
+        let repeated = parser.parseObservation(sourceID: sourceID, reportID: 7,
+                                               bytes: report(isDown: true, x: 10, y: 20))
+        XCTAssertEqual(repeated?.contactEpoch, 1)
+        XCTAssertEqual(repeated?.isPressed, true)
+        XCTAssertNil(repeated?.event)
+    }
+
+    func testPublicParserAndObservationPathShareOneNormalizationState() {
+        let parser = HIDValueParser()
+        let sourceID = HIDSourceID(rawValue: 123)
+        let bytes = report(isDown: true, x: 10, y: 20)
+        XCTAssertEqual(parser.parseReport(reportID: 7, bytes: bytes)?.kind, .down)
+        let heartbeat = parser.parseObservation(sourceID: sourceID, reportID: 7, bytes: bytes)
+        XCTAssertEqual(heartbeat?.contactEpoch, 1)
+        XCTAssertNil(heartbeat?.event)
+        XCTAssertEqual(parser.parseReport(reportID: 7, bytes: report(isDown: false, x: 10, y: 20))?.kind, .up)
+        let fresh = parser.parseObservation(sourceID: sourceID, reportID: 7, bytes: bytes)
+        XCTAssertEqual(fresh?.contactEpoch, 2)
+        XCTAssertEqual(fresh?.event?.kind, .down)
     }
 
     private func report(isDown: Bool, x: Int, y: Int) -> [UInt8] {

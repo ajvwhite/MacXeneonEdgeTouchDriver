@@ -1,7 +1,7 @@
 import Foundation
 
 /// Timing values used to sequence cursor warps and synthetic mouse events.
-public struct GestureTiming: Equatable {
+public struct GestureTiming: Equatable, Sendable {
     /// Delay between cursor warp and mouse-down.
     public let warpToClickDelayMs: Int
 

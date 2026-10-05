@@ -20,7 +20,9 @@ let package = Package(
             dependencies: ["MacXeneonEdgeTouchDriverCore"]
         ),
         .executableTarget(name: "DisplayInfo"),
-        .executableTarget(name: "HIDDump"),
+        .target(name: "HIDDumpSupport"),
+        .executableTarget(name: "HIDDump", dependencies: ["HIDDumpSupport"]),
+        .testTarget(name: "HIDDumpSupportTests", dependencies: ["HIDDumpSupport"]),
         .testTarget(
             name: "MacXeneonEdgeTouchDriverCoreTests",
             dependencies: ["MacXeneonEdgeTouchDriverCore"]
