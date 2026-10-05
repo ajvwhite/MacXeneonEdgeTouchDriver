@@ -97,6 +97,26 @@ final class StationaryHoldLivenessTests: XCTestCase {
         }
     }
 
+    func testCleanupQueuePreservesFreshTapBeyondDefaultDebounce() {
+        onMain {
+            var configuration = holdConfiguration(timeout: 500)
+            configuration.timing.tapDebounceMs = 50
+            configuration.timing.downToUpDelayMs = 100
+            let f = HoldFixture(configuration: configuration)
+            let source = f.makeSource()
+            source.pressed(at: f.clock.now); source.released(at: f.clock.now)
+            f.clock.advance(toMilliseconds: 60)
+            source.pressed(at: f.clock.now, x: 100, y: 100)
+            f.clock.advance(toMilliseconds: 70)
+            source.released(at: f.clock.now, x: 100, y: 100)
+            XCTAssertEqual(f.effects.downs.count, 1)
+            f.clock.advance(toMilliseconds: 250)
+            XCTAssertEqual(f.effects.downs, [f.point(0, 0), f.point(100, 100)])
+            XCTAssertEqual(f.effects.ups, f.effects.downs)
+            f.effects.assertBalanced()
+        }
+    }
+
     func testBufferedDragPreservesEveryPointAndItsRelease() {
         onMain {
             var configuration = holdConfiguration(timeout: 500)
