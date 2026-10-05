@@ -69,6 +69,7 @@ final class HIDInputReportRegistration {
     private(set) var hasParsedPressedReport = false
     private let receiveObservation: (HIDTouchObservation, HIDSourceRetirementFence) -> Void
     private let token: UInt
+    private var callbackDiagnosticCount = 0
     private let sender: UnsafeMutableRawPointer
     private let receive: (UInt32, [UInt8], DispatchTime) -> Void
 
@@ -135,13 +136,17 @@ final class HIDInputReportRegistration {
     ) {
         // The manager is scheduled only on the main run loop. Do not access the
         // registry or parser if a callback unexpectedly arrives elsewhere.
-        guard Thread.isMainThread,
-              result == kIOReturnSuccess,
+        guard Thread.isMainThread, let context,
+              let registration = registry.registration(for: UInt(bitPattern: context)) else { return }
+        if registration.callbackDiagnosticCount < 4 {
+            registration.callbackDiagnosticCount += 1
+            DriverLoggers.log(.debug, category: .hid,
+                "Input callback metadata: result=\(result), type=\(type.rawValue), reportID=\(reportID), length=\(reportLength), senderMatches=\(sender == registration.sender), bufferMatches=\(report == registration.buffer).")
+        }
+        guard result == kIOReturnSuccess,
               type == kIOHIDReportTypeInput,
               reportID == UInt32(XeneonEdgeDevice.touchReportID),
               reportLength >= XeneonEdgeDevice.touchReportLength,
-              let context,
-              let registration = registry.registration(for: UInt(bitPattern: context)),
               sender == registration.sender,
               report == registration.buffer,
               reportLength <= registration.length else {
@@ -168,6 +173,9 @@ final class HIDInputReportRegistration {
                 sourceID: registration.sourceID, reportID: Int(reportID),
                 bytes: bytes, timestamp: timestamp
             ) else { return }
+            if let event = observation.event, event.kind != .move {
+                DriverLoggers.log(.debug, category: .hid, "Normalized HID contact event: \(event.kind), epoch=\(observation.contactEpoch).")
+            }
             if observation.isPressed { registration.hasParsedPressedReport = true }
             registration.receiveObservation(observation, registration.retirementFence)
             registration.receive(reportID, bytes, timestamp)

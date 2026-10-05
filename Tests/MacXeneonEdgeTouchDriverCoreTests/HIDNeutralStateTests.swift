@@ -11,6 +11,38 @@ final class HIDNeutralStateTests: XCTestCase {
         }
     }
 
+    private var resetCache: [HIDCachedInputValue] {
+        neutral.map { HIDCachedInputValue(usagePage: $0.usagePage, usage: $0.usage,
+            minimum: $0.minimum, maximum: $0.maximum, value: 0, timestamp: 0) }
+    }
+
+    func testColdCacheMarkerIsNotAReleaseCertificate() {
+        XCTAssertTrue(HIDNeutralStateReader.isUninitializedResetCache(first: resetCache, second: resetCache))
+        XCTAssertNil(HIDNeutralState.certify(first: resetCache, second: resetCache, after: 0, now: 100))
+    }
+
+    func testInitializedOrPressedInputCannotBeAColdCacheMarker() {
+        for index in resetCache.indices {
+            for change in ["value", "timestamp"] {
+                var values = resetCache
+                let v = values[index]
+                values[index] = HIDCachedInputValue(usagePage: v.usagePage, usage: v.usage,
+                    minimum: v.minimum, maximum: v.maximum,
+                    value: change == "value" ? 1 : 0, timestamp: change == "timestamp" ? 1 : 0)
+                XCTAssertFalse(HIDNeutralStateReader.isUninitializedResetCache(first: values, second: values))
+                XCTAssertFalse(HIDNeutralStateReader.isUninitializedResetCache(first: resetCache, second: values))
+            }
+        }
+    }
+
+    func testIncompleteOrWrongDescriptorCannotBeAColdCacheMarker() {
+        XCTAssertFalse(HIDNeutralStateReader.isUninitializedResetCache(first: [], second: []))
+        var values = resetCache
+        values.swapAt(0, 1)
+        XCTAssertFalse(HIDNeutralStateReader.isUninitializedResetCache(first: values, second: values))
+        XCTAssertFalse(HIDNeutralStateReader.isUninitializedResetCache(first: Array(resetCache.dropLast()), second: Array(resetCache.dropLast())))
+    }
+
     func testUnchangedFieldsCanPrecedeLossButReleaseMustFollowIt() {
         XCTAssertEqual(HIDNeutralState.certify(first: neutral, second: neutral, after: 100, now: 130),
                        HIDNeutralState(reportTimestamp: 120))

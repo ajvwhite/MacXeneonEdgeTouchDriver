@@ -20,12 +20,18 @@ final class FocusOperationToken {
     private var certifiedRevision: UInt64?
     private var enrollmentRequested = false
     private var enrollmentStarted = false
+    private var ownedInputDelivery = false
 
     init(preparationMilliseconds: UInt64 = 30, now: @escaping () -> UInt64,
          inputPermit: @escaping () -> Bool = { true }) {
         self.now = now
         self.inputPermit = inputPermit
         deadline = now() &+ preparationMilliseconds * 1_000_000
+    }
+
+    var diagnosticState: String {
+        lock.lock(); defer { lock.unlock() }
+        return "phase=\(phase), revision=\(focusRevision), certified=\(String(describing: certifiedRevision))"
     }
 
     var isPermitted: Bool {
@@ -45,6 +51,13 @@ final class FocusOperationToken {
         lock.lock()
         defer { lock.unlock() }
         if event == .keyboardFocusChanged && (phase == .touching || phase == .targetPreparing || phase == .released || phase == .mutatingRestore) {
+            return false
+        }
+        if event == .focusChanged && ownedInputDelivery &&
+            (phase == .touching || phase == .released || phase == .restoring) {
+            // A queued click can activate its destination after the raw HID up.
+            // The coordinator must establish a fresh, permitted source/target
+            // baseline before committing restoration; this hint is not proof.
             return false
         }
         if event == .focusChanged && phase == .mutatingRestore {
@@ -120,18 +133,28 @@ final class FocusOperationToken {
         return true
     }
 
+    func beginSyntheticInput() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard phase == .touching, certifiedRevision == focusRevision,
+              permittedWhileLocked() else { return false }
+        ownedInputDelivery = true
+        return true
+    }
+
     func beginRestore(budgetMilliseconds: UInt64 = 150) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard phase == .released, permittedWhileLocked() else { return false }
         phase = .restoring
-        deadline = now() &+ budgetMilliseconds * 1_000_000
+        let restoreDeadline = now() &+ budgetMilliseconds * 1_000_000
+        deadline = ownedInputDelivery ? min(deadline ?? restoreDeadline, restoreDeadline) : restoreDeadline
         return true
     }
 
     func beginRestoreMutation() -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard phase == .restoring, permittedWhileLocked() else { return false }
+        ownedInputDelivery = false
         phase = .mutatingRestore
         return true
     }
@@ -155,6 +178,7 @@ final class FocusOperationToken {
             return false
         }
         phase = .released
+        if ownedInputDelivery { deadline = now() &+ 150_000_000 }
         return true
     }
 

@@ -71,6 +71,9 @@ public final class MacXeneonEdgeTouchDriverApplication {
         },
         sourceNeutralHandler: { [weak self] sourceID, fence in
             self?.handleSourceNeutralState(sourceID, fence: fence)
+        },
+        sourcePowerResetHandler: { [weak self] sourceID, fence in
+            self?.handleSourcePowerReset(sourceID, fence: fence)
         }
     )
 
@@ -614,7 +617,17 @@ public final class MacXeneonEdgeTouchDriverApplication {
 
     /// A validated replacement cache clears only that registration's recovery
     /// barrier. It cannot end, renew, or replace a live contact or cleanup lease.
+    func handleSourcePowerReset(_ sourceID: HIDSourceID, fence: HIDSourceRetirementFence) {
+        // A qualified controller boot starts a new physical contact stream;
+        // this is not a fabricated raw release and cannot affect a live epoch.
+        admitUnpressedReplacement(sourceID, fence: fence)
+    }
+
     func handleSourceNeutralState(_ sourceID: HIDSourceID, fence: HIDSourceRetirementFence) {
+        admitUnpressedReplacement(sourceID, fence: fence)
+    }
+
+    private func admitUnpressedReplacement(_ sourceID: HIDSourceID, fence: HIDSourceRetirementFence) {
         guard sourceID == fence.sourceID, !fence.isRetired else { return }
         var contact = sourceContacts[sourceID] ?? SourceContact(epoch: 0, isPressed: false,
             isClosed: false, isRejected: false, needsRelease: resynchronizeNewSources)

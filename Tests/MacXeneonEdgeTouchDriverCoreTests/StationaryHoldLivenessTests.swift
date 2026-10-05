@@ -308,6 +308,68 @@ final class StationaryHoldLivenessTests: XCTestCase {
         }
     }
 
+    func testQualifiedPowerResetPreservesItsFirstTapAfterInterruptedOwnerRemoval() {
+        onMain {
+            let f = HoldFixture(timeout: 100)
+            let old = f.makeSource()
+            old.pressed(at: f.clock.now)
+            old.registration.invalidate()
+            f.application.handleSourceRemoval(old.registration.sourceID)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            let replacement = f.makeSource()
+            f.application.handleSourcePowerReset(replacement.registration.sourceID,
+                fence: replacement.registration.retirementFence)
+            replacement.pressed(at: f.clock.now, x: 500, y: 500)
+            replacement.released(at: f.clock.now, x: 500, y: 500)
+            XCTAssertEqual(f.effects.downs.count, 2)
+            XCTAssertEqual(f.effects.ups.count, 2)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testQualifiedPowerResetCannotClearAnAliasBarrierOrAlterAnActiveContact() {
+        onMain {
+            let f = HoldFixture(timeout: 100)
+            let old = f.makeSource()
+            old.pressed(at: f.clock.now)
+            old.registration.invalidate()
+            f.application.handleSourceRemoval(old.registration.sourceID)
+            let proven = f.makeSource()
+            let alias = f.makeSource(sender: UnsafeMutableRawPointer(bitPattern: 0x2000)!)
+            f.application.handleSourcePowerReset(proven.registration.sourceID,
+                fence: proven.registration.retirementFence)
+            alias.pressed(at: f.clock.now)
+            XCTAssertEqual(f.effects.downs.count, 1, "Only the proven registration is recovered")
+            proven.pressed(at: f.clock.now)
+            let active = f.effects.events
+            f.application.handleSourcePowerReset(proven.registration.sourceID,
+                fence: proven.registration.retirementFence)
+            XCTAssertEqual(f.effects.events, active)
+            proven.released(at: f.clock.now)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testRetiredOrMismatchedPowerResetCannotRecoverANewSource() {
+        onMain {
+            let f = HoldFixture(timeout: 100)
+            let old = f.makeSource()
+            old.pressed(at: f.clock.now)
+            old.registration.invalidate()
+            f.application.handleSourceRemoval(old.registration.sourceID)
+            let replacement = f.makeSource()
+            f.application.handleSourcePowerReset(replacement.registration.sourceID,
+                fence: old.registration.retirementFence)
+            replacement.pressed(at: f.clock.now)
+            XCTAssertEqual(f.effects.downs.count, 1)
+            replacement.released(at: f.clock.now)
+            replacement.pressed(at: f.clock.now)
+            replacement.released(at: f.clock.now)
+            XCTAssertEqual(f.effects.downs.count, 2)
+            f.effects.assertBalanced()
+        }
+    }
+
     func testDenseStationaryHeartbeatsKeepOnePendingWatchdogTask() {
         onMain {
             let f = HoldFixture(timeout: 100)

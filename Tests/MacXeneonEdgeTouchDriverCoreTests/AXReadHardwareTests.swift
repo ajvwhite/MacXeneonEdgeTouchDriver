@@ -27,6 +27,37 @@ final class AXReadHardwareTests: XCTestCase {
         wait(for: [finished], timeout: 5)
     }
 
+    /// Read-only native check for an already visible, nonfocusable floating panel.
+    /// The guard below prevents this diagnostic from entering any mutation path.
+    func testPassiveFloatingTargetIsResolvableWithoutActivation() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["XENEON_RUN_PASSIVE_AX_READ_TESTS"] == "1" else {
+            throw XCTSkip("Set XENEON_RUN_PASSIVE_AX_READ_TESTS=1 and supply panel PID and global coordinates.")
+        }
+        guard AXIsProcessTrusted(),
+              let pid = environment["XENEON_AX_TEST_PID"].flatMap(Int32.init), pid > 0,
+              let x = environment["XENEON_AX_TEST_X"].flatMap(Double.init), x.isFinite,
+              let y = environment["XENEON_AX_TEST_Y"].flatMap(Double.init), y.isFinite else {
+            XCTFail("Existing AX grant, expected owner PID and finite target coordinates are required."); return
+        }
+        let finished = expectation(description: "read-only passive target verification")
+        DispatchQueue(label: "AXReadHardwareTests.passive").async {
+            defer { finished.fulfill() }
+            let started = DispatchTime.now().uptimeNanoseconds
+            let permit = { DispatchTime.now().uptimeNanoseconds - started < 150_000_000 }
+            let backend = AXTouchTargetBackend(timeout: 0.05)
+            let point = CGPoint(x: x, y: y)
+            guard let target = backend.resolve(at: point, permit: permit), !target.requiresActivation else {
+                XCTFail("Target was not certified as a passive floating panel; no mutation was attempted."); return
+            }
+            XCTAssertEqual(target.pid, pid)
+            XCTAssertTrue(backend.focusWindow(target, at: point, permit: permit))
+            XCTAssertTrue(permit())
+            print("Passive target read verification elapsed ms=\(Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)")
+        }
+        wait(for: [finished], timeout: 5)
+    }
+
     private func check(application: AXFocusWorkspaceApplication, environment: [String: String]) {
         let operations = SystemAXFocusOperations()
         let app = operations.applicationElement(pid: application.processIdentifier)

@@ -46,6 +46,11 @@ struct AXFocusFailure {
     let systemWideError: AXError?
 }
 
+struct AXWindowlessFocusTarget {
+    let application: AXFocusElement
+    let workspaceApplication: AXFocusWorkspaceApplication
+}
+
 enum AXFocusResolution {
     case known(AXFocusTarget)
     case unknown(AXFocusFailure)
@@ -67,6 +72,8 @@ protocol AXFocusObservationProtocol: AnyObject {
 
 protocol AXFocusBackendProtocol: AnyObject {
     func resolve(workspace: AXFocusWorkspaceApplication?, permit: () -> Bool) -> AXFocusResolution
+    func resolveWindowlessApplication(workspace: AXFocusWorkspaceApplication?, permit: () -> Bool) -> AXWindowlessFocusTarget?
+    func canRestoreExactRecipient(_ captured: AXFocusTarget, permit: () -> Bool) -> Bool
     func relationship(_ lhs: AXFocusTarget, _ rhs: AXFocusTarget) -> AXFocusRelationship
     func windowRelationship(_ lhs: AXFocusTarget, _ rhs: AXFocusTarget) -> AXFocusRelationship
     func attemptRestore(captured: AXFocusTarget, baseline: AXFocusTarget,
@@ -78,6 +85,9 @@ protocol AXFocusBackendProtocol: AnyObject {
 }
 
 extension AXFocusBackendProtocol {
+    func resolveWindowlessApplication(workspace: AXFocusWorkspaceApplication?, permit: () -> Bool) -> AXWindowlessFocusTarget? { nil }
+    func canRestoreExactRecipient(_ captured: AXFocusTarget, permit: () -> Bool) -> Bool { false }
+
     func windowRelationship(_ lhs: AXFocusTarget, _ rhs: AXFocusTarget) -> AXFocusRelationship {
         relationship(lhs, rhs)
     }
@@ -163,6 +173,55 @@ final class AXFocusBackend: AXFocusBackendProtocol {
             focusedElement: secondTarget.focusedElement))
     }
 
+    /// Explicit absence is a separate observation from an AX error. This path
+    /// does not invent a focused window and is usable only for a verified passive
+    /// click destination, never for pre-input capture or ordinary restoration.
+    func resolveWindowlessApplication(workspace: AXFocusWorkspaceApplication?, permit: () -> Bool) -> AXWindowlessFocusTarget? {
+        guard let workspace, workspace.processIdentifier > 0,
+              !workspace.isTerminated, !workspace.isHidden else { return nil }
+        var confirmed: AXFocusElement?
+        for _ in 0..<2 {
+            guard permit() else { return nil }
+            let system = operations.systemWideElement()
+            guard operations.setTimeout(system, seconds: timeout) == .success, permit() else { return nil }
+            let global = operations.read(system, attribute: kAXFocusedApplicationAttribute)
+            guard global.error == .noValue, case nil = global.value, permit() else { return nil }
+            let app = operations.applicationElement(pid: workspace.processIdentifier)
+            guard validate(app, role: kAXApplicationRole, pid: workspace.processIdentifier, permit: permit) == nil,
+                  permit() else { return nil }
+            let frontmost = operations.read(app, attribute: kAXFrontmostAttribute)
+            guard frontmost.error == .success, case .bool(true)? = frontmost.value, permit() else { return nil }
+            let window = operations.read(app, attribute: kAXFocusedWindowAttribute)
+            guard window.error == .noValue, case nil = window.value, permit() else { return nil }
+            let recipient = operations.read(app, attribute: kAXFocusedUIElementAttribute)
+            guard recipient.error == .noValue, case nil = recipient.value, permit() else { return nil }
+            if let confirmed, !operations.equal(confirmed, app) { return nil }
+            confirmed = app
+        }
+        guard let confirmed, permit() else { return nil }
+        return AXWindowlessFocusTarget(application: confirmed, workspaceApplication: workspace)
+    }
+
+    func canRestoreExactRecipient(_ captured: AXFocusTarget, permit: () -> Bool) -> Bool {
+        let pid = captured.workspaceApplication.processIdentifier
+        guard let recipient = captured.focusedElement,
+              validate(captured.application, role: kAXApplicationRole, pid: pid, permit: permit) == nil,
+              validate(captured.window, role: kAXWindowRole, pid: pid, permit: permit) == nil,
+              permit(), operations.setTimeout(recipient, seconds: timeout) == .success, permit() else { return false }
+        let (ownerError, owner) = operations.ownerPID(recipient)
+        guard ownerError == .success, owner == pid, permit() else { return false }
+        let window = AXElementWindowResolver.resolve(recipient, operations: operations, timeout: timeout, permit: permit)
+        guard window.error == .success, case let .element(ownWindow)? = window.value,
+              operations.equal(ownWindow, captured.window), permit() else { return false }
+        let minimized = operations.read(captured.window, attribute: kAXMinimizedAttribute)
+        guard minimized.error == .success, case .bool(false)? = minimized.value, permit() else { return false }
+        let (error, settable) = operations.isSettable(recipient, attribute: kAXFocusedAttribute)
+        guard error == .success, permit() else { return false }
+        if settable { return true }
+        let (appError, appSettable) = operations.isSettable(captured.application, attribute: kAXFocusedUIElementAttribute)
+        return appError == .success && appSettable && permit()
+    }
+
     private func resolveOnce(workspace: AXFocusWorkspaceApplication?, permit: () -> Bool) -> AXFocusResolution {
         guard permit(), let workspace, workspace.processIdentifier > 0,
               !workspace.isTerminated, !workspace.isHidden else {
@@ -183,7 +242,11 @@ final class AXFocusBackend: AXFocusBackendProtocol {
                 return .unknown(failure("focused application type", nil, read.error))
             }
             application = value
-        case .cannotComplete:
+        case .cannotComplete, .noValue:
+            // Floating, non-key panels can leave the global focused-application
+            // attribute empty even while Workspace and application AX agree on
+            // the foreground process. Require that independent corroboration,
+            // then resolve the exact window and recipient twice as usual.
             guard permit() else { return .unknown(failure("cancelled", nil, read.error)) }
             application = operations.applicationElement(pid: workspace.processIdentifier)
         default:
@@ -193,7 +256,7 @@ final class AXFocusBackend: AXFocusBackendProtocol {
                                   pid: workspace.processIdentifier, permit: permit) {
             return .unknown(failure(problem.stage, problem.error, read.error))
         }
-        if read.error == .cannotComplete {
+        if read.error == .cannotComplete || read.error == .noValue {
             guard permit() else { return .unknown(failure("cancelled", nil, read.error)) }
             let frontmost = operations.read(application, attribute: kAXFrontmostAttribute)
             guard frontmost.error == .success, case .bool(true)? = frontmost.value else {

@@ -10,6 +10,10 @@ public protocol FocusRestorer: AnyObject {
     func beginTargetActivation() -> Bool
     func confirmTargetActivation(completion: @escaping (Bool) -> Void)
 
+    /// Starts the verified target's synthetic click delivery. Its app/window
+    /// notifications may arrive after raw HID lift; physical input still revokes.
+    func syntheticInputWillBegin(targetProcessIdentifier: Int32?, permitsWindowlessDestination: Bool)
+
     /// Captures the currently focused window, if one is available.
     func captureFocusedWindow()
 
@@ -48,6 +52,7 @@ public extension FocusRestorer {
     }
 
     func inputDidEnd() {}
+    func syntheticInputWillBegin(targetProcessIdentifier: Int32?, permitsWindowlessDestination: Bool = false) {}
 }
 
 /// Focus restorer used when restoration is disabled or side effects are unwanted.

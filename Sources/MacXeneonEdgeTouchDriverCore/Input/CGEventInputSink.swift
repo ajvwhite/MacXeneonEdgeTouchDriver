@@ -39,12 +39,15 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
         let eventNumber: Int64
     }
 
+    /// Post into the login session, after the hardware input state table. Posting
+    /// at the HID entry point also increments hidSystemState counters for private
+    /// sources, falsely revoking PhysicalInputGuard during our own touch click.
     /// The normal default remains a private source. Managed/reporting calls fail
     /// closed for nil because the fallback source table cannot be safely inferred.
     /// The legacy Void methods still pass nil through to the CGEvent constructor.
     public convenience init(
         eventSource: CGEventSource? = CGEventSource(stateID: .privateState),
-        eventTap: CGEventTapLocation = .cghidEventTap
+        eventTap: CGEventTapLocation = .cgSessionEventTap
     ) {
         self.init(
             environment: MouseInputEnvironment(
@@ -70,7 +73,7 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
         )
     }
 
-    init(environment: MouseInputEnvironment, eventTap: CGEventTapLocation = .cghidEventTap) {
+    init(environment: MouseInputEnvironment, eventTap: CGEventTapLocation = .cgSessionEventTap) {
         self.environment = environment
         self.eventTap = eventTap
     }

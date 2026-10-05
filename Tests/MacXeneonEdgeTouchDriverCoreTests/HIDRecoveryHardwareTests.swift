@@ -8,6 +8,29 @@ import XCTest
 /// Opt-in, read-only check of the production cached-release reader. Stop any
 /// seizing driver first. This test never prompts or posts synthetic input.
 final class HIDRecoveryHardwareTests: XCTestCase {
+    /// Registry/descriptor reads only; this check may run with the driver active.
+    func testAttachedControllerHasQualifiedUSBPowerResetIdentity() throws {
+        guard ProcessInfo.processInfo.environment["XENEON_RUN_HARDWARE_TESTS"] == "1" else {
+            throw XCTSkip("Set XENEON_RUN_HARDWARE_TESTS=1 to inspect attached USB identity metadata.")
+        }
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, 0)
+        IOHIDManagerSetDeviceMatching(manager, [kIOHIDVendorIDKey: XeneonEdgeDevice.vendorID,
+            kIOHIDProductIDKey: XeneonEdgeDevice.productID] as CFDictionary)
+        let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> ?? []
+        let touch = devices.filter {
+            (IOHIDDeviceGetProperty($0, kIOHIDMaxInputReportSizeKey as CFString) as? NSNumber)?.intValue == 7
+        }
+        XCTAssertEqual(touch.count, 1)
+        guard let device = touch.first else { return }
+        XCTAssertNotNil(HIDNeutralStateReader(device: device), "Supported report-7 descriptor required")
+        let identity = HIDUSBPowerIdentity.read(device: device)
+        XCTAssertEqual(identity?.hasQualifiedResetBehavior, true,
+            "Power-reset fast recovery is qualified only for the recorded controller/hub revisions")
+        if let identity {
+            print("USB identity verified: firmware=\(identity.deviceRevision), controller=\(identity.controllerID), hub=\(identity.hubID)")
+        }
+    }
+
     func testAttachedControllerHasInitializedCoherentNeutralCache() throws {
         guard ProcessInfo.processInfo.environment["XENEON_RUN_HARDWARE_TESTS"] == "1" else {
             throw XCTSkip("Set XENEON_RUN_HARDWARE_TESTS=1 with the driver stopped and fingers lifted.")

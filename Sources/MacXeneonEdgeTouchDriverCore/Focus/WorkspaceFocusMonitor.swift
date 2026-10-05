@@ -15,6 +15,13 @@ protocol WorkspaceFocusMonitoring: AnyObject {
     func snapshot() -> WorkspaceFocusSnapshot
     func application(processIdentifier: pid_t) -> AXFocusWorkspaceApplication?
     func stop()
+    func activate(_ application: AXFocusWorkspaceApplication) -> Bool
+    func isActive(_ application: AXFocusWorkspaceApplication) -> Bool
+}
+
+extension WorkspaceFocusMonitoring {
+    func activate(_ application: AXFocusWorkspaceApplication) -> Bool { false }
+    func isActive(_ application: AXFocusWorkspaceApplication) -> Bool { false }
 }
 
 /// All NSWorkspace/NSRunningApplication access and observer lifetime live on main.
@@ -136,6 +143,22 @@ final class WorkspaceFocusMonitor: WorkspaceFocusMonitoring {
     func application(processIdentifier: pid_t) -> AXFocusWorkspaceApplication? {
         precondition(Thread.isMainThread)
         return operations.application(processIdentifier)
+    }
+
+    func activate(_ application: AXFocusWorkspaceApplication) -> Bool {
+        precondition(Thread.isMainThread)
+        guard let retained = application.identity as? NSRunningApplication,
+              let live = NSRunningApplication(processIdentifier: application.processIdentifier),
+              live.isEqual(retained), !live.isTerminated, !live.isHidden else { return false }
+        return live.isActive || live.activate(options: [.activateIgnoringOtherApps])
+    }
+
+    func isActive(_ application: AXFocusWorkspaceApplication) -> Bool {
+        precondition(Thread.isMainThread)
+        guard let retained = application.identity as? NSRunningApplication,
+              let live = NSRunningApplication(processIdentifier: application.processIdentifier),
+              live.isEqual(retained), !live.isTerminated, !live.isHidden else { return false }
+        return live.isActive && NSWorkspace.shared.frontmostApplication?.isEqual(live) == true
     }
 
     func stop() {

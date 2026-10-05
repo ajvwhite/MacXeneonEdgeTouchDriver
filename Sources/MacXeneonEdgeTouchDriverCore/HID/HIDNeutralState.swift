@@ -79,6 +79,29 @@ final class HIDNeutralStateReader {
                                        now: max(started, mach_absolute_time()))
     }
 
+    /// Uninitialized input is never release evidence. This marker can be used
+    /// only with a separately qualified physical USB power-reset generation.
+    func hasUninitializedResetCache() -> Bool {
+        precondition(Thread.isMainThread)
+        let deadline = DispatchTime.now() + .milliseconds(4)
+        guard let first = sample(before: deadline), let second = sample(before: deadline),
+              DispatchTime.now() <= deadline else { return false }
+        return Self.isUninitializedResetCache(first: first, second: second)
+    }
+
+    static func isUninitializedResetCache(first: [HIDCachedInputValue], second: [HIDCachedInputValue]) -> Bool {
+        guard first == second, first.count == 6 else { return false }
+        let expected: [(UInt32, UInt32, Int, Int)] = [
+            (9, 1, 0, 1), (9, 2, 0, 1), (9, 3, 0, 1),
+            (1, 48, 0, 16_383), (1, 49, 0, 9_599), (1, 56, -127, 127)
+        ]
+        return zip(first, expected).allSatisfy { value, descriptor in
+            value.usagePage == descriptor.0 && value.usage == descriptor.1 &&
+                value.minimum == descriptor.2 && value.maximum == descriptor.3 &&
+                value.value == 0 && value.timestamp == 0
+        }
+    }
+
     private func sample(before deadline: DispatchTime) -> [HIDCachedInputValue]? {
         var sample: [HIDCachedInputValue] = []
         for element in elements {

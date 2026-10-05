@@ -6,12 +6,18 @@ import Foundation
 /// to reach an inactive view. The gesture queue owns prepare/cancel and completion.
 protocol TouchTargetPreparing: AnyObject {
     var requiresPreparation: Bool { get }
+    var preparedTargetProcessIdentifier: pid_t? { get }
+    var preparedTargetIsPassive: Bool { get }
     func beginContact()
     func prepare(at point: CGPoint, completion: @escaping (Bool) -> Void)
     func cancel()
 }
 
-extension TouchTargetPreparing { func beginContact() {} }
+extension TouchTargetPreparing {
+    func beginContact() {}
+    var preparedTargetProcessIdentifier: pid_t? { nil }
+    var preparedTargetIsPassive: Bool { false }
+}
 
 final class NoOpTouchTargetPreparer: TouchTargetPreparing {
     let requiresPreparation = false
@@ -57,6 +63,14 @@ final class AXTouchTargetPreparer: TouchTargetPreparing {
     private var generation: UInt64 = 0
     private var busy = false
     private var contactInputPermit: PhysicalInputGuard.Permit?
+    private var preparedPID: pid_t?
+    private var preparedPassive = false
+    var preparedTargetIsPassive: Bool {
+        lock.lock(); defer { lock.unlock() }; return preparedPassive
+    }
+    var preparedTargetProcessIdentifier: pid_t? {
+        lock.lock(); defer { lock.unlock() }; return preparedPID
+    }
 
     convenience init(callbackQueue: DispatchQueue) {
         let worker = DispatchQueue(label: "\(DriverLoggers.subsystem).touch-target-ax")
@@ -85,10 +99,10 @@ final class AXTouchTargetPreparer: TouchTargetPreparing {
 
     func beginContact() {
         let permit = captureInputPermit()
-        lock.lock(); generation &+= 1; contactInputPermit = permit; lock.unlock()
+        lock.lock(); generation &+= 1; preparedPID = nil; preparedPassive = false; contactInputPermit = permit; lock.unlock()
     }
 
-    func cancel() { lock.lock(); generation &+= 1; contactInputPermit = nil; lock.unlock() }
+    func cancel() { lock.lock(); generation &+= 1; preparedPID = nil; preparedPassive = false; contactInputPermit = nil; lock.unlock() }
 
     func prepare(at point: CGPoint, completion: @escaping (Bool) -> Void) {
         lock.lock()
@@ -105,10 +119,25 @@ final class AXTouchTargetPreparer: TouchTargetPreparing {
             guard permit(), let target = self.backend.resolve(at: point, permit: permit) else {
                 self.finish(current, accepted: false, inputPermit: inputPermit, completion: completion); return
             }
+            self.lock.lock()
+            if self.generation == current { self.preparedPID = target.pid; self.preparedPassive = !target.requiresActivation }
+            self.lock.unlock()
             self.onMain {
                 guard permit(), let application = self.application(target.pid),
                       !application.isTerminated, !application.isHidden else {
                     self.finish(current, accepted: false, inputPermit: inputPermit, completion: completion); return
+                }
+                if !target.requiresActivation {
+                    self.onWorker {
+                        guard permit(), self.backend.focusWindow(target, at: point, permit: permit) else {
+                            self.finish(current, accepted: false, inputPermit: inputPermit, completion: completion); return
+                        }
+                        self.onMain {
+                            let available = !application.isTerminated && !application.isHidden
+                            self.finish(current, accepted: available && permit(), inputPermit: inputPermit, completion: completion)
+                        }
+                    }
+                    return
                 }
                 let activated = application.isActive || application.activate()
                 guard activated, permit() else {

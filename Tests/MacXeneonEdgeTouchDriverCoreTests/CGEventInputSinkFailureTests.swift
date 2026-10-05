@@ -7,6 +7,19 @@ final class CGEventInputSinkFailureTests: XCTestCase {
     private let downPoint = CGPoint(x: 120, y: 240)
     private let releasePoint = CGPoint(x: 345, y: 678)
 
+    func testDefaultPostingKeepsDownDragAndEmergencyReleaseAfterHardwareState() {
+        let effects = MockMouseEnvironment()
+        let sink = effects.makeSink()
+        XCTAssertEqual(sink.tryPostMouseDown(at: downPoint), .postInvoked)
+        XCTAssertEqual(sink.tryPostMouseDragged(to: releasePoint), .postInvoked)
+        effects.failFactoryFromCall = effects.requests.count + 1
+        XCTAssertEqual(sink.tryPostMouseUp(at: releasePoint), .postInvoked)
+        XCTAssertEqual(effects.posts.map(\.tap),
+                       [.cgSessionEventTap, .cgSessionEventTap, .cgSessionEventTap])
+        XCTAssertEqual(effects.posts.map { $0.event.type },
+                       [.leftMouseDown, .leftMouseDragged, .leftMouseUp])
+    }
+
     func testReserveCreationFailureDoesNotConstructOrPostDown() {
         let effects = MockMouseEnvironment()
         effects.failedFactoryCalls = [1]
@@ -367,7 +380,7 @@ private final class MockMouseEnvironment {
     private(set) var flagReads = 0
     private(set) var flagSourceIDs: [Int64?] = []
 
-    func makeSink(eventTap: CGEventTapLocation = .cghidEventTap) -> CGEventInputSink {
+    func makeSink(eventTap: CGEventTapLocation? = nil) -> CGEventInputSink {
         let explicitSourceID = sourceStateID
         let environment = MouseInputEnvironment(
             makeEvent: { type, point in
@@ -404,6 +417,7 @@ private final class MockMouseEnvironment {
                 return self.currentFlags
             }
         )
-        return CGEventInputSink(environment: environment, eventTap: eventTap)
+        if let eventTap { return CGEventInputSink(environment: environment, eventTap: eventTap) }
+        return CGEventInputSink(environment: environment)
     }
 }

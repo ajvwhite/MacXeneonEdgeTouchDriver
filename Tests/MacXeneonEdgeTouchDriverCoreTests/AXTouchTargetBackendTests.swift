@@ -5,6 +5,27 @@ import XCTest
 @testable import MacXeneonEdgeTouchDriverCore
 
 final class AXTouchTargetBackendTests: XCTestCase {
+    func testNonFocusableFloatingDialogIsRevalidatedWithoutMutation() {
+        let f = TargetOperations(); f.dialog = true; f.windowSettable = false
+        var visible = true
+        let backend = AXTouchTargetBackend(operations: f, floatingWindow: { _, _, _ in visible })
+        let target = backend.resolve(at: f.point, permit: { true })!
+        XCTAssertFalse(target.requiresActivation)
+        XCTAssertTrue(backend.focusWindow(target, at: f.point, permit: { true }))
+        XCTAssertTrue(f.mutations.isEmpty)
+        visible = false
+        XCTAssertFalse(backend.focusWindow(target, at: f.point, permit: { true }))
+        XCTAssertTrue(f.mutations.isEmpty)
+    }
+
+    func testDialogRequiresActivationWithoutFloatingProofOrWhenFocusable() {
+        for settable in [false, true] {
+            let f = TargetOperations(); f.dialog = true; f.windowSettable = settable
+            let backend = AXTouchTargetBackend(operations: f, floatingWindow: { _, _, _ in !settable ? false : true })
+            XCTAssertTrue(backend.resolve(at: f.point, permit: { true })!.requiresActivation)
+        }
+    }
+
     func testInactiveSiblingIsFocusedOnceAndConfirmed() {
         let f = TargetOperations()
         let backend = AXTouchTargetBackend(operations: f)
@@ -95,6 +116,7 @@ private final class TargetOperations: AXTouchTargetOperations {
     var hitPID: pid_t = 33
     var hitError: AXError = .success
     var minimized = false
+    var dialog = false
     var focusedWindow = "sibling"
     var appSettable = true
     var windowSettable = true
@@ -118,6 +140,8 @@ private final class TargetOperations: AXTouchTargetOperations {
         case kAXWindowAttribute: value = .element(handle("window"))
         case kAXPositionAttribute: value = .point(origin)
         case kAXSizeAttribute: value = .size(size)
+        case kAXSubroleAttribute: value = .string(dialog ? kAXDialogSubrole : kAXStandardWindowSubrole)
+        case kAXFocusedAttribute: value = .bool(false)
         case kAXMinimizedAttribute: value = .bool(minimized)
         case kAXFocusedWindowAttribute: value = .element(handle(focusedWindow))
         default: return AXFocusRead(error: .attributeUnsupported, value: nil)

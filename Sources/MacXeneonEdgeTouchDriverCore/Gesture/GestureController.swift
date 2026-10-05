@@ -461,6 +461,8 @@ public final class GestureController {
         let captureIsTimely = captureReady && scheduler.now.uptimeNanoseconds < preparation.deadline.uptimeNanoseconds
         let acceptedGeneration = self.generation
         let pendingInput = preparedInput
+        let preparedTargetPID = targetPreparer.preparedTargetProcessIdentifier
+        let preparedPassiveTarget = targetPreparer.preparedTargetIsPassive
         if targetPreparer.requiresPreparation && (!targetReady || !captureIsTimely) {
             // No speculative down if activation failed or exceeded its deadline.
             let ended = pendingInput.contains { $0.kind == .up }
@@ -520,6 +522,7 @@ public final class GestureController {
             finishDeferredInput()
             return
         }
+        focusRestorer.syntheticInputWillBegin(targetProcessIdentifier: preparedTargetPID, permitsWindowlessDestination: preparedPassiveTarget)
         scheduleMouseDown(generation: self.generation, at: preparation.point)
         finishDeferredInput()
         for event in pendingInput {

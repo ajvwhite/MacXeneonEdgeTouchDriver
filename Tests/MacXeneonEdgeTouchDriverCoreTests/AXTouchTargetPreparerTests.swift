@@ -4,6 +4,24 @@ import XCTest
 @testable import MacXeneonEdgeTouchDriverCore
 
 final class AXTouchTargetPreparerTests: XCTestCase {
+    func testPassivePanelDoesNotActivateItsApplicationButStillChecksTarget() {
+        let f = ActivationFixture(); f.backend.requiresActivation = false
+        f.prepare(); f.worker.run(); f.main.run(); f.worker.run(); f.main.run(); f.callback.run()
+        XCTAssertEqual(f.application.activations, 0)
+        XCTAssertFalse(f.application.isActive)
+        XCTAssertEqual(f.backend.focusCount, 1)
+        XCTAssertEqual(f.results, [true])
+    }
+
+    func testPassivePanelLossBeforeCallbackRejectsClick() {
+        let f = ActivationFixture(); f.backend.requiresActivation = false
+        f.prepare(); f.worker.run(); f.main.run(); f.worker.run()
+        f.application.isHidden = true
+        f.main.run(); f.callback.run()
+        XCTAssertEqual(f.results, [false])
+        XCTAssertEqual(f.application.activations, 0)
+    }
+
     func testActivationRequestWaitsForObservedActiveStateBeforeWindowMutation() {
         let f = ActivationFixture()
         f.prepare(); f.worker.run(); f.main.run()
@@ -125,10 +143,11 @@ private final class ActivationApplication: TouchTargetApplication {
 
 private final class ActivationBackend: AXTouchTargetResolving {
     var resolveCount = 0, focusCount = 0
+    var requiresActivation = true
     func resolve(at point: CGPoint, permit: () -> Bool) -> AXTouchTargetBackend.Target? {
         resolveCount += 1
         let element = AXFocusElement(rawValue: "window" as NSString)
-        return AXTouchTargetBackend.Target(application: element, window: element, pid: 33)
+        return AXTouchTargetBackend.Target(application: element, window: element, pid: 33, requiresActivation: requiresActivation)
     }
     func focusWindow(_ target: AXTouchTargetBackend.Target, at point: CGPoint, permit: () -> Bool) -> Bool {
         focusCount += 1; return true

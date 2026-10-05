@@ -18,6 +18,8 @@ public final class AXFocusRestorer: FocusRestorer {
         // Published under sessionLock while touching, then frozen by inputDidEnd.
         var certifiedBaseline: AXFocusTarget?
         var releasedBaseline: AXFocusTarget?
+        var inputDestinationPID: pid_t?
+        var inputDestinationIsPassive = false
         // Successive pipeline stages own these; callbacks touch the token only.
         var observations: [AXFocusObservationProtocol] = []
         var attachedSources: [CFRunLoopSource] = []
@@ -33,6 +35,7 @@ public final class AXFocusRestorer: FocusRestorer {
     private let now: () -> UInt64
     private let preparationMilliseconds: UInt64
     private let captureInputPermit: () -> PhysicalInputGuard.Permit
+    private let retryOnMain: Enqueue
     private let state = FocusOperationState()
     private let sessionLock = NSLock()
     private var session: Session?
@@ -53,7 +56,8 @@ public final class AXFocusRestorer: FocusRestorer {
             onCallback: { callbackQueue.async(execute: DispatchWorkItem(block: $0)) },
             now: { DispatchTime.now().uptimeNanoseconds },
             preparationMilliseconds: 150,
-            captureInputPermit: { PhysicalInputGuard.system.capture() }
+            captureInputPermit: { PhysicalInputGuard.system.capture() },
+            retryOnMain: { DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(5), execute: DispatchWorkItem(block: $0)) }
         )
     }
 
@@ -64,7 +68,8 @@ public final class AXFocusRestorer: FocusRestorer {
          onMain: @escaping Enqueue, onWorker: @escaping Enqueue,
          onCallback: @escaping Enqueue, now: @escaping () -> UInt64,
          preparationMilliseconds: UInt64 = 30,
-         captureInputPermit: @escaping () -> PhysicalInputGuard.Permit = { { true } }) {
+         captureInputPermit: @escaping () -> PhysicalInputGuard.Permit = { { true } },
+         retryOnMain: Enqueue? = nil) {
         self.backend = backend
         self.workspace = workspace
         self.onMain = onMain
@@ -73,6 +78,7 @@ public final class AXFocusRestorer: FocusRestorer {
         self.now = now
         self.preparationMilliseconds = preparationMilliseconds
         self.captureInputPermit = captureInputPermit
+        self.retryOnMain = retryOnMain ?? onMain
     }
 
     deinit {
@@ -166,6 +172,14 @@ public final class AXFocusRestorer: FocusRestorer {
         onMain { self.startEnrollment(current, completion: completion) }
     }
 
+    public func syntheticInputWillBegin(targetProcessIdentifier: Int32?, permitsWindowlessDestination: Bool = false) {
+        guard let pid = targetProcessIdentifier, pid > 0 else { return }
+        sessionLock.lock(); defer { sessionLock.unlock() }
+        guard let current = session, current.token.beginSyntheticInput() else { return }
+        current.inputDestinationPID = pid
+        current.inputDestinationIsPassive = permitsWindowlessDestination
+    }
+
     public func inputDidEnd() {
         sessionLock.lock()
         if state.inputDidEnd(), let current = session {
@@ -183,6 +197,7 @@ public final class AXFocusRestorer: FocusRestorer {
         sessionLock.unlock()
         guard admitted, let current, let captured = current.captured,
               let baseline = current.releasedBaseline else {
+            log("Focus restoration not admitted; captured=\(current?.captured != nil), releasedBaseline=\(current?.releasedBaseline != nil), \(current?.token.diagnosticState ?? "no session").")
             discardCapturedWindow()
             return
         }
@@ -196,16 +211,34 @@ public final class AXFocusRestorer: FocusRestorer {
                 let resolution = self.backend.resolve(workspace: baselineWorkspace.application,
                                                        permit: { current.token.isPermitted })
                 guard case let .known(confirmed) = resolution else {
-                    self.logUnknown(resolution, context: "Post-release focus baseline unavailable")
-                    self.finish(current)
+                    if current.inputDestinationIsPassive,
+                       current.inputDestinationPID == baselineWorkspace.application?.processIdentifier,
+                       captured.focusedElement != nil,
+                       let empty = self.backend.resolveWindowlessApplication(workspace: baselineWorkspace.application,
+                                                                           permit: { current.token.isPermitted }),
+                       self.backend.canRestoreExactRecipient(captured, permit: { current.token.isPermitted }) {
+                        self.restoreFromWindowlessDestination(empty, snapshot: baselineWorkspace, session: current, captured: captured)
+                    } else {
+                        self.logUnknown(resolution, context: "Post-release focus baseline unavailable")
+                        self.finish(current)
+                    }
                     return
                 }
-                guard self.backend.windowRelationship(baseline, confirmed) == .same else {
+                let effectiveBaseline: AXFocusTarget
+                if let destination = current.inputDestinationPID {
+                    let currentPID = confirmed.workspaceApplication.processIdentifier
+                    guard currentPID == destination || currentPID == captured.workspaceApplication.processIdentifier else {
+                        self.log("Post-delivery focus belongs to neither captured source nor verified touch destination; restoration skipped.")
+                        self.finish(current); return
+                    }
+                    effectiveBaseline = confirmed
+                } else { effectiveBaseline = baseline }
+                guard self.backend.windowRelationship(effectiveBaseline, confirmed) == .same else {
                     self.log("Focus changed from the certified pre-release baseline; restoration skipped.")
                     self.finish(current)
                     return
                 }
-                if self.backend.relationship(captured, baseline) == .same {
+                if self.backend.relationship(captured, effectiveBaseline) == .same {
                     self.log("Captured window is already focused; no mutation needed.")
                     self.finish(current)
                     return
@@ -222,11 +255,80 @@ public final class AXFocusRestorer: FocusRestorer {
                     self.onWorker {
                         guard current.token.beginRestoreMutation() else { self.finish(current); return }
                         let result = self.backend.attemptRestore(
-                            captured: captured, baseline: baseline,
+                            captured: captured, baseline: effectiveBaseline,
                             workspace: refreshedWorkspace.application, capturedApplication: capturedApplication,
                             permit: { current.token.isPermitted })
                         self.completeAttempt(result, session: current, captured: captured)
                     }
+                }
+            }
+        }
+    }
+
+    /// A verified passive destination has no keyboard window to compare with the
+    /// captured source. First prove that explicit state twice, then activate the
+    /// retained source once. Actual activation and fresh AX ownership must be
+    /// confirmed before the exact recipient setter; no speculative window fallback.
+    private func restoreFromWindowlessDestination(_ empty: AXWindowlessFocusTarget,
+        snapshot: WorkspaceFocusSnapshot, session current: Session, captured: AXFocusTarget) {
+        onMain {
+            guard current.token.isPermitted, self.sameWorkspace(snapshot, self.workspace.snapshot()),
+                  let source = self.workspace.application(processIdentifier: captured.workspaceApplication.processIdentifier),
+                  source.isSameApplication(as: captured.workspaceApplication), !source.isHidden, !source.isTerminated else {
+                self.finish(current); return
+            }
+            self.onWorker {
+                guard current.token.isPermitted,
+                      let confirmed = self.backend.resolveWindowlessApplication(workspace: snapshot.application,
+                                                                                permit: { current.token.isPermitted }),
+                      confirmed.workspaceApplication.isSameApplication(as: empty.workspaceApplication) else {
+                    self.finish(current); return
+                }
+                self.onMain {
+                    guard current.token.isPermitted, self.sameWorkspace(snapshot, self.workspace.snapshot()),
+                          current.token.beginRestoreMutation() else { self.finish(current); return }
+                    self.log("Verified windowless click destination; activating captured source once.")
+                    guard self.workspace.activate(source) else { self.finish(current); return }
+                    self.awaitRestoredSource(source, session: current, captured: captured, retries: 16)
+                }
+            }
+        }
+    }
+
+    private func awaitRestoredSource(_ source: AXFocusWorkspaceApplication, session current: Session,
+                                     captured: AXFocusTarget, retries: Int) {
+        guard current.token.isPermitted else { finish(current); return }
+        let observed = workspace.snapshot()
+        guard observed.sessionActive else { finish(current); return }
+        guard workspace.isActive(source), observed.application?.isSameApplication(as: source) == true else {
+            guard retries > 0 else { finish(current); return }
+            retryOnMain { self.awaitRestoredSource(source, session: current, captured: captured, retries: retries - 1) }
+            return
+        }
+        onWorker {
+            guard current.token.isPermitted else { self.finish(current); return }
+            let resolution = self.backend.resolve(workspace: observed.application, permit: { current.token.isPermitted })
+            guard case let .known(baseline) = resolution else {
+                if retries > 0, self.canRetryRead(resolution) {
+                    self.onMain {
+                        guard current.token.isPermitted, self.sameWorkspace(observed, self.workspace.snapshot()),
+                              self.workspace.isActive(source) else { self.finish(current); return }
+                        self.retryOnMain { self.awaitRestoredSource(source, session: current, captured: captured, retries: retries - 1) }
+                    }
+                } else {
+                    self.logUnknown(resolution, context: "Activated source has no verified keyboard window")
+                    self.finish(current)
+                }
+                return
+            }
+            self.onMain {
+                guard current.token.isPermitted, self.sameWorkspace(observed, self.workspace.snapshot()),
+                      self.workspace.isActive(source) else { self.finish(current); return }
+                self.onWorker {
+                    guard current.token.isPermitted else { self.finish(current); return }
+                    let result = self.backend.attemptRestore(captured: captured, baseline: baseline,
+                        workspace: observed.application, capturedApplication: source, permit: { current.token.isPermitted })
+                    self.completeAttempt(result, session: current, captured: captured)
                 }
             }
         }
@@ -323,6 +425,7 @@ public final class AXFocusRestorer: FocusRestorer {
                             if let systemError = confirmed.systemWideError {
                                 self.log("Capture corroborated after system-wide AX error \(systemError.rawValue).")
                             }
+                            self.log("Pre-input focus captured; recipientPresent=\(confirmed.focusedElement != nil), \(current.token.diagnosticState).")
                             self.deliverPreparation(completion, prepared: current)
                         }
                     }
@@ -335,7 +438,9 @@ public final class AXFocusRestorer: FocusRestorer {
         { [weak self, weak current, token = current.token] event in
             // Dirty the certificate immediately, even if main is busy. The single
             // queued request samples after a burst of activation/deactivation hints.
-            guard token.observe(event), let self, let current else { return }
+            let requested = token.observe(event)
+            self?.log("Focus observation \(event); \(token.diagnosticState), enrollmentRequested=\(requested).")
+            guard requested, let self, let current else { return }
             self.onMain { [weak self, weak current] in
                 guard let self, let current else { return }
                 self.startEnrollment(current)
@@ -422,32 +527,50 @@ public final class AXFocusRestorer: FocusRestorer {
         case .attempted(let error):
             log("Issued one focus mutation; AX=\(error.rawValue). Timeout does not cancel an issued action.")
             guard current.token.isPermitted else { finish(current); return }
-            onMain {
+            verifyRestoreAttempt(current, captured: captured, retries: 16)
+        }
+    }
+
+    private func canRetryRead(_ resolution: AXFocusResolution) -> Bool {
+        guard case let .unknown(problem) = resolution else { return false }
+        return problem.error == .noValue || problem.error == .cannotComplete
+    }
+
+    /// Poll only observations after the committed action. Never repeat activation
+    /// or an AX setter merely because its result is not visible yet.
+    private func verifyRestoreAttempt(_ current: Session, captured: AXFocusTarget, retries: Int) {
+        onMain {
+            guard current.token.isPermitted else { self.finish(current); return }
+            let after = self.workspace.snapshot()
+            guard after.sessionActive else { self.finish(current); return }
+            self.onWorker {
                 guard current.token.isPermitted else { self.finish(current); return }
-                let after = self.workspace.snapshot()
-                guard after.sessionActive else { self.finish(current); return }
-                self.onWorker {
-                    guard current.token.isPermitted else { self.finish(current); return }
-                    let verification = self.backend.resolve(workspace: after.application,
-                                                           permit: { current.token.isPermitted })
-                    guard case let .known(verified) = verification else {
+                let verification = self.backend.resolve(workspace: after.application, permit: { current.token.isPermitted })
+                guard case let .known(verified) = verification else {
+                    if retries > 0, self.canRetryRead(verification) {
+                        self.retryOnMain { self.verifyRestoreAttempt(current, captured: captured, retries: retries - 1) }
+                    } else {
                         self.logUnknown(verification, context: "Focus mutation has no fresh verification result")
                         self.finish(current)
+                    }
+                    return
+                }
+                let restored = self.backend.relationship(captured, verified) == .same
+                self.onMain {
+                    let final = self.workspace.snapshot()
+                    guard current.token.isPermitted, self.sameWorkspace(after, final) else {
+                        self.log("Focus verification became stale before main-thread revalidation.")
+                        self.finish(current); return
+                    }
+                    if !restored, retries > 0,
+                       verified.workspaceApplication.isSameApplication(as: captured.workspaceApplication) {
+                        self.retryOnMain { self.verifyRestoreAttempt(current, captured: captured, retries: retries - 1) }
                         return
                     }
-                    let restored = self.backend.relationship(captured, verified) == .same
-                    self.onMain {
-                        let final = self.workspace.snapshot()
-                        guard current.token.isPermitted, self.sameWorkspace(after, final) else {
-                            self.log("Focus verification became stale before main-thread revalidation.")
-                            self.finish(current)
-                            return
-                        }
-                        self.log(restored
-                            ? "Fresh AX verification found the captured window focused."
-                            : "Fresh AX verification did not find the captured window focused.")
-                        self.finish(current)
-                    }
+                    self.log(restored
+                        ? "Fresh AX verification found the captured window and keyboard recipient focused."
+                        : "Fresh AX verification did not find the captured window and keyboard recipient focused.")
+                    self.finish(current)
                 }
             }
         }
@@ -471,6 +594,7 @@ public final class AXFocusRestorer: FocusRestorer {
     }
 
     private func finish(_ current: Session, completion: (() -> Void)? = nil) {
+        log("Focus transaction finishing; \(current.token.diagnosticState).")
         current.token.invalidate()
         dispose(current, finishOperation: true) {
             if let completion { self.deliverPreparation(completion) }
