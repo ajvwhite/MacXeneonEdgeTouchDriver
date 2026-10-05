@@ -47,7 +47,7 @@ public final class DriverPerformanceMetrics: @unchecked Sendable {
         let copiedTimings = timings
         let copiedCounters = counters
         lock.unlock()
-        let result = copiedTimings.mapValues { samples in
+        let result: [String: Distribution] = copiedTimings.mapValues { (samples: Samples) -> Distribution in
             let ordered = samples.values.sorted()
             func percentile(_ p: Double) -> Double {
                 guard !ordered.isEmpty else { return 0 }
