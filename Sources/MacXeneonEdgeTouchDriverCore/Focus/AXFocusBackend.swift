@@ -225,7 +225,7 @@ final class AXFocusBackend: AXFocusBackendProtocol {
                 return .unknown(failure("focused element owner", ownerError))
             }
             guard permit() else { return .unknown(failure("cancelled")) }
-            let elementWindow = operations.read(element, attribute: kAXWindowAttribute)
+            let elementWindow = AXElementWindowResolver.resolve(element, operations: operations, timeout: timeout, permit: permit)
             guard elementWindow.error == .success, case let .element(owningWindow)? = elementWindow.value,
                   operations.equal(owningWindow, window) else {
                 return .unknown(failure("focused element window", elementWindow.error))
@@ -313,7 +313,7 @@ final class AXFocusBackend: AXFocusBackendProtocol {
                 return .unknown(failure("restore element owner", ownerError))
             }
             guard permit() else { return .skipped }
-            let owningWindow = operations.read(element, attribute: kAXWindowAttribute)
+            let owningWindow = AXElementWindowResolver.resolve(element, operations: operations, timeout: timeout, permit: permit)
             guard owningWindow.error == .success, case let .element(window)? = owningWindow.value,
                   operations.equal(window, captured.window) else {
                 return .unknown(failure("restore element window changed", owningWindow.error))

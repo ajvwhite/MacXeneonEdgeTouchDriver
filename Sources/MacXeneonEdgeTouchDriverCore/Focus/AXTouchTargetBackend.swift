@@ -34,10 +34,14 @@ final class AXTouchTargetBackend: AXTouchTargetResolving {
         let pid: pid_t
     }
     private let operations: AXTouchTargetOperations
-    init(operations: AXTouchTargetOperations = SystemAXFocusOperations()) { self.operations = operations }
+    private let timeout: Float
+    init(operations: AXTouchTargetOperations = SystemAXFocusOperations(), timeout: Float = 0.008) {
+        self.operations = operations
+        self.timeout = max(0.001, min(timeout, 0.05))
+    }
 
     private func read(_ element: AXFocusElement, _ attribute: String, permit: () -> Bool) -> AXFocusValue? {
-        guard permit(), operations.setTimeout(element, seconds: 0.008) == .success, permit() else { return nil }
+        guard permit(), operations.setTimeout(element, seconds: timeout) == .success, permit() else { return nil }
         let result = operations.read(element, attribute: attribute)
         guard result.error == .success, permit() else { return nil }
         return result.value
@@ -54,14 +58,15 @@ final class AXTouchTargetBackend: AXTouchTargetResolving {
     func resolve(at point: CGPoint, permit: () -> Bool) -> Target? {
         guard point.x.isFinite, point.y.isFinite, permit() else { return nil }
         let system = operations.systemWideElement()
-        guard permit(), operations.setTimeout(system, seconds: 0.008) == .success, permit() else { return nil }
+        guard permit(), operations.setTimeout(system, seconds: timeout) == .success, permit() else { return nil }
         let (error, hit) = operations.element(at: point, system: system)
         guard error == .success, let hit, permit(),
               case let .string(role)? = read(hit, kAXRoleAttribute, permit: permit) else { return nil }
         let window: AXFocusElement
         if role == kAXWindowRole { window = hit }
         else {
-            guard case let .element(value)? = read(hit, kAXWindowAttribute, permit: permit) else { return nil }
+            let result = AXElementWindowResolver.resolve(hit, operations: operations, timeout: timeout, permit: permit)
+            guard result.error == .success, case let .element(value)? = result.value else { return nil }
             window = value
         }
         guard case .string(kAXWindowRole)? = read(window, kAXRoleAttribute, permit: permit),

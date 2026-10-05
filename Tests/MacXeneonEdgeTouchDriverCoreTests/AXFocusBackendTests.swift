@@ -22,6 +22,52 @@ final class AXFocusBackendTests: XCTestCase {
         XCTAssertEqual(captured?.focusedElement.map(f.operations.id), "text")
     }
 
+    func testWebRecipientWithoutWindowAttributeUsesVerifiedTopLevelWindow() {
+        let f = FocusBackendFixture()
+        f.operations.owners["text"] = 11
+        f.operations.reads["A:AXFocusedUIElement"] = AXFocusRead(error: .success, value: .element(f.operations.element("text")))
+        f.operations.reads["text:AXTopLevelUIElement"] = AXFocusRead(error: .success, value: .element(f.operations.element("a")))
+        let captured = known(f.backend.resolve(workspace: f.appA, permit: { true }))
+        XCTAssertEqual(captured?.focusedElement.map(f.operations.id), "text")
+        XCTAssertTrue(f.operations.mutations.isEmpty)
+    }
+
+    func testWebRecipientParentTraversalChecksOwnerCyclesAndDepth() {
+        for mode in ["valid", "foreign", "cycle", "deep", "uncertain"] {
+            let f = FocusBackendFixture()
+            f.operations.owners["text"] = 11
+            f.operations.reads["A:AXFocusedUIElement"] = AXFocusRead(error: .success, value: .element(f.operations.element("text")))
+            f.operations.reads["text:AXRole"] = AXFocusRead(error: .success, value: .string(kAXTextFieldRole))
+            let parent = mode == "cycle" ? "text" : "group0"
+            f.operations.reads["text:AXParent"] = AXFocusRead(error: .success, value: .element(f.operations.element(parent)))
+            for index in 0..<17 {
+                let name = "group\(index)"
+                f.operations.owners[name] = mode == "foreign" ? 22 : 11
+                f.operations.reads["\(name):AXRole"] = AXFocusRead(error: .success, value: .string(kAXGroupRole))
+                let next = mode == "deep" ? "group\(index + 1)" : "a"
+                f.operations.reads["\(name):AXParent"] = AXFocusRead(error: .success, value: .element(f.operations.element(next)))
+            }
+            if mode == "uncertain" {
+                f.operations.reads["text:AXWindow"] = AXFocusRead(error: .cannotComplete, value: nil)
+            }
+            let result = f.backend.resolve(workspace: f.appA, permit: { true })
+            if mode == "valid" {
+                XCTAssertEqual(known(result)?.focusedElement.map(f.operations.id), "text")
+            } else {
+                XCTAssertEqual(unknown(result)?.stage, "focused element window", mode)
+            }
+            XCTAssertTrue(f.operations.mutations.isEmpty)
+        }
+    }
+
+    func testTopLevelWindowFromForeignProcessIsRejected() {
+        let f = FocusBackendFixture()
+        f.operations.owners["text"] = 11
+        f.operations.reads["A:AXFocusedUIElement"] = AXFocusRead(error: .success, value: .element(f.operations.element("text")))
+        f.operations.reads["text:AXTopLevelUIElement"] = AXFocusRead(error: .success, value: .element(f.operations.element("b")))
+        XCTAssertEqual(unknown(f.backend.resolve(workspace: f.appA, permit: { true }))?.stage, "focused element window")
+    }
+
     func testSameWindowDifferentKeyboardRecipientRestoresTextInsteadOfSkipping() {
         let f = FocusBackendFixture()
         for name in ["text", "url"] { f.operations.owners[name] = 11 }

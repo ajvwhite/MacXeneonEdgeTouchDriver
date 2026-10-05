@@ -47,7 +47,7 @@ public final class AXFocusRestorer: FocusRestorer {
     public convenience init(callbackQueue: DispatchQueue = .main) {
         let worker = DispatchQueue(label: "\(DriverLoggers.subsystem).focus-ax")
         self.init(
-            backend: AXFocusBackend(), workspace: WorkspaceFocusMonitor(),
+            backend: AXFocusBackend(timeout: 0.05), workspace: WorkspaceFocusMonitor(),
             onMain: { DispatchQueue.main.async(execute: DispatchWorkItem(block: $0)) },
             onWorker: { worker.async(execute: DispatchWorkItem(block: $0)) },
             onCallback: { callbackQueue.async(execute: DispatchWorkItem(block: $0)) },

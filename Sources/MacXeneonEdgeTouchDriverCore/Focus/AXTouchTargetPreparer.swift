@@ -60,7 +60,7 @@ final class AXTouchTargetPreparer: TouchTargetPreparing {
 
     convenience init(callbackQueue: DispatchQueue) {
         let worker = DispatchQueue(label: "\(DriverLoggers.subsystem).touch-target-ax")
-        self.init(backend: AXTouchTargetBackend(),
+        self.init(backend: AXTouchTargetBackend(timeout: 0.05),
                   onWorker: { worker.async(execute: DispatchWorkItem(block: $0)) },
                   onMain: { DispatchQueue.main.async(execute: DispatchWorkItem(block: $0)) },
                   onCallback: { callbackQueue.async(execute: DispatchWorkItem(block: $0)) },
