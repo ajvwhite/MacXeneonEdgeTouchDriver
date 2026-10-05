@@ -21,13 +21,14 @@ struct MouseInputEnvironment {
     // The actual source table ID, including a private source's unique ID.
     let sourceStateID: Int64?
     let flags: () -> CGEventFlags
+    var makeScrollEvent: ((CGPoint) -> MouseInputEvent?)? = nil
 }
 
 /// Posts synthetic left-button events. GestureController exclusively uses the
 /// managed reporting API; that API reserves one release before posting a down.
 /// The original Void API retains single-event behavior, without reserve guarantees.
 /// Do not mix raw and managed calls within a press. Requires serial use.
-public final class CGEventInputSink: ReportingSyntheticInputSink {
+public final class CGEventInputSink: ClickCountSyntheticInputSink, ScrollInputSink {
     private let environment: MouseInputEnvironment
     private let eventTap: CGEventTapLocation
     private var operationInFlight = false
@@ -37,6 +38,7 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
         // Strongly retained, distinct, and never posted before the one release attempt.
         let emergencyUp: MouseInputEvent
         let eventNumber: Int64
+        let clickCount: Int
     }
 
     /// Post into the login session, after the hardware input state table. Posting
@@ -67,6 +69,12 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
                     // The factory and this closure strongly retain the same source.
                     guard let eventSource else { return [] }
                     return CGEventSource.flagsState(eventSource.sourceStateID)
+                },
+                makeScrollEvent: { point in
+                    guard let event = CGEvent(scrollWheelEvent2Source: eventSource, units: .pixel,
+                                              wheelCount: 2, wheel1: 0, wheel2: 0, wheel3: 0) else { return nil }
+                    event.location = point
+                    return event
                 }
             ),
             eventTap: eventTap
@@ -86,6 +94,11 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
     public func postMouseDragged(to point: CGPoint) { postLegacyEvent(type: .leftMouseDragged, at: point) }
 
     public func tryPostMouseDown(at point: CGPoint) -> SyntheticInputResult {
+        tryPostMouseDown(at: point, clickCount: 1)
+    }
+
+    public func tryPostMouseDown(at point: CGPoint, clickCount: Int) -> SyntheticInputResult {
+        guard clickCount == 1 || clickCount == 2 else { return .constructionFailed }
         guard !operationInFlight, press == nil else { return .busy }
         operationInFlight = true
         defer { operationInFlight = false }
@@ -106,9 +119,9 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
             DriverLoggers.log(.error, category: .gesture, "Mouse event reserve does not match the explicit source.")
             return .sourceUnavailable
         }
-        configureButton(down, click: true)
+        configureButton(down, click: true, clickCount: clickCount)
         press = Press(emergencyUp: emergencyUp,
-                      eventNumber: down.getIntegerValueField(.mouseEventNumber))
+                      eventNumber: down.getIntegerValueField(.mouseEventNumber), clickCount: clickCount)
         environment.post(down, eventTap)
         return .postInvoked
     }
@@ -132,7 +145,7 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
             event.flags = environment.flags()
             event.setIntegerValueField(.mouseEventNumber, value: ownedPress.eventNumber)
         }
-        configureButton(event, click: true)
+        configureButton(event, click: true, clickCount: ownedPress.clickCount)
         environment.post(event, eventTap)
         return .postInvoked
     }
@@ -146,6 +159,26 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
             return .constructionFailed
         }
         configureButton(event, click: false)
+        environment.post(event, eventTap)
+        return .postInvoked
+    }
+
+    public func tryPostScroll(deltaX: Double, deltaY: Double, at point: CGPoint) -> SyntheticInputResult {
+        guard !operationInFlight, press == nil else { return .busy }
+        guard deltaX.isFinite, deltaY.isFinite, abs(deltaX) <= 10_000, abs(deltaY) <= 10_000,
+              point.x.isFinite, point.y.isFinite else { return .constructionFailed }
+        guard let source = environment.sourceStateID else { return .sourceUnavailable }
+        operationInFlight = true
+        defer { operationInFlight = false }
+        guard let event = environment.makeScrollEvent?(point) else { return .constructionFailed }
+        guard event.getIntegerValueField(.eventSourceStateID) == source else { return .sourceUnavailable }
+        event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: 0)
+        event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: 0)
+        event.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(deltaY.rounded()))
+        event.setIntegerValueField(.scrollWheelEventPointDeltaAxis2, value: Int64(deltaX.rounded()))
+        event.setIntegerValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Int64((deltaY * 65_536).rounded()))
+        event.setIntegerValueField(.scrollWheelEventFixedPtDeltaAxis2, value: Int64((deltaX * 65_536).rounded()))
         environment.post(event, eventTap)
         return .postInvoked
     }
@@ -170,8 +203,8 @@ public final class CGEventInputSink: ReportingSyntheticInputSink {
         return event
     }
 
-    private func configureButton(_ event: MouseInputEvent, click: Bool) {
+    private func configureButton(_ event: MouseInputEvent, click: Bool, clickCount: Int = 1) {
         event.setIntegerValueField(.mouseEventButtonNumber, value: Int64(CGMouseButton.left.rawValue))
-        if click { event.setIntegerValueField(.mouseEventClickState, value: 1) }
+        if click { event.setIntegerValueField(.mouseEventClickState, value: Int64(clickCount)) }
     }
 }

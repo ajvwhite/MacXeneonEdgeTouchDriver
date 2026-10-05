@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Check inconsistent touch reports and track clear, deliberate touches through noise. Release a track when it loses support, then recover automatically when the stream settles.
+- Add double-clicks for nearby taps on the same confirmed window, with an option to keep separate clicks.
+- Add optional single-finger scrolling. Quick taps click; holding before moving starts a drag. Direct dragging remains the default.
+- Skip outdated movement during established drags while preserving the first movement, final point and button release.
+- Use Interactive process scheduling for the installed service to avoid background timer delays.
+- Add optional timing summaries and offline report replay to investigate performance without posting mouse input.
+
 - Make the first tap work on an inactive window by preparing it before sending the click. If the window cannot be confirmed, drop the touch rather than click an uncertain target.
 - Return typing to the original text field after touch, including after virtual Stream Deck actions. Later mouse clicks, typing or scrolling cancel further focus restoration.
 - Recover the first fresh tap after USB reconnect on the tested controller and hub, including disconnects during a held touch. Other hardware still requires a release before accepting a new touch.

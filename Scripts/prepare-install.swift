@@ -91,8 +91,8 @@ func preparePlist(templatePath: String, binaryPath: String, logDirectory: String
           throttle.int64Value > 0 else {
         throw PreparationError(message: "LaunchAgent template must have a positive integer ThrottleInterval.")
     }
-    try require(plist["ProcessType"] as? String == "Background",
-                "LaunchAgent template must use the Background process type.")
+    try require(plist["ProcessType"] as? String == "Interactive",
+                "LaunchAgent template must use the Interactive process type.")
 
     plist["ProgramArguments"] = [binaryPath]
     plist["StandardOutPath"] = logDirectory + "/stdout.log"
@@ -155,10 +155,18 @@ func prepareConfig(configPath: String, logDirectory: String) throws -> Data {
         ] as [String: Any],
         "focus": ["restorePreviousWindow": true],
         "cursor": ["returnToPreviousPosition": true],
-        "gesture": ["multiTouchEnabled": false],
+        "gesture": [
+            "multiTouchEnabled": false,
+            "mode": "direct",
+            "holdDurationMs": 300,
+            "scrollThresholdPx": 6,
+            "scrollSensitivity": 1.0,
+            "doubleClickEnabled": true,
+        ] as [String: Any],
         "diagnostics": [
             "fileLogPath": logDirectory + "/driver.log",
             "fileLogMaxBytes": 5_242_880,
+            "performanceMetricsEnabled": false,
         ] as [String: Any],
     ]
     var data = try JSONSerialization.data(withJSONObject: configuration, options: [.prettyPrinted, .sortedKeys])

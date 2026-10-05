@@ -8,6 +8,7 @@ protocol TouchTargetPreparing: AnyObject {
     var requiresPreparation: Bool { get }
     var preparedTargetProcessIdentifier: pid_t? { get }
     var preparedTargetIsPassive: Bool { get }
+    var preparedTargetIdentity: TouchTargetIdentity? { get }
     func beginContact()
     func prepare(at point: CGPoint, completion: @escaping (Bool) -> Void)
     func cancel()
@@ -17,6 +18,7 @@ extension TouchTargetPreparing {
     func beginContact() {}
     var preparedTargetProcessIdentifier: pid_t? { nil }
     var preparedTargetIsPassive: Bool { false }
+    var preparedTargetIdentity: TouchTargetIdentity? { nil }
 }
 
 final class NoOpTouchTargetPreparer: TouchTargetPreparing {
@@ -65,6 +67,10 @@ final class AXTouchTargetPreparer: TouchTargetPreparing {
     private var contactInputPermit: PhysicalInputGuard.Permit?
     private var preparedPID: pid_t?
     private var preparedPassive = false
+    private var preparedIdentity: TouchTargetIdentity?
+    var preparedTargetIdentity: TouchTargetIdentity? {
+        lock.lock(); defer { lock.unlock() }; return preparedIdentity
+    }
     var preparedTargetIsPassive: Bool {
         lock.lock(); defer { lock.unlock() }; return preparedPassive
     }
@@ -99,10 +105,10 @@ final class AXTouchTargetPreparer: TouchTargetPreparing {
 
     func beginContact() {
         let permit = captureInputPermit()
-        lock.lock(); generation &+= 1; preparedPID = nil; preparedPassive = false; contactInputPermit = permit; lock.unlock()
+        lock.lock(); generation &+= 1; preparedPID = nil; preparedPassive = false; preparedIdentity = nil; contactInputPermit = permit; lock.unlock()
     }
 
-    func cancel() { lock.lock(); generation &+= 1; preparedPID = nil; preparedPassive = false; contactInputPermit = nil; lock.unlock() }
+    func cancel() { lock.lock(); generation &+= 1; preparedPID = nil; preparedPassive = false; preparedIdentity = nil; contactInputPermit = nil; lock.unlock() }
 
     func prepare(at point: CGPoint, completion: @escaping (Bool) -> Void) {
         lock.lock()
@@ -120,7 +126,12 @@ final class AXTouchTargetPreparer: TouchTargetPreparing {
                 self.finish(current, accepted: false, inputPermit: inputPermit, completion: completion); return
             }
             self.lock.lock()
-            if self.generation == current { self.preparedPID = target.pid; self.preparedPassive = !target.requiresActivation }
+            if self.generation == current {
+                self.preparedPID = target.pid
+                self.preparedPassive = !target.requiresActivation
+                self.preparedIdentity = TouchTargetIdentity(pid: target.pid,
+                    application: target.application.rawValue, window: target.window.rawValue)
+            }
             self.lock.unlock()
             self.onMain {
                 guard permit(), let application = self.application(target.pid),
@@ -181,6 +192,9 @@ final class AXTouchTargetPreparer: TouchTargetPreparing {
         onCallback {
             guard self.isCurrent(expected) else { return }
             let confirmed = accepted && inputPermit()
+            if !confirmed {
+                self.lock.lock(); self.preparedIdentity = nil; self.lock.unlock()
+            }
             if !confirmed { DriverLoggers.log(.warning, category: .focus, "Touch target activation could not be confirmed; contact rejected.") }
             completion(confirmed)
         }

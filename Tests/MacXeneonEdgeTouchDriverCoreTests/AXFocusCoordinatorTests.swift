@@ -1186,3 +1186,34 @@ private final class CoordinatorWorkspaceFake: WorkspaceFocusMonitoring {
     func isActive(_ application: AXFocusWorkspaceApplication) -> Bool { reportsActive && frontmost.isSameApplication(as: application) }
     func stop() { stopCount += 1; observer = nil }
 }
+
+extension AXFocusCoordinatorTests {
+    func testPerformanceMetricsCountVerifiedRestorationOnce() {
+        let f = FocusCoordinatorFixture()
+        let metrics = DriverPerformanceMetrics()
+        f.restorer.setPerformanceMetrics(metrics)
+        f.prepare()
+        f.restorer.inputDidEnd()
+        f.clock.nanoseconds = 1_000_000
+        f.restorer.restoreCapturedWindow()
+        f.clock.nanoseconds = 3_000_000
+        f.pump()
+        XCTAssertEqual(metrics.snapshot().timings["focusRestoration"]?.count, 1)
+        XCTAssertEqual(metrics.snapshot().timings["focusRestoration"]?.p50Milliseconds, 2)
+        XCTAssertEqual(metrics.snapshot().counters["focusVerified"], 1)
+        f.restorer.discardCapturedWindow(); f.pump()
+        XCTAssertEqual(metrics.snapshot().timings["focusRestoration"]?.count, 1)
+    }
+
+    func testCancelledFocusWorkIsNotReportedAsVerified() {
+        let f = FocusCoordinatorFixture()
+        let metrics = DriverPerformanceMetrics()
+        f.restorer.setPerformanceMetrics(metrics)
+        f.prepare(); f.changeFocusDuringTouch(); f.restorer.inputDidEnd()
+        f.restorer.restoreCapturedWindow()
+        f.restorer.discardCapturedWindow(); f.pump()
+        XCTAssertEqual(metrics.snapshot().timings["focusRestoration"]?.count, 1)
+        XCTAssertNil(metrics.snapshot().counters["focusVerified"])
+        XCTAssertEqual(metrics.snapshot().counters["focusUnverifiedOrCancelled"], 1)
+    }
+}

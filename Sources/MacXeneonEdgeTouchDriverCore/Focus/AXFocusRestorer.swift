@@ -20,6 +20,8 @@ public final class AXFocusRestorer: FocusRestorer {
         var releasedBaseline: AXFocusTarget?
         var inputDestinationPID: pid_t?
         var inputDestinationIsPassive = false
+        var restorationStartedAt: UInt64?
+        var restorationVerified = false
         // Successive pipeline stages own these; callbacks touch the token only.
         var observations: [AXFocusObservationProtocol] = []
         var attachedSources: [CFRunLoopSource] = []
@@ -39,6 +41,7 @@ public final class AXFocusRestorer: FocusRestorer {
     private let state = FocusOperationState()
     private let sessionLock = NSLock()
     private var session: Session?
+    private var performanceMetrics: DriverPerformanceMetrics?
     private var hasStarted = false
     private var independentTargetActivation = false
     private var isShutdown = false
@@ -96,6 +99,26 @@ public final class AXFocusRestorer: FocusRestorer {
                 remaining.observations.removeAll()
             }
         }
+    }
+
+    func setPerformanceMetrics(_ metrics: DriverPerformanceMetrics?) {
+        sessionLock.lock(); performanceMetrics = metrics; sessionLock.unlock()
+    }
+
+    private func markVerified(_ current: Session) {
+        sessionLock.lock(); current.restorationVerified = true; sessionLock.unlock()
+    }
+
+    private func recordRestoration(_ current: Session) {
+        sessionLock.lock()
+        let start = current.restorationStartedAt
+        current.restorationStartedAt = nil
+        let verified = current.restorationVerified
+        let metrics = performanceMetrics
+        sessionLock.unlock()
+        guard let start, let metrics else { return }
+        metrics.record("focusRestoration", from: start, to: now())
+        metrics.increment(verified ? "focusVerified" : "focusUnverifiedOrCancelled")
     }
 
     public func captureFocusedWindow() {
@@ -194,6 +217,7 @@ public final class AXFocusRestorer: FocusRestorer {
         let admitted = current.map {
             $0.captured != nil && $0.releasedBaseline != nil && state.beginRestoration(token: $0.token)
         } ?? false
+        if admitted { current?.restorationStartedAt = now() }
         sessionLock.unlock()
         guard admitted, let current, let captured = current.captured,
               let baseline = current.releasedBaseline else {
@@ -239,6 +263,7 @@ public final class AXFocusRestorer: FocusRestorer {
                     return
                 }
                 if self.backend.relationship(captured, effectiveBaseline) == .same {
+                    self.markVerified(current)
                     self.log("Captured window is already focused; no mutation needed.")
                     self.finish(current)
                     return
@@ -356,7 +381,7 @@ public final class AXFocusRestorer: FocusRestorer {
         let cleanup = previous != nil && state.beginCleanup()
         if cleanup { session = nil }
         sessionLock.unlock()
-        if cleanup, let previous { dispose(previous, finishOperation: true) }
+        if cleanup, let previous { recordRestoration(previous); dispose(previous, finishOperation: true) }
     }
 
     private func startPreparation(_ current: Session, completion: @escaping () -> Void) {
@@ -567,6 +592,7 @@ public final class AXFocusRestorer: FocusRestorer {
                         self.retryOnMain { self.verifyRestoreAttempt(current, captured: captured, retries: retries - 1) }
                         return
                     }
+                    if restored { self.markVerified(current) }
                     self.log(restored
                         ? "Fresh AX verification found the captured window and keyboard recipient focused."
                         : "Fresh AX verification did not find the captured window and keyboard recipient focused.")
@@ -594,6 +620,7 @@ public final class AXFocusRestorer: FocusRestorer {
     }
 
     private func finish(_ current: Session, completion: (() -> Void)? = nil) {
+        recordRestoration(current)
         log("Focus transaction finishing; \(current.token.diagnosticState).")
         current.token.invalidate()
         dispose(current, finishOperation: true) {

@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Foundation
 
@@ -43,6 +44,16 @@ public final class GestureController {
     private var pendingMouseUp: GestureScheduledTask?
     private var pendingCursorReturn: GestureScheduledTask?
     private var lastCompletedTouchTimestamp: DispatchTime?
+    private var doubleClicks = DoubleClickSequence()
+    private var clickTarget: TouchTargetIdentity?
+    private var contactStartedAt: UInt64 = 0
+    private var contactReleasedAt: UInt64?
+    private var clickCount = 1
+    private let doubleClickInterval: () -> UInt64
+    private let captureDoubleClickPermit: () -> PhysicalInputGuard.Permit
+    private let options: GestureOptions
+    private var isScrolling = false
+    private let performanceMetrics: DriverPerformanceMetrics?
     private var preparation: Preparation?
     private var preparationDeadline: GestureScheduledTask?
     private var preparationGeneration: UInt64 = 0
@@ -88,7 +99,9 @@ public final class GestureController {
         focusRestorer: FocusRestorer = NoOpFocusRestorer(),
         returnCursorToPreviousPosition: Bool = true,
         timing: GestureTiming = .immediate,
-        schedulingQueue: DispatchQueue? = nil
+        schedulingQueue: DispatchQueue? = nil,
+        options: GestureOptions = GestureOptions(),
+        performanceMetrics: DriverPerformanceMetrics? = nil
     ) {
         self.init(
             mapperProvider: mapperProvider,
@@ -97,7 +110,8 @@ public final class GestureController {
             focusRestorer: focusRestorer,
             returnCursorToPreviousPosition: returnCursorToPreviousPosition,
             timing: timing,
-            scheduler: DispatchGestureScheduler(queue: schedulingQueue)
+            scheduler: DispatchGestureScheduler(queue: schedulingQueue),
+            options: options, performanceMetrics: performanceMetrics
         )
     }
 
@@ -109,8 +123,16 @@ public final class GestureController {
         returnCursorToPreviousPosition: Bool = true,
         timing: GestureTiming = .immediate,
         scheduler: GestureScheduler,
-        targetPreparer: TouchTargetPreparing = NoOpTouchTargetPreparer()
+        targetPreparer: TouchTargetPreparing = NoOpTouchTargetPreparer(),
+        doubleClickInterval: @escaping () -> UInt64 = { UInt64(NSEvent.doubleClickInterval * 1_000_000_000) },
+        captureDoubleClickPermit: @escaping () -> PhysicalInputGuard.Permit = { PhysicalInputGuard.system.capture() },
+        options: GestureOptions = GestureOptions(),
+        performanceMetrics: DriverPerformanceMetrics? = nil
     ) {
+        self.performanceMetrics = performanceMetrics
+        self.options = options
+        self.doubleClickInterval = doubleClickInterval
+        self.captureDoubleClickPermit = captureDoubleClickPermit
         self.mapperProvider = mapperProvider
         self.inputSink = inputSink
         self.cursorController = cursorController
@@ -219,14 +241,25 @@ public final class GestureController {
 
         let point = mapper.map(rawX: event.rawX, rawY: event.rawY)
 
+        if options.mode == .scroll, phase == .tracking,
+           case .singleTouch = state, event.kind != .down,
+           handleScrollMode(event, point: point) { return }
+
         switch (state, event.kind) {
         case (.idle, .down):
-            guard !isDebounced(event.timestamp) else {
+            guard !isDebounced(event.timestamp) || options.doubleClickEnabled && doubleClicks.mayContinue(at: point,
+                timestamp: event.timestamp.uptimeNanoseconds, mapper: mapper,
+                interval: doubleClickInterval()) else {
                 rejectedContactIDs.insert(event.contactID)
                 DriverLoggers.log(.debug, category: .gesture, "Ignoring touch down inside tap debounce window.")
                 return
             }
 
+            isScrolling = false
+            contactStartedAt = event.timestamp.uptimeNanoseconds
+            contactReleasedAt = nil
+            clickTarget = nil
+            clickCount = 1
             generation &+= 1
             phase = .preparing
             state = .singleTouch(
@@ -278,6 +311,7 @@ public final class GestureController {
             currentContext.lastRawX = event.rawX
             currentContext.lastRawY = event.rawY
             state = .singleTouch(currentContext)
+            performanceMetrics?.record("moveAgeAtPost", from: event.timestamp.uptimeNanoseconds, to: scheduler.now.uptimeNanoseconds)
             let result = performInput {
                 if let reporting = inputSink as? ReportingSyntheticInputSink {
                     return reporting.tryPostMouseDragged(to: point)
@@ -312,6 +346,7 @@ public final class GestureController {
             currentContext.lastRawX = event.rawX
             currentContext.lastRawY = event.rawY
             state = .singleTouch(currentContext)
+            contactReleasedAt = event.timestamp.uptimeNanoseconds
             lastCompletedTouchTimestamp = event.timestamp
             phase = .waitingForMouseUp
 
@@ -333,6 +368,55 @@ public final class GestureController {
             rejectedContactIDs.insert(event.contactID)
             DriverLoggers.log(.warning, category: .gesture, "Rejecting touch down while a gesture is active or cleaning up.")
         }
+    }
+
+    /// Scroll mode delays a mouse press until a hold or a completed tap. Early
+    /// movement scrolls at the prepared start point and never owns a mouse button.
+    private func handleScrollMode(_ event: TouchEvent, point: CGPoint) -> Bool {
+        guard case .singleTouch(var context) = state, context.contactID == event.contactID,
+              !context.isMouseDownPosted else { return false }
+        let elapsed = event.timestamp.uptimeNanoseconds >= contactStartedAt ?
+            event.timestamp.uptimeNanoseconds - contactStartedAt : 0
+        let distance = hypot(point.x - context.startPoint.x, point.y - context.startPoint.y)
+        if !isScrolling, distance >= options.movementThresholdPx,
+           elapsed < UInt64(options.holdDurationMs) * 1_000_000 {
+            guard inputSink is ScrollInputSink else { forceCancel(); return true }
+            pendingMouseDown?.cancel()
+            pendingMouseDown = nil
+            isScrolling = true
+            doubleClicks.reset()
+        }
+        if isScrolling {
+            let deltaX = (point.x - context.lastPoint.x) * options.scrollSensitivity
+            let deltaY = (point.y - context.lastPoint.y) * options.scrollSensitivity
+            context.lastPoint = point
+            context.lastRawX = event.rawX
+            context.lastRawY = event.rawY
+            state = .singleTouch(context)
+            let acceptedGeneration = generation
+            if deltaX != 0 || deltaY != 0 {
+                let result = performInput {
+                    (inputSink as! ScrollInputSink).tryPostScroll(deltaX: deltaX, deltaY: deltaY, at: context.startPoint)
+                }
+                if result != .postInvoked { cancellationRequested = true }
+                finishDeferredInput()
+            }
+            guard generation == acceptedGeneration, phase == .tracking else { return true }
+            if event.kind == .up {
+                isScrolling = false
+                contactReleasedAt = event.timestamp.uptimeNanoseconds
+                lastCompletedTouchTimestamp = event.timestamp
+                phase = .waitingForCursorReturn
+                let task = schedule(after: timing.clickToWarpBackDelayMs) { [weak self] in
+                    self?.returnCursorAndIdle(generation: acceptedGeneration)
+                }
+                if generation == acceptedGeneration, phase == .waitingForCursorReturn { pendingCursorReturn = task }
+                else { task.cancel() }
+            }
+            return true
+        }
+        if event.kind == .move, elapsed < UInt64(options.holdDurationMs) * 1_000_000 { return true }
+        return false
     }
 
     /// Handles a stuck gesture timeout by cleaning up any active mouse-down state.
@@ -369,6 +453,8 @@ public final class GestureController {
 
     /// Forces the controller back to idle, posting cleanup events if needed.
     public func forceCancel() {
+        isScrolling = false
+        doubleClicks.reset()
         invalidateInputSession()
         guard phase != .finishing, phase != .releaseBlocked else { return }
         if inputOperationInFlight {
@@ -463,6 +549,7 @@ public final class GestureController {
         let pendingInput = preparedInput
         let preparedTargetPID = targetPreparer.preparedTargetProcessIdentifier
         let preparedPassiveTarget = targetPreparer.preparedTargetIsPassive
+        let preparedIdentity = targetPreparer.preparedTargetIdentity
         if targetPreparer.requiresPreparation && (!targetReady || !captureIsTimely) {
             // No speculative down if activation failed or exceeded its deadline.
             let ended = pendingInput.contains { $0.kind == .up }
@@ -517,6 +604,7 @@ public final class GestureController {
             transitionToIdle()
             return
         }
+        clickTarget = preparedIdentity
         phase = .tracking
         if cancellationRequested {
             finishDeferredInput()
@@ -542,7 +630,10 @@ public final class GestureController {
 
     private func scheduleMouseDown(generation: UInt64, at point: CGPoint) {
         pendingMouseDown?.cancel()
-        let task = schedule(after: timing.warpToClickDelayMs) { [weak self] in
+        let elapsed = scheduler.now.uptimeNanoseconds >= contactStartedAt ?
+            Int((scheduler.now.uptimeNanoseconds - contactStartedAt) / 1_000_000) : 0
+        let delay = options.mode == .scroll ? max(timing.warpToClickDelayMs, options.holdDurationMs - elapsed) : timing.warpToClickDelayMs
+        let task = schedule(after: delay) { [weak self] in
             self?.postMouseDownIfNeeded(generation: generation, at: point)
         }
         // Zero-delay scheduling runs inline; it may have completed this phase already.
@@ -567,7 +658,7 @@ public final class GestureController {
     }
 
     private func postMouseDownIfNeeded(generation: UInt64, at point: CGPoint) {
-        guard self.generation == generation, phase == .tracking,
+        guard self.generation == generation, phase == .tracking, !isScrolling,
               case .singleTouch(var context) = state else {
             return
         }
@@ -580,7 +671,14 @@ public final class GestureController {
         }
 
         pendingMouseDown = nil
+        let permit = captureDoubleClickPermit()
+        guard self.generation == generation, phase == .tracking, let mapper = mapperProvider() else { return }
+        clickCount = doubleClicks.begin(at: point, timestamp: contactStartedAt, target: options.doubleClickEnabled ? clickTarget : nil,
+            mapper: mapper, interval: doubleClickInterval(), inputPermit: permit)
         let result = performInput {
+            if let counting = inputSink as? ClickCountSyntheticInputSink {
+                return counting.tryPostMouseDown(at: point, clickCount: clickCount)
+            }
             if let reporting = inputSink as? ReportingSyntheticInputSink {
                 return reporting.tryPostMouseDown(at: point)
             }
@@ -591,6 +689,7 @@ public final class GestureController {
             abortFailedMouseDown(contactID: context.contactID)
             return
         }
+        performanceMetrics?.record("hidToMouseDownPost", from: contactStartedAt, to: scheduler.now.uptimeNanoseconds)
         context.isMouseDownPosted = true
         state = .singleTouch(context)
         finishDeferredInput()
@@ -656,6 +755,7 @@ public final class GestureController {
     }
 
     private func abortFailedMouseDown(contactID: Int) {
+        doubleClicks.reset()
         invalidateInputSession()
         // No poster was invoked, so no release is owed. Block reentry until cursor
         // cleanup finishes, discard focus eligibility, and quarantine the contact.
@@ -697,6 +797,12 @@ public final class GestureController {
             DriverLoggers.log(.fault, category: .gesture, "Synthetic mouse release was not invoked; retaining unresolved release ownership without a cursor warp.")
             return false
         }
+        if let contactReleasedAt {
+            performanceMetrics?.record("hidUpToMouseUpPost", from: contactReleasedAt, to: scheduler.now.uptimeNanoseconds)
+        }
+        doubleClicks.completed(at: point, timestamp: contactReleasedAt ?? scheduler.now.uptimeNanoseconds,
+            interval: doubleClickInterval(), dragged: context.hasMoved,
+            posted: !cancellationRequested && contactReleasedAt != nil)
         context.isMouseDownPosted = false
         state = .singleTouch(context)
         return true

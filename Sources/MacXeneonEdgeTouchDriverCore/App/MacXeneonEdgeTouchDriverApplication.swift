@@ -11,6 +11,7 @@ struct DriverMonitoringHooks {
 /// Production application wiring for the Xeneon Edge single-touch driver.
 public final class MacXeneonEdgeTouchDriverApplication {
     private let configuration: DriverConfiguration
+    private let performanceMetrics: DriverPerformanceMetrics?
     private let displayResolver: DisplayResolver
     private let mapperStore = CoordinateMapperStore()
     private let gestureQueue: DispatchQueue
@@ -32,7 +33,9 @@ public final class MacXeneonEdgeTouchDriverApplication {
             returnCursorToPreviousPosition: configuration.cursor.returnToPreviousPosition,
             timing: GestureTiming(configuration: configuration.timing),
             scheduler: scheduler,
-            targetPreparer: targetPreparer
+            targetPreparer: targetPreparer,
+            options: GestureOptions(configuration: configuration.gesture),
+            performanceMetrics: performanceMetrics
         )
         controller.onInputSessionEnded = { [weak self] session in
             self?.inputSessionEnded(session)
@@ -64,7 +67,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
             self?.handleDeviceMatched()
         },
         observationHandler: { [weak self] observation, fence in
-            self?.handleTouchObservation(observation, fence: fence)
+            self?.handleRawTouchObservation(observation, fence: fence)
         },
         sourceRemovalHandler: { [weak self] sourceID in
             self?.handleSourceRemoval(sourceID)
@@ -116,6 +119,29 @@ public final class MacXeneonEdgeTouchDriverApplication {
     private var replayingContact: PendingContact?
     private var drainingPendingContacts = false
     private var sourceContacts: [HIDSourceID: SourceContact] = [:]
+    private final class FilteredStream {
+        var filter = TouchStreamFilter()
+        let fence: HIDSourceRetirementFence
+        var task: GestureScheduledTask?
+        var scheduledDeadline: UInt64?
+        var generation: UInt64 = 0
+        init(fence: HIDSourceRetirementFence) { self.fence = fence }
+        func cancelTimer() {
+            generation &+= 1
+            task?.cancel()
+            task = nil
+            scheduledDeadline = nil
+        }
+    }
+    private var filteredStreams: [HIDSourceID: FilteredStream] = [:]
+    private struct BufferedMove {
+        let observation: HIDTouchObservation
+        let fence: HIDSourceRetirementFence
+        let session: GestureInputSession
+    }
+    private var bufferedMove: BufferedMove?
+    private var moveFlushTask: GestureScheduledTask?
+    private var moveFlushGeneration: UInt64 = 0
     private var resynchronizeNewSources = false
     private var inputLease: InputLease?
     private var normalizedSequence: UInt64 = 0
@@ -223,12 +249,13 @@ public final class MacXeneonEdgeTouchDriverApplication {
         targetFactory: (DispatchQueue) -> TouchTargetPreparing = { _ in NoOpTouchTargetPreparer() },
         capturePendingInputPermit: @escaping () -> PhysicalInputGuard.Permit = { PhysicalInputGuard.system.capture() }
     ) {
-        let gestureQueue = gestureQueue ?? DispatchQueue(label: "\(DriverLoggers.subsystem).gesture-queue")
+        let gestureQueue = gestureQueue ?? DispatchQueue(label: "\(DriverLoggers.subsystem).gesture-queue", qos: .default)
         self.gestureQueue = gestureQueue
         self.startupDependencies = startupDependencies
         self.monitoringOverride = monitoringOverride
         self.scheduler = scheduler ?? DispatchGestureScheduler(queue: gestureQueue)
         self.configuration = configuration
+        self.performanceMetrics = configuration.diagnostics.performanceMetricsEnabled ? DriverPerformanceMetrics() : nil
         self.displayResolver = displayResolver
         self.inputSink = inputSink
         self.cursorController = cursorController
@@ -236,6 +263,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
         self.capturePendingInputPermit = capturePendingInputPermit
         self.focusRestorer = configuration.focus.restorePreviousWindow ? focusFactory(gestureQueue) : NoOpFocusRestorer()
         (self.focusRestorer as? AXFocusRestorer)?.bindCallbackQueue(gestureQueue)
+        (self.focusRestorer as? AXFocusRestorer)?.setPerformanceMetrics(performanceMetrics)
     }
 
     deinit {
@@ -253,6 +281,8 @@ public final class MacXeneonEdgeTouchDriverApplication {
         focusRestorer.shutdown()
     }
 
+    func performanceSnapshot() -> DriverPerformanceMetrics.Snapshot? { performanceMetrics?.snapshot() }
+
     /// Starts one driver lifecycle on the main thread, waiting for permission if needed.
     public func run() -> Int32 {
         precondition(Thread.isMainThread, "Driver lifecycle must run on the main thread.")
@@ -269,7 +299,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
         return withExtendedLifetime(self) {
             // Waiting, startup failure, and normal exit all invalidate focus,
             // even when the coordinator never acquired hardware.
-            defer { shutdownFocus() }
+            defer { shutdownFocus(); performanceMetrics?.logSummary() }
             return startupCoordinator!.run()
         }
     }
@@ -400,6 +430,139 @@ public final class MacXeneonEdgeTouchDriverApplication {
         if event.kind == .up, normalizedOrigins[event.contactID] == origin {
             normalizedOrigins.removeValue(forKey: event.contactID)
         }
+    }
+
+    /// Raw reports are validated before gesture ownership and liveness admission.
+    func handleRawTouchObservation(_ observation: HIDTouchObservation, fence: HIDSourceRetirementFence) {
+        guard observation.sourceID == fence.sourceID, !fence.isRetired,
+              observation.rawX != nil, observation.rawY != nil else { return }
+        let source = observation.sourceID
+        let now = scheduler.now.uptimeNanoseconds
+        performanceMetrics?.record("rawReportQueueDelay", from: observation.timestamp.uptimeNanoseconds, to: now)
+        guard observation.timestamp.uptimeNanoseconds <= now,
+              now - observation.timestamp.uptimeNanoseconds <= 120_000_000 else { return }
+        // Recovery after an interrupted disconnect still needs actual release or
+        // the separately certified power-reset/cache path. Filtering cannot grant it.
+        if sourceContacts[source]?.needsRelease ?? resynchronizeNewSources {
+            guard !observation.isPressed else { return }
+            sourceContacts[source] = SourceContact(epoch: 0, isPressed: false, isClosed: false,
+                                                    isRejected: false, needsRelease: false)
+            return
+        }
+        let stream: FilteredStream
+        if let existing = filteredStreams[source] { stream = existing }
+        else {
+            guard filteredStreams.count < 7 else { return }
+            stream = FilteredStream(fence: fence)
+            filteredStreams[source] = stream
+        }
+        let expiration = stream.filter.advance(to: now)
+        let result = stream.filter.process(observation)
+        deliverFiltered(expiration, stream: stream)
+        guard filteredStreams[source] === stream, !fence.isRetired else { return }
+        deliverFiltered(result, stream: stream)
+        updateFilterTimer(stream)
+    }
+
+    private func deliverFiltered(_ result: TouchStreamFilter.Result, stream: FilteredStream) {
+        let source = stream.fence.sourceID
+        guard filteredStreams[source] === stream, !stream.fence.isRetired else { return }
+        if result.cancelContact {
+            pendingContacts.removeAll {
+                if case .hid(let contact) = $0.origin { return contact.sourceID == source }
+                return false
+            }
+            sourceContacts[source]?.isRejected = true
+            if let lease = inputLease, lease.mode == .pressed,
+               case .hid(let contact) = lease.origin, contact.sourceID == source {
+                cancelActiveGesture()
+            }
+        }
+        if result.enteredStorm {
+            DriverLoggers.log(.warning, category: .hid, "Inconsistent touch reports; filtering the affected USB stream.")
+        } else if result.recoveredFromStorm {
+            DriverLoggers.log(.notice, category: .hid, "Touch report stream is quiet; normal validation resumed.")
+        }
+        for observation in result.observations {
+            guard filteredStreams[source] === stream, !stream.fence.isRetired else { return }
+            deliverValidatedObservation(observation, fence: stream.fence)
+        }
+    }
+
+    private func deliverValidatedObservation(_ observation: HIDTouchObservation,
+                                             fence: HIDSourceRetirementFence) {
+        let origin = InputOrigin.hid(HIDContact(sourceID: observation.sourceID, epoch: observation.contactEpoch))
+        if observation.event?.kind == .move, configuration.gesture.mode == .direct,
+           let lease = inputLease, lease.origin == origin, lease.mode == .pressed,
+           case .singleTouch(let context) = gestureController.state,
+           context.isMouseDownPosted, context.hasMoved {
+            // Validate every raw report and deliver the first drag immediately.
+            // Only later motion can be replaced by a newer point in this session.
+            if bufferedMove != nil { performanceMetrics?.increment("coalescedMoves") }
+            bufferedMove = BufferedMove(observation: observation, fence: fence, session: lease.session)
+            renewPressedWatchdog(origin: origin)
+            if moveFlushTask == nil {
+                moveFlushGeneration &+= 1
+                let generation = moveFlushGeneration
+                let task = scheduler.schedule(afterMilliseconds: 1) { [weak self] in
+                    guard let self, self.moveFlushGeneration == generation else { return }
+                    self.flushBufferedMove()
+                }
+                if moveFlushGeneration == generation, bufferedMove != nil { moveFlushTask = task }
+                else { task.cancel() }
+            }
+            return
+        }
+        if observation.event?.kind == .up, bufferedMove?.observation.sourceID == observation.sourceID,
+           bufferedMove?.observation.contactEpoch == observation.contactEpoch {
+            // The final accepted drag point precedes its release even when both
+            // reports were queued before the deferred motion task.
+            flushBufferedMove()
+        }
+        handleTouchObservation(observation, fence: fence)
+    }
+
+    private func discardBufferedMove() {
+        moveFlushGeneration &+= 1
+        moveFlushTask?.cancel()
+        moveFlushTask = nil
+        bufferedMove = nil
+    }
+
+    private func flushBufferedMove() {
+        let pending = bufferedMove
+        discardBufferedMove()
+        guard let pending, !pending.fence.isRetired,
+              let lease = inputLease, lease.session == pending.session, lease.mode == .pressed,
+              gestureController.acceptsHeartbeat(for: pending.session) else { return }
+        handleTouchObservation(pending.observation, fence: pending.fence)
+    }
+
+    private func updateFilterTimer(_ stream: FilteredStream) {
+        let source = stream.fence.sourceID
+        guard filteredStreams[source] === stream, !stream.fence.isRetired else { return }
+        guard let next = stream.filter.nextDeadline else {
+            stream.cancelTimer()
+            return
+        }
+        // Report-rate activity updates the filter's deadline, not the task. Only
+        // a newly acquired track with an earlier deadline needs a replacement.
+        if let pending = stream.scheduledDeadline, stream.task != nil, pending <= next { return }
+        stream.cancelTimer()
+        let generation = stream.generation
+        stream.scheduledDeadline = next
+        let task = scheduler.schedule(at: DispatchTime(uptimeNanoseconds: next)) { [weak self, weak stream] in
+            guard let self, let stream, self.filteredStreams[source] === stream,
+                  stream.generation == generation, !stream.fence.isRetired else { return }
+            stream.task = nil
+            stream.scheduledDeadline = nil
+            let result = stream.filter.advance(to: self.scheduler.now.uptimeNanoseconds)
+            self.deliverFiltered(result, stream: stream)
+            self.updateFilterTimer(stream)
+        }
+        if filteredStreams[source] === stream, stream.generation == generation,
+           stream.scheduledDeadline == next { stream.task = task }
+        else { task.cancel() }
     }
 
     /// One ordered queue operation for both normalized effects and liveness.
@@ -603,6 +766,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
 
     private func inputSessionInvalidated(_ session: GestureInputSession) {
         guard inputLease?.session == session else { return }
+        discardBufferedMove()
         inputLease = nil
         cancelStuckGestureTimer()
     }
@@ -637,6 +801,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
     }
 
     func handleSourceRemoval(_ sourceID: HIDSourceID) {
+        filteredStreams.removeValue(forKey: sourceID)?.cancelTimer()
         pendingContacts.removeAll {
             if case .hid(let contact) = $0.origin { return contact.sourceID == sourceID }
             return false
@@ -659,6 +824,8 @@ public final class MacXeneonEdgeTouchDriverApplication {
     /// Called only after main-thread ingress has retired every registration.
     /// Preserve interrupted-hold recovery across a stop/start of this instance.
     func handleHIDStop() {
+        filteredStreams.values.forEach { $0.cancelTimer() }
+        filteredStreams.removeAll()
         if let lease = inputLease, lease.mode == .pressed, case .hid = lease.origin {
             resynchronizeNewSources = true
         }
@@ -670,6 +837,7 @@ public final class MacXeneonEdgeTouchDriverApplication {
     /// Gesture teardown shared by stop, owner removal, and display loss.
     /// Called on the gesture queue in production; tests can exercise it without starting HID.
     func cancelActiveGesture() {
+        discardBufferedMove()
         clearPendingContacts()
         inputLease = nil
         cancelStuckGestureTimer()

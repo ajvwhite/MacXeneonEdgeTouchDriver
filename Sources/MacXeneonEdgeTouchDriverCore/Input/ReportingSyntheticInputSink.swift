@@ -20,3 +20,9 @@ public protocol ReportingSyntheticInputSink: SyntheticInputSink {
     func tryPostMouseUp(at point: CGPoint) -> SyntheticInputResult
     func tryPostMouseDragged(to point: CGPoint) -> SyntheticInputResult
 }
+
+
+/// Adds click counts without weakening the reserved-release contract.
+public protocol ClickCountSyntheticInputSink: ReportingSyntheticInputSink {
+    func tryPostMouseDown(at point: CGPoint, clickCount: Int) -> SyntheticInputResult
+}

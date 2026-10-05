@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import HIDDumpSupport
+import MacXeneonEdgeTouchDriverCore
 import IOKit
 import IOKit.hid
 import IOKit.hidsystem
@@ -40,14 +41,24 @@ private final class HIDDumpApplication {
     private var isRunning = false
     private var valueEventCount = 0
     private var rawReportCount = 0
+    private var recordHandle: FileHandle?
+    private var recordingFailed = false
+    private let recordPath: String?
 
-    init() {
+    init(recordPath: String? = nil) {
+        self.recordPath = recordPath
         self.manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
     }
 
     func run() -> Int32 {
         precondition(Thread.isMainThread, "HIDDump must run on the main thread.")
         setbuf(stdout, nil)
+        if let recordPath {
+            let fd = Darwin.open(recordPath, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o600))
+            guard fd >= 0 else { fputs("Cannot create recording; choose a new file path.\n", stderr); return EXIT_FAILURE }
+            recordHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        }
+        defer { try? recordHandle?.close() }
         printHeader()
 
         let matching: [String: Any] = [
@@ -77,11 +88,11 @@ private final class HIDDumpApplication {
         registerCurrentlyMatchedDevices()
 
         print("Listening in non-seize mode. Press Ctrl+C to quit.")
-        print("Capture one-finger, two-finger, and three-finger interactions for the section 3.4 gate.")
+        print("Try one-, two- and three-finger touches to compare report formats.")
         print(String(repeating: "-", count: 88))
 
         CFRunLoopRun()
-        return EXIT_SUCCESS
+        return recordingFailed ? EXIT_FAILURE : EXIT_SUCCESS
     }
 
     fileprivate func handleDeviceMatched(_ device: IOHIDDevice) {
@@ -93,7 +104,7 @@ private final class HIDDumpApplication {
             device: device,
             length: maxInputReportLength(for: device),
             receive: { [weak self] type, reportID, bytes in
-                self?.handleInputReport(type: type, reportID: reportID, bytes: bytes)
+                self?.handleInputReport(device: device, type: type, reportID: reportID, bytes: bytes)
             }
         )
         reportRegistrations.append(registration)
@@ -117,7 +128,7 @@ private final class HIDDumpApplication {
     fileprivate func handleDeviceRemoved(_ device: IOHIDDevice) {
         guard isRunning else { return }
         let removed = reportRegistrations.filter { $0.matches(device) }
-        removed.forEach { $0.input.invalidate() }
+        removed.forEach { record(device: $0.device, kind: .removal, reportID: 0, bytes: []); $0.input.invalidate() }
         // IOKit can still own the device at removal. Keep its allocation alive
         // until input is unscheduled and this exact callback token is removed.
         removed.forEach {
@@ -161,12 +172,16 @@ private final class HIDDumpApplication {
     }
 
     fileprivate func handleInputReport(
+        device: IOHIDDevice,
         type: IOHIDReportType,
         reportID: UInt32,
         bytes: [UInt8]
     ) {
         guard isRunning else { return }
         rawReportCount += 1
+        if type == kIOHIDReportTypeInput {
+            record(device: device, kind: .report, reportID: reportID, bytes: bytes)
+        }
 
         let hexBytes = bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
 
@@ -179,6 +194,26 @@ private final class HIDDumpApplication {
                 "bytes=\(hexBytes)"
             ].joined(separator: " | ")
         )
+    }
+
+    private func record(device: IOHIDDevice, kind: HIDReportTraceRecord.Kind, reportID: UInt32, bytes: [UInt8]) {
+        guard let handle = recordHandle, !recordingFailed else { return }
+        var source: UInt64 = 0
+        guard IORegistryEntryGetRegistryEntryID(IOHIDDeviceGetService(device), &source) == KERN_SUCCESS,
+              source != 0 else { recordingFailed = true; CFRunLoopStop(CFRunLoopGetMain()); return }
+        do {
+            let record = HIDReportTraceRecord(kind: kind, sourceID: source,
+                timestampNanoseconds: DispatchTime.now().uptimeNanoseconds, reportID: reportID, bytes: bytes,
+                wallClockMilliseconds: UInt64(Date().timeIntervalSince1970 * 1000),
+                controllerLocationID: (IOHIDDeviceGetProperty(device, kIOHIDLocationIDKey as CFString) as? NSNumber)?.uint32Value)
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+            try handle.write(contentsOf: encoder.encode(record))
+            try handle.write(contentsOf: Data([10]))
+        } catch {
+            recordingFailed = true
+            fputs("Recording failed; capture stopped: \(error)\n", stderr)
+            CFRunLoopStop(CFRunLoopGetMain())
+        }
     }
 
     fileprivate func acceptsManagerSender(_ sender: UnsafeMutableRawPointer?) -> Bool {
@@ -406,4 +441,8 @@ if CommandLine.arguments.dropFirst().elementsEqual(["--describe-input-cache"]) {
 if CommandLine.arguments.dropFirst().elementsEqual(["--describe-input-cache", "--open"]) {
     exit(describeInputCache(openDevice: true))
 }
-exit(HIDDumpApplication().run())
+let args = Array(CommandLine.arguments.dropFirst())
+if args.isEmpty { exit(HIDDumpApplication().run()) }
+if args.count == 2, args[0] == "--record" { exit(HIDDumpApplication(recordPath: args[1]).run()) }
+fputs("Usage: HIDDump [--record new-file.jsonl | --describe-input-cache [--open]]\n", stderr)
+exit(EX_USAGE)

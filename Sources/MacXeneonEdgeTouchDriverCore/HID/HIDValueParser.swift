@@ -35,7 +35,9 @@ public final class HIDValueParser {
         }
         return HIDTouchObservation(
             sourceID: sourceID, contactEpoch: parsed.contactEpoch,
-            isPressed: parsed.isPressed, timestamp: timestamp, event: parsed.event
+            isPressed: parsed.isPressed, timestamp: timestamp, event: parsed.event,
+            rawX: Int(bytes[2]) | (Int(bytes[3]) << 8),
+            rawY: Int(bytes[4]) | (Int(bytes[5]) << 8)
         )
     }
 

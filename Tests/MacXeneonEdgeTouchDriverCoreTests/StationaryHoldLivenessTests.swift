@@ -1745,6 +1745,7 @@ private final class HoldFixture {
     let application: MacXeneonEdgeTouchDriverApplication
     var observations: [HoldEnvelope] = []
     var deliverObservations = true
+    var useRawFiltering = false
     private var sources: [HoldSource] = []
     var normalizedKinds: [TouchEvent.Kind] { observations.compactMap { $0.observation.event?.kind } }
 
@@ -1778,7 +1779,8 @@ private final class HoldFixture {
             envelope.observation, fence: envelope.fence,
             touchEventHandler: { _ in XCTFail("Production observation delivery must not also use the legacy event callback") },
             observationHandler: { observation, fence in
-                self.application.handleTouchObservation(observation, fence: fence)
+                if self.useRawFiltering { self.application.handleRawTouchObservation(observation, fence: fence) }
+                else { self.application.handleTouchObservation(observation, fence: fence) }
             })
     }
 
@@ -1963,5 +1965,148 @@ private final class HoldInlineReplayScheduler: GestureScheduler {
     func replayEveryActionIncludingCancelled() {
         let snapshot = tasks
         for task in snapshot { task.action() }
+    }
+}
+
+
+extension StationaryHoldLivenessTests {
+    func testProductionFilterExpiryReleasesWithoutAnotherReport() {
+        onMain {
+            let f = HoldFixture()
+            f.useRawFiltering = true
+            let source = f.makeSource()
+            source.pressed(at: f.clock.now, x: 5000, y: 3000)
+            f.clock.advance(toMilliseconds: 1)
+            source.pressed(at: f.clock.now, x: 16000, y: 9000)
+            for t: UInt64 in [20, 28, 36, 44] {
+                f.clock.advance(toMilliseconds: t)
+                source.pressed(at: f.clock.now, x: 5000, y: 3000)
+            }
+            XCTAssertEqual(f.effects.downs.count, 1)
+            f.clock.advance(toMilliseconds: 163)
+            XCTAssertTrue(f.effects.ups.isEmpty)
+            f.clock.advance(toMilliseconds: 164)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            XCTAssertEqual(f.effects.releases, [true])
+            XCTAssertTrue(f.effects.restores.isEmpty)
+            f.clock.advance(toMilliseconds: 3000)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testProductionFilterNoiseCannotRenewExpiredDrag() {
+        onMain {
+            let f = HoldFixture(); f.useRawFiltering = true
+            let source = f.makeSource()
+            source.pressed(at: f.clock.now, x: 5000, y: 3000)
+            f.clock.advance(toMilliseconds: 1)
+            source.pressed(at: f.clock.now, x: 16000, y: 9000)
+            for t: UInt64 in [20, 28, 36, 44] {
+                f.clock.advance(toMilliseconds: t)
+                source.pressed(at: f.clock.now, x: 5000, y: 3000)
+            }
+            for t: UInt64 in [60, 90, 120, 150] {
+                f.clock.advance(toMilliseconds: t)
+                source.released(at: f.clock.now, x: 16000, y: 9000)
+            }
+            f.clock.advance(toMilliseconds: 164)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testProductionFilterStationaryReportsKeepNormalHoldAlive() {
+        onMain {
+            let f = HoldFixture(); f.useRawFiltering = true
+            let source = f.makeSource()
+            for t: UInt64 in stride(from: 0, through: 3000, by: 8) {
+                f.clock.advance(toMilliseconds: t)
+                source.pressed(at: f.clock.now, x: 5000, y: 3000)
+            }
+            XCTAssertEqual(f.effects.downs.count, 1)
+            XCTAssertTrue(f.effects.drags.isEmpty)
+            XCTAssertTrue(f.effects.ups.isEmpty)
+            source.released(at: f.clock.now, x: 5000, y: 3000)
+            // Equal receipt timestamps are stale; provide a fresh release.
+            f.clock.advance(toMilliseconds: 3008)
+            source.released(at: f.clock.now, x: 5000, y: 3000)
+            f.clock.advance(toMilliseconds: 3050)
+            XCTAssertEqual(f.effects.ups.count, 1)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testProductionFilterRemovalCannotRunCancelledTrackTimer() {
+        onMain {
+            let f = HoldFixture(); f.useRawFiltering = true
+            let source = f.makeSource()
+            source.pressed(at: f.clock.now, x: 5000, y: 3000)
+            f.clock.advance(toMilliseconds: 1)
+            source.pressed(at: f.clock.now, x: 16000, y: 9000)
+            for t: UInt64 in [20, 28, 36, 44] {
+                f.clock.advance(toMilliseconds: t)
+                source.pressed(at: f.clock.now, x: 5000, y: 3000)
+            }
+            f.application.handleSourceRemoval(source.registration.sourceID)
+            let terminal = f.effects.events
+            f.clock.advance(toMilliseconds: 3000)
+            XCTAssertEqual(f.effects.events, terminal)
+            f.effects.assertBalanced()
+        }
+    }
+}
+
+extension StationaryHoldLivenessTests {
+    func testValidatedBacklogKeepsFirstDragAndFinalPointBeforeRelease() {
+        onMain {
+            let f = HoldFixture(); f.useRawFiltering = true
+            let source = f.makeSource()
+            f.clock.advance(toMilliseconds: 100)
+            for (time, x): (UInt64, Int) in [(0, 5000), (8, 5000), (24, 5100), (32, 5200), (40, 5300)] {
+                source.pressed(at: DispatchTime(uptimeNanoseconds: time * 1_000_000), x: x, y: 3000)
+            }
+            XCTAssertEqual(f.effects.drags, [f.point(5100, 3000)])
+            source.released(at: DispatchTime(uptimeNanoseconds: 48_000_000), x: 5300, y: 3000)
+            XCTAssertEqual(f.effects.drags, [f.point(5100, 3000), f.point(5300, 3000)])
+            XCTAssertEqual(f.effects.ups.count, 1)
+            let terminal = f.effects.events
+            f.clock.advance(toMilliseconds: 3000)
+            XCTAssertEqual(f.effects.events, terminal, "A canceled flush must not replay after release")
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testValidatedMoveFlushUsesNewestPointWhileContactRemainsHeld() {
+        onMain {
+            let f = HoldFixture(); f.useRawFiltering = true
+            let source = f.makeSource()
+            f.clock.advance(toMilliseconds: 100)
+            for (time, x): (UInt64, Int) in [(0, 5000), (8, 5000), (24, 5100), (32, 5200), (40, 5300)] {
+                source.pressed(at: DispatchTime(uptimeNanoseconds: time * 1_000_000), x: x, y: 3000)
+            }
+            f.clock.advance(toMilliseconds: 101)
+            XCTAssertEqual(f.effects.drags, [f.point(5100, 3000), f.point(5300, 3000)])
+            source.released(at: f.clock.now, x: 5300, y: 3000)
+            f.effects.assertBalanced()
+        }
+    }
+
+    func testRemovedOwnerCannotPostBufferedMotionFromCanceledTask() {
+        onMain {
+            let f = HoldFixture(); f.useRawFiltering = true
+            let source = f.makeSource()
+            f.clock.advance(toMilliseconds: 100)
+            for (time, x): (UInt64, Int) in [(0, 5000), (8, 5000), (24, 5100), (32, 5200)] {
+                source.pressed(at: DispatchTime(uptimeNanoseconds: time * 1_000_000), x: x, y: 3000)
+            }
+            XCTAssertEqual(f.effects.drags.count, 1)
+            source.registration.invalidate()
+            f.application.handleSourceRemoval(source.registration.sourceID)
+            let terminal = f.effects.events
+            f.clock.advance(toMilliseconds: 3000)
+            XCTAssertEqual(f.effects.events, terminal)
+            f.effects.assertBalanced()
+        }
     }
 }

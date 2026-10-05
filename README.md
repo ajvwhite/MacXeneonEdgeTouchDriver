@@ -44,7 +44,7 @@ Before replacing files, the installer saves a backup under `~/Library/Applicatio
 
 If installation fails after replacement starts, the installer tries to stop the replacement, restore the previous files and reload the previous LaunchAgent. If it cannot safely determine which job is running, stop it, or restore its files, it stops recovery and reports the backup location. Check the error before trying again.
 
-Replacing files and reloading the driver happen in separate steps. A power loss or forced stop can interrupt them and leave the installer lock in place. Check the running driver and backups before removing a stale lock. The lock prevents two copies of this installer running together; it cannot prevent another tool from changing the files. Recovery uses the saved files, so it cannot recover unsaved changes to launchd's loaded configuration. Existing launchd enable/disable settings are kept. After installation, check the log and try a touch: launchd accepting the job does not prove the driver is working.
+Replacing files and reloading the driver happen in separate steps. A power loss or forced stop can interrupt them and leave the installer lock in place. Check the running driver and backups before removing a stale lock. The lock prevents two copies of this installer running together; it cannot prevent another tool from changing the files. Recovery uses the saved files, so it cannot recover unsaved changes to launchd's loaded configuration. Existing launchd enable/disable settings are kept. The LaunchAgent uses Interactive process scheduling to avoid macOS background timer delays. After installation, check the log and try a touch: launchd accepting the job does not prove the driver is working.
 
 Uninstall:
 
@@ -145,11 +145,17 @@ All fields are optional. Missing or malformed config falls back to defaults and 
     "returnToPreviousPosition": true
   },
   "gesture": {
-    "multiTouchEnabled": false
+    "multiTouchEnabled": false,
+    "mode": "direct",
+    "holdDurationMs": 300,
+    "scrollThresholdPx": 6,
+    "scrollSensitivity": 1.0,
+    "doubleClickEnabled": true
   },
   "diagnostics": {
     "fileLogPath": "~/Library/Logs/MacXeneonEdgeTouchDriver/driver.log",
-    "fileLogMaxBytes": 5242880
+    "fileLogMaxBytes": 5242880,
+    "performanceMetricsEnabled": false
   }
 }
 ```
@@ -160,7 +166,7 @@ If several displays match equally well, the driver pauses touch input rather tha
 
 `focus.restorePreviousWindow` defaults to `true`. The driver remembers the window and text field you were using before a touch and tries to return focus there afterward. Set it to `false` to leave the touched app active.
 
-With either setting, the driver first checks that the window under your finger is ready to receive a click. This lets the first tap work on an inactive window. It allows 150 ms to prepare the window and holds up to 256 movement/release events while waiting. If it cannot confirm the target in time, it drops that touch. The configured click delays follow this check. A slow macOS request can take longer than the scheduled limit.
+With either setting, the driver first checks that the window under your finger is ready to receive a click. This lets the first tap work on an inactive window. It allows 30 ms to prepare the window and holds up to 256 movement/release events while waiting. If it cannot confirm the target in time, it drops that touch. The configured click delays follow this check. A slow macOS request can take longer than the scheduled limit.
 
 Focus returns after the mouse button is released and cursor cleanup finishes. The driver checks the saved window and field before asking the app to restore focus. If a text field was captured but is no longer available, it leaves focus alone. Floating panels, such as a virtual Stream Deck, can receive a tap without needing a text field of their own. The driver can reactivate the original app once before restoring its field.
 
@@ -177,7 +183,21 @@ Clicking the mouse, typing or scrolling cancels further focus restoration. New t
 
 The window readiness check applies with either focus setting. Restart the driver after changing the configuration.
 
-`gesture.multiTouchEnabled` is always forced to `false` because the hardware reports one touch at a time.
+### Tap, drag and scroll
+
+The default `gesture.mode`, `"direct"`, keeps the existing behavior: tap to click, or move a held finger to drag.
+
+Set `gesture.mode` to `"scroll"` to scroll with one finger. A quick tap still clicks. Movement beyond `scrollThresholdPx` scrolls the page; hold still for `holdDurationMs` before moving to drag instead. Increase `scrollSensitivity` for more scrolling per movement. Scrolling does not hold a mouse button down.
+
+Two nearby taps can produce a double-click when they hit the same confirmed window within macOS's double-click interval. A drag, failed click, changed display mapping or intervening mouse/keyboard input breaks the pair. Set `doubleClickEnabled` to `false` for separate clicks.
+
+The touch reports currently handled by this driver contain one position. Two-finger scrolling and other multi-contact gestures remain unsupported. `gesture.multiTouchEnabled` is forced to `false`; an unsupported mode logs a warning and keeps direct touch behavior. It does not silently switch to single-finger scrolling.
+
+### Inconsistent touch reports
+
+The driver checks consecutive reports before accepting a new touch. When a stream starts jumping between unrelated positions, it releases the affected gesture and looks for a consistent track. A deliberate touch can continue while unrelated reports arrive, provided the track remains clear. Noise alone cannot extend a held gesture indefinitely: a track that loses support for 120 ms is released. A quiet stream returns to normal validation automatically.
+
+Every report is checked, including reports that do not move the finger. During an established drag, queued movement can skip intermediate positions and use the latest accepted point. The first drag movement and final point before release are preserved. Scrolling keeps each accepted direction change.
 
 ## Held touches and USB reconnect
 
@@ -209,7 +229,7 @@ Run `MacXeneonEdgeTouchDriver --check-permissions` for a JSON snapshot without o
 - If touch reports stop, `timing.stuckGestureTimeoutMs` releases the gesture. Lift and touch again to continue.
 - Apps must expose their windows and text fields through macOS Accessibility for focus restoration to work. Mouse clicks, typing and scrolling cancel further restoration, but a request already sent to an app may still finish afterward.
 - With cursor return enabled, moving the mouse during a touch does not change the saved return position. With it disabled, the cursor stays where it is after cleanup.
-- The hardware reports one touch at a time, so multi-contact gestures are unsupported.
+- The supported report format contains one position, so multi-contact gestures are unsupported.
 - Killing the process with `SIGKILL` prevents normal cleanup. Restarting the driver or moving the mouse after cursor control is restored may be needed.
 
 ## Troubleshooting
@@ -230,8 +250,27 @@ XENEON_RUN_HARDWARE_TESTS=1 swift test --filter HIDRecoveryHardwareTests
 This check uses the production cached-release reader, requires already-granted Input Monitoring, and closes its non-seize HID manager before returning. It posts no input and requests no permissions. It checks descriptor support, coherent initialized neutral values and rejection of stale release evidence. It does not replace a physical reconnect test. Restart the installed service afterward. Ordinary test runs skip this hardware check.
 
 
+### Timing and report replay
+
+Set `diagnostics.performanceMetricsEnabled` to `true` to write a timing summary when the driver stops normally. It reports counts and recent median, 95th and 99th percentile timings for queued reports, mouse-event posting and focus restoration. Canceled or unverified focus work is counted separately. The summary contains no typed text or touch coordinates. Event-posting times do not establish when an app received the click.
+
+For an offline check, run:
+
+```sh
+swift run -c release Benchmarks
+swift run -c release Benchmarks --timers
+swift run -c release Benchmarks --backlog
+swift run -c release Benchmarks --trace recording.jsonl
+```
+
+The default replay generates repeatable taps. `--backlog` simulates delayed drag reports to check movement coalescing and balanced button release. `--timers` measures queue wake delays without touch input. Trace replay uses the driver's parser and gesture handling with simulated mouse, cursor and focus effects. It cannot establish physical touch accuracy or native focus behavior.
+
+To record raw touch reports, stop the installed driver first, then run `swift run HIDDump --record recording.jsonl`. The destination must be a new file. Quit the recorder before restarting the driver. Recordings contain touch coordinates, timestamps and USB connection identifiers; review them before sharing. The recorder does not change USB modes or request new permission grants.
+
 ## Contributors
 
 Thanks to [Greg Thompson (`isleofgreg`)](https://github.com/isleofgreg) for the per-touch-down display refresh proposal and moved-display regression test in [PR #4](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/pull/4), which this driver adapts.
 
 Thanks to [Clark Hager](https://github.com/clarkhager) for the focus check proposed in [PR #5](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/pull/5). The driver keeps that check to avoid unnecessarily refocusing an already focused window.
+
+Thanks to [`mrnocreativity`](https://github.com/mrnocreativity) for the touch-stream validation and gesture proposals in [PR #3](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/pull/3). The noise tracking, double-click and optional scroll work follows those proposals with separate implementation and tests.
