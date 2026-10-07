@@ -189,7 +189,7 @@ The default `gesture.mode`, `"direct"`, keeps the existing behavior: tap to clic
 
 Set `gesture.mode` to `"scroll"` to scroll with one finger. A quick tap still clicks. Movement beyond `scrollThresholdPx` scrolls the page; hold still for `holdDurationMs` before moving to drag instead. Increase `scrollSensitivity` for more scrolling per movement. Scrolling does not hold a mouse button down.
 
-Two nearby taps can produce a double-click when they hit the same confirmed window within macOS's double-click interval. A drag, failed click, changed display mapping or intervening mouse/keyboard input breaks the pair. Set `doubleClickEnabled` to `false` for separate clicks.
+Two nearby taps can produce a double-click within macOS's double-click interval. Both taps must hit the same window. If macOS identifies the button or control, both taps must hit it; otherwise they must land almost on the same point. A drag, failed click, changed display mapping or intervening mouse/keyboard input breaks the pair. Set `doubleClickEnabled` to `false` for separate clicks.
 
 The touch reports currently handled by this driver contain one position. Two-finger scrolling and other multi-contact gestures remain unsupported. `gesture.multiTouchEnabled` is forced to `false`; an unsupported mode logs a warning and keeps direct touch behavior. It does not silently switch to single-finger scrolling.
 
@@ -215,13 +215,15 @@ The timeout uses one pending timer, updated by reports from the active touch. Bu
 
 ## Permission startup
 
-The driver needs Accessibility access to prepare windows for touch, even if focus restoration is disabled. It also checks permission to send mouse input and read the Edge's touch reports. If access is missing, it stays running and waits instead of repeatedly restarting. Grant access to the executable or launcher named in the log; startup then continues automatically.
+In System Settings > Privacy & Security, enable the driver under Device Control and Data Access and Input Monitoring. On macOS 26 and earlier, Device Control and Data Access is called Accessibility. The driver needs this access to prepare windows for touch, even if focus restoration is disabled. If access is missing, it stays running and waits; startup continues after approval.
 
-Startup requests permission at most once per process and checks again every two seconds without repeated prompts. You can stop the driver while it waits. Stopping cannot dismiss a permission dialog macOS has already shown. Apple's [Accessibility API documentation](https://developer.apple.com/documentation/applicationservices/1459186-axisprocesstrustedwithoptions) explains that the prompt does not grant access immediately. The [CoreGraphics request](https://developer.apple.com/documentation/coregraphics/cgrequestposteventaccess()) runs separately so it cannot hold up shutdown.
+Startup requests permission at most once per process and checks again every two seconds without repeated prompts. While waiting, it runs its read-only permission check in a short-lived process because macOS can keep an old answer in the running driver. Only one check runs at a time; a timeout or invalid answer cannot start touch input. You can stop the driver while it waits. Stopping cannot dismiss a permission dialog macOS has already shown. Apple's [Accessibility API documentation](https://developer.apple.com/documentation/applicationservices/1459186-axisprocesstrustedwithoptions) explains that the prompt does not grant access immediately. The [CoreGraphics request](https://developer.apple.com/documentation/coregraphics/cgrequestposteventaccess()) runs separately so it cannot hold up shutdown.
 
 If Input Monitoring is denied, the driver waits for a confirmed grant before opening the device again. An error such as `kIOReturnNotPermitted` starts that wait too. Other USB errors, including another process holding the device exclusively, still stop startup and are recorded in the log. This addresses the restart loop reported in [issue #1](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/issues/1). The driver does not change your permission settings.
 
-Run `MacXeneonEdgeTouchDriver --check-permissions` for a JSON snapshot without opening HID, requesting grants or posting input. Exit status is zero only when required synthetic/Accessibility access and HID listen access are already granted; otherwise it is 77.
+Run `MacXeneonEdgeTouchDriver --check-permissions` for a JSON snapshot without opening the touch device, requesting access or generating input. Exit status is zero only when device-control and Input Monitoring access are already granted; otherwise it is 77.
+
+An update or signing change may need a new permission approval. If the driver's entry is enabled but access is still denied, remove that entry and add the installed executable again. Do this only for the driver, in the affected permission category.
 
 ## Known Caveats
 

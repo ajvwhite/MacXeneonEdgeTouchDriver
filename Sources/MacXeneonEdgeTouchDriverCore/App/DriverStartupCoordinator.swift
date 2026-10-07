@@ -26,6 +26,7 @@ struct DriverStartupDependencies {
     let polling: PermissionPollScheduling
     let signals: StartupSignalHandling
     let runLoop: StartupRunLoop
+    var freshPermissionWorker: PermissionRequestWorking? = nil
 
     static var live: DriverStartupDependencies {
         DriverStartupDependencies(
@@ -33,7 +34,8 @@ struct DriverStartupDependencies {
             requestWorker: DispatchPermissionRequestWorker(),
             polling: DispatchPermissionPollScheduler(),
             signals: DispatchStartupSignals(),
-            runLoop: MainStartupRunLoop()
+            runLoop: MainStartupRunLoop(),
+            freshPermissionWorker: DispatchPermissionRequestWorker(label: "permission-check")
         )
     }
 }
@@ -48,14 +50,19 @@ final class DriverStartupCoordinator {
     private let dependencies: DriverStartupDependencies
     private let startHardware: () throws -> Void
     private let stopHardware: () -> Void
+    private let releaseFailedHardware: () -> Void
     private let log: (DriverLogLevel, String) -> Void
-    private let requestCancellation = StartupCancellation()
+    private var requestCancellation = StartupCancellation()
     private var poll: PermissionPollTask?
     private var generation: UInt64 = 0
     private var didAttemptHardware = false
     private var isStartingHardware = false
     private var waitingForHIDGrant = false
     private var lastSnapshot: SyntheticPermissionSnapshot?
+    private var freshSnapshot: SyntheticPermissionSnapshot?
+    private var freshCheckPending = false
+    private var freshCheckID: UInt64 = 0
+    private var requiresFreshHIDGrant = false
     private(set) var state: State = .idle
     private(set) var exitStatus: Int32 = EXIT_SUCCESS
 
@@ -63,11 +70,13 @@ final class DriverStartupCoordinator {
         dependencies: DriverStartupDependencies,
         startHardware: @escaping () throws -> Void,
         stopHardware: @escaping () -> Void,
+        releaseFailedHardware: (() -> Void)? = nil,
         log: @escaping (DriverLogLevel, String) -> Void = { DriverLoggers.log($0, category: .lifecycle, $1) }
     ) {
         self.dependencies = dependencies
         self.startHardware = startHardware
         self.stopHardware = stopHardware
+        self.releaseFailedHardware = releaseFailedHardware ?? stopHardware
         self.log = log
     }
 
@@ -131,10 +140,10 @@ final class DriverStartupCoordinator {
         finish(as: .stopped)
     }
 
-    private func checkReadiness(generation expectedGeneration: UInt64? = nil) {
+    private func checkReadiness(generation expectedGeneration: UInt64? = nil, allowFreshCheck: Bool = true) {
         guard state == .waitingForPermission,
               expectedGeneration == nil || expectedGeneration == generation else { return }
-        let snapshot = dependencies.permissions.snapshot()
+        let snapshot = freshSnapshot ?? dependencies.permissions.snapshot()
         // A dependency may deliver stop while a check is in progress.
         guard state == .waitingForPermission else { return }
         let snapshotChanged = snapshot != lastSnapshot
@@ -142,14 +151,16 @@ final class DriverStartupCoordinator {
             lastSnapshot = snapshot
             log(.notice, "Synthetic permission state: CG post-event access=\(snapshot.postEventAccess), AX trusted=\(snapshot.accessibilityTrusted), HID listen access=\(snapshot.hidInputAccess.rawValue).")
         }
-        guard snapshot.isReady, !waitingForHIDGrant || snapshot.hidInputAccess == .granted else {
+        guard snapshot.isReady, !waitingForHIDGrant || snapshot.hidInputAccess == .granted,
+              !requiresFreshHIDGrant else {
             if snapshot.hasRequiredSyntheticAccess {
                 if snapshotChanged || expectedGeneration == nil {
                     log(.notice, "Waiting for HID Input Monitoring access. Grant access to the executable or launcher; startup will continue automatically.")
                 }
             } else if snapshotChanged || expectedGeneration == nil {
-                log(.notice, "Waiting for synthetic event permission. Grant Accessibility to the executable or launcher; startup will continue automatically.")
+                log(.notice, "Waiting for synthetic event permission. Enable Device Control and Data Access (Accessibility on earlier macOS) for the executable or launcher; startup will continue automatically.")
             }
+            if allowFreshCheck { requestFreshSnapshot() }
             return
         }
 
@@ -172,11 +183,15 @@ final class DriverStartupCoordinator {
         case .failure(let error):
             if case HIDDeviceMonitorError.openFailed(kIOReturnNotPermitted) = error {
                 // Release any partial acquisition before waiting in this process.
-                // A positive HID preflight is required before another open attempt;
+                // A current HID permission grant is required before another open attempt;
                 // unknown/denied state never loops through permission prompts.
-                stopAttemptedHardware()
+                stopAttemptedHardware(finalStop: false)
                 guard state == .startingHardware else { return }
                 waitingForHIDGrant = true
+                requestCancellation = StartupCancellation()
+                freshSnapshot = nil
+                requiresFreshHIDGrant = dependencies.permissions.supportsFreshSnapshots
+                    && dependencies.freshPermissionWorker != nil
                 state = .waitingForPermission
                 log(.notice, "HID access denied; waiting for Input Monitoring permission without restarting: \(error.localizedDescription)")
                 ensurePermissionPoll()
@@ -186,10 +201,39 @@ final class DriverStartupCoordinator {
         }
     }
 
-    private func stopAttemptedHardware() {
+    private func requestFreshSnapshot() {
+        guard state == .waitingForPermission, !freshCheckPending,
+              dependencies.permissions.supportsFreshSnapshots,
+              let worker = dependencies.freshPermissionWorker else { return }
+        freshCheckPending = true
+        freshCheckID &+= 1
+        let currentID = freshCheckID
+        let currentGeneration = generation
+        let permissions = dependencies.permissions
+        let cancellation = requestCancellation
+        let result = PermissionSnapshotBox()
+        worker.submit({
+            guard !cancellation.isCancelled else { return }
+            result.store(permissions.freshSnapshot(cancellation: cancellation))
+        }, completion: { [weak self] in
+            guard let self, self.state == .waitingForPermission,
+                  self.generation == currentGeneration, self.freshCheckPending,
+                  self.freshCheckID == currentID else { return }
+            self.freshCheckPending = false
+            if let snapshot = result.read() {
+                self.freshSnapshot = snapshot
+                self.requiresFreshHIDGrant = false
+            }
+            // A denied result waits for the next timer tick; completion never
+            // starts an immediate chain of new checks.
+            self.checkReadiness(generation: currentGeneration, allowFreshCheck: false)
+        })
+    }
+
+    private func stopAttemptedHardware(finalStop: Bool = true) {
         guard didAttemptHardware else { return }
         didAttemptHardware = false
-        stopHardware()
+        if finalStop { stopHardware() } else { releaseFailedHardware() }
     }
 
     private func fail(_ message: String) {
@@ -201,6 +245,7 @@ final class DriverStartupCoordinator {
 
     private func invalidateWaiting() {
         generation &+= 1
+        freshCheckPending = false
         requestCancellation.cancel()
         poll?.cancel()
         poll = nil

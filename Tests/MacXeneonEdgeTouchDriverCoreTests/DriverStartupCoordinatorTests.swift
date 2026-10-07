@@ -465,6 +465,8 @@ extension SyntheticPermissionSnapshot {
 final class StartupTestHarness {
     let permissions: FakeSyntheticPermissionProvider
     let worker = FakePermissionRequestWorker()
+    let freshWorker = FakePermissionRequestWorker()
+    var useFreshWorker = false
     let polling = FakePermissionPollScheduler()
     let signals = FakeStartupSignals()
     let runLoop = FakeStartupRunLoop()
@@ -477,7 +479,8 @@ final class StartupTestHarness {
     var onStopHardware: (() -> Void)?
 
     var dependencies: DriverStartupDependencies {
-        DriverStartupDependencies(permissions: permissions, requestWorker: worker, polling: polling, signals: signals, runLoop: runLoop)
+        DriverStartupDependencies(permissions: permissions, requestWorker: worker, polling: polling, signals: signals, runLoop: runLoop,
+            freshPermissionWorker: useFreshWorker ? freshWorker : nil)
     }
 
     lazy var coordinator = DriverStartupCoordinator(
@@ -505,6 +508,10 @@ final class StartupTestHarness {
 }
 
 final class FakeSyntheticPermissionProvider: SyntheticPermissionProviding {
+    var supportsFreshSnapshots = false
+    var currentFreshSnapshot: SyntheticPermissionSnapshot?
+    var onFreshSnapshot: ((StartupCancellation) -> Void)?
+    private(set) var freshSnapshotCount = 0
     var currentSnapshot: SyntheticPermissionSnapshot
     var onSnapshot: (() -> Void)?
     var onRequest: ((StartupCancellation) -> Void)?
@@ -520,6 +527,12 @@ final class FakeSyntheticPermissionProvider: SyntheticPermissionProviding {
         record?("permission.snapshot")
         onSnapshot?()
         return currentSnapshot
+    }
+
+    func freshSnapshot(cancellation: StartupCancellation) -> SyntheticPermissionSnapshot? {
+        freshSnapshotCount += 1
+        onFreshSnapshot?(cancellation)
+        return currentFreshSnapshot
     }
 
     func requestInitialAccess(cancellation: StartupCancellation) {

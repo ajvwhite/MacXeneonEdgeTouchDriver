@@ -294,7 +294,8 @@ public final class MacXeneonEdgeTouchDriverApplication {
         startupCoordinator = DriverStartupCoordinator(
             dependencies: startupDependencies,
             startHardware: { [weak self] in try self?.startMonitoring() },
-            stopHardware: { [weak self] in self?.stopMonitoring() }
+            stopHardware: { [weak self] in self?.stopMonitoring() },
+            releaseFailedHardware: { [weak self] in self?.stopMonitoring(finalStop: false) }
         )
         return withExtendedLifetime(self) {
             // Waiting, startup failure, and normal exit all invalidate focus,
@@ -328,9 +329,15 @@ public final class MacXeneonEdgeTouchDriverApplication {
         try hidMonitor.start()
     }
 
-    private func stopMonitoring() {
-        // Signal-driven coordinator teardown also needs early focus invalidation.
-        shutdownFocus()
+    private func stopMonitoring(finalStop: Bool = true) {
+        // A permission retry must invalidate pending work without permanently
+        // closing focus restoration. Terminal teardown still closes it early.
+        if finalStop {
+            shutdownFocus()
+        } else {
+            targetPreparer.cancel()
+            focusRestorer.discardCapturedWindow()
+        }
         if let monitoringOverride {
             monitoringOverride.stop()
         } else {

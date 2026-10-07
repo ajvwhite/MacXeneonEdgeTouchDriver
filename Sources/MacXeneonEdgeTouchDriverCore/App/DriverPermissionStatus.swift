@@ -2,7 +2,7 @@ import Foundation
 
 /// Read-only startup diagnostics. This does not request permissions, open HID,
 /// start monitoring or post input. Readiness is not proof of event delivery.
-public struct DriverPermissionStatus: Encodable {
+public struct DriverPermissionStatus: Codable {
     public let postEventAccess: Bool
     public let accessibilityTrusted: Bool
     public let hidInputAccess: String

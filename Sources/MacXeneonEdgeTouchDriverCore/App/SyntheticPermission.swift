@@ -30,6 +30,13 @@ struct SyntheticPermissionSnapshot: Equatable {
 protocol SyntheticPermissionProviding: AnyObject {
     func snapshot() -> SyntheticPermissionSnapshot
     func requestInitialAccess(cancellation: StartupCancellation)
+    var supportsFreshSnapshots: Bool { get }
+    func freshSnapshot(cancellation: StartupCancellation) -> SyntheticPermissionSnapshot?
+}
+
+extension SyntheticPermissionProviding {
+    var supportsFreshSnapshots: Bool { false }
+    func freshSnapshot(cancellation: StartupCancellation) -> SyntheticPermissionSnapshot? { nil }
 }
 
 /// Shared only with the request worker. Cancellation cannot dismiss an OS dialog.
@@ -55,8 +62,10 @@ final class SystemSyntheticPermissionProvider: SyntheticPermissionProviding {
     private let requestPostEventAccess: () -> Bool
     private let requestAccessibilityTrust: () -> Void
     private let logIdentity: () -> Void
+    private let readFreshSnapshot: ((StartupCancellation) -> SyntheticPermissionSnapshot?)?
 
     convenience init() {
+        let check = FreshPermissionCheck(executableURL: Bundle.main.executableURL)
         self.init(
             readSnapshot: {
                 SyntheticPermissionSnapshot(
@@ -81,7 +90,8 @@ final class SystemSyntheticPermissionProvider: SyntheticPermissionProviding {
                 let executable = Bundle.main.executableURL?.path ?? CommandLine.arguments.first ?? "Unknown executable"
                 let launcher = NSRunningApplication(processIdentifier: getppid())?.bundleURL?.path ?? "Unknown launcher"
                 DriverLoggers.log(.notice, category: .lifecycle, "Permission identity: executable=\(executable), launcher=\(launcher).")
-            }
+            },
+            readFreshSnapshot: { check.snapshot(cancellation: $0) }
         )
     }
 
@@ -89,15 +99,22 @@ final class SystemSyntheticPermissionProvider: SyntheticPermissionProviding {
         readSnapshot: @escaping () -> SyntheticPermissionSnapshot,
         requestPostEventAccess: @escaping () -> Bool,
         requestAccessibilityTrust: @escaping () -> Void,
-        logIdentity: @escaping () -> Void = {}
+        logIdentity: @escaping () -> Void = {},
+        readFreshSnapshot: ((StartupCancellation) -> SyntheticPermissionSnapshot?)? = nil
     ) {
         self.readSnapshot = readSnapshot
         self.requestPostEventAccess = requestPostEventAccess
         self.requestAccessibilityTrust = requestAccessibilityTrust
         self.logIdentity = logIdentity
+        self.readFreshSnapshot = readFreshSnapshot
     }
 
     func snapshot() -> SyntheticPermissionSnapshot { readSnapshot() }
+    var supportsFreshSnapshots: Bool { readFreshSnapshot != nil }
+    func freshSnapshot(cancellation: StartupCancellation) -> SyntheticPermissionSnapshot? {
+        guard !cancellation.isCancelled else { return nil }
+        return readFreshSnapshot?(cancellation)
+    }
 
     func requestInitialAccess(cancellation: StartupCancellation) {
         guard !cancellation.isCancelled else { return }
@@ -120,7 +137,11 @@ protocol PermissionRequestWorking {
 }
 
 struct DispatchPermissionRequestWorker: PermissionRequestWorking {
-    private let queue = DispatchQueue(label: "\(DriverLoggers.subsystem).permission-request", qos: .utility)
+    private let queue: DispatchQueue
+
+    init(label: String = "permission-request") {
+        queue = DispatchQueue(label: "\(DriverLoggers.subsystem).\(label)", qos: .utility)
+    }
 
     func submit(_ request: @escaping () -> Void, completion: @escaping () -> Void) {
         // The request owns only its provider and locked cancellation token.
