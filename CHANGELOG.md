@@ -15,8 +15,8 @@
 - Keep stationary holds active while touch reports continue. Missing reports still trigger the default two-second safety timeout. Other USB interfaces can no longer interrupt the active touch.
 - Let fresh taps wait briefly for the previous mouse-button release, within fixed queue and time limits. Preserve movement and release order, and use one pending timer for the hold timeout.
 - Wait for Input Monitoring permission in the same process instead of repeatedly restarting. Add commands to check permissions and inspect saved USB input values without requesting access.
-- Recognise new permission approvals even when macOS keeps an old answer in the running driver.
-- Keep focus restoration working when startup retries after a temporary device-access failure.
+- Recognise new permission approvals even when macOS keeps an old answer. Refresh startup once if needed, with a limit that prevents repeated restarts.
+- Close failed device-open attempts before retrying, and keep focus restoration working after a temporary device-access failure.
 - Pause touch input when several displays match equally well. Resume once there is one clear match, instead of guessing or keeping an outdated display mapping.
 - Keep touch coordinates inside the target display, including its outer edges. Refresh the display selection and position before each touch.
 - Add optional signing during installation with `CODESIGN_IDENTITY`. Sign and verify the new executable before replacing installed files.

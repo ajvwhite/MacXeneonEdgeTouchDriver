@@ -467,6 +467,7 @@ final class StartupTestHarness {
     let worker = FakePermissionRequestWorker()
     let freshWorker = FakePermissionRequestWorker()
     var useFreshWorker = false
+    var refreshPermissionProcess: (() throws -> Void)?
     let polling = FakePermissionPollScheduler()
     let signals = FakeStartupSignals()
     let runLoop = FakeStartupRunLoop()
@@ -480,7 +481,8 @@ final class StartupTestHarness {
 
     var dependencies: DriverStartupDependencies {
         DriverStartupDependencies(permissions: permissions, requestWorker: worker, polling: polling, signals: signals, runLoop: runLoop,
-            freshPermissionWorker: useFreshWorker ? freshWorker : nil)
+            freshPermissionWorker: useFreshWorker ? freshWorker : nil,
+            refreshPermissionProcess: refreshPermissionProcess)
     }
 
     lazy var coordinator = DriverStartupCoordinator(

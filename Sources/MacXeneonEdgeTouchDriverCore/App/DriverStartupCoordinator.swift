@@ -27,6 +27,7 @@ struct DriverStartupDependencies {
     let signals: StartupSignalHandling
     let runLoop: StartupRunLoop
     var freshPermissionWorker: PermissionRequestWorking? = nil
+    var refreshPermissionProcess: (() throws -> Void)? = nil
 
     static var live: DriverStartupDependencies {
         DriverStartupDependencies(
@@ -35,7 +36,8 @@ struct DriverStartupDependencies {
             polling: DispatchPermissionPollScheduler(),
             signals: DispatchStartupSignals(),
             runLoop: MainStartupRunLoop(),
-            freshPermissionWorker: DispatchPermissionRequestWorker(label: "permission-check")
+            freshPermissionWorker: DispatchPermissionRequestWorker(label: "permission-check"),
+            refreshPermissionProcess: { try PermissionProcessRefresh.live.perform() }
         )
     }
 }
@@ -161,6 +163,31 @@ final class DriverStartupCoordinator {
                 log(.notice, "Waiting for synthetic event permission. Enable Device Control and Data Access (Accessibility on earlier macOS) for the executable or launcher; startup will continue automatically.")
             }
             if allowFreshCheck { requestFreshSnapshot() }
+            return
+        }
+
+        let needsProcessRefresh = freshSnapshot != nil && dependencies.refreshPermissionProcess != nil
+            && (waitingForHIDGrant || dependencies.permissions.snapshot().hidInputAccess != .granted)
+        guard state == .waitingForPermission else { return }
+        if needsProcessRefresh, let refresh = dependencies.refreshPermissionProcess {
+            // A fresh check can see approval while this process or its device
+            // objects retain denial. Replace the process image before acquiring
+            // HID; the replacement carries a one-refresh limit across exec.
+            state = .startingHardware
+            invalidateWaiting()
+            dependencies.signals.cancel()
+            do {
+                log(.notice, "Refreshing driver startup after Input Monitoring approval.")
+                try refresh()
+                // A real exec never returns. Test replacements return here.
+                finish(as: .stopped)
+            } catch {
+                log(.fault, "Could not refresh permission state: \(error.localizedDescription). Restart the driver after checking its permissions.")
+                // Exit normally so launchd cannot turn a failed refresh into
+                // an automatic relaunch loop. Monitoring has not started.
+                exitStatus = EXIT_SUCCESS
+                finish(as: .failed)
+            }
             return
         }
 

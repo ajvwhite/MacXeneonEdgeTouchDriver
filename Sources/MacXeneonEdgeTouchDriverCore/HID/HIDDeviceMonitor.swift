@@ -135,7 +135,10 @@ public final class HIDDeviceMonitor {
         IOHIDManagerRegisterDeviceRemovalCallback(manager, hidDeviceRemovedCallback, context)
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
-        let openResult = IOHIDManagerOpen(manager, openOptions)
+        let openResult = HIDManagerOpenAttempt.perform(
+            open: { IOHIDManagerOpen(manager, openOptions) },
+            close: { IOHIDManagerClose(manager, openOptions) }
+        )
         guard openResult == kIOReturnSuccess else {
             callbacks.invalidate()
             managerCallbackRegistration = nil

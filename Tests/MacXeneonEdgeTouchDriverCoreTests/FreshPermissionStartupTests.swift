@@ -104,4 +104,51 @@ final class FreshPermissionStartupTests: XCTestCase {
         h.coordinator.stop()
         XCTAssertEqual(h.hardwareStopCount, 2)
     }
+    func testFreshApprovalRefreshesCachedDenialBeforeAnyHardwareOpen() {
+        let h = harness(snapshot: denied)
+        h.permissions.currentFreshSnapshot = granted
+        var refreshes = 0
+        h.refreshPermissionProcess = { refreshes += 1 }
+        h.coordinator.start()
+        h.freshWorker.runRequest(); h.freshWorker.completeRequest()
+        XCTAssertEqual(refreshes, 1)
+        XCTAssertEqual(h.hardwareStartCount, 0)
+        XCTAssertEqual(h.coordinator.state, .stopped)
+        h.polling.advance(bySeconds: 10)
+        h.freshWorker.completeRequest()
+        XCTAssertEqual(refreshes, 1)
+    }
+
+    func testFailedRefreshStopsWithoutTriggeringLaunchdFailureRelaunch() {
+        let h = harness(snapshot: denied)
+        h.permissions.currentFreshSnapshot = granted
+        h.refreshPermissionProcess = { throw PermissionProcessRefresh.Failure.alreadyRefreshed }
+        h.coordinator.start()
+        h.freshWorker.runRequest(); h.freshWorker.completeRequest()
+        XCTAssertEqual(h.hardwareStartCount, 0)
+        XCTAssertEqual(h.coordinator.state, .failed)
+        XCTAssertEqual(h.coordinator.exitStatus, EXIT_SUCCESS)
+        XCTAssertTrue(h.logs.contains { $0.contains("Restart the driver") })
+    }
+
+    func testAlreadyGrantedStartupDoesNotRefreshProcess() {
+        let h = harness(snapshot: granted)
+        h.refreshPermissionProcess = { XCTFail("Granted startup needs no process refresh") }
+        h.coordinator.start()
+        XCTAssertEqual(h.hardwareStartCount, 1)
+        XCTAssertEqual(h.coordinator.state, .running)
+        h.coordinator.stop()
+    }
+
+    func testStopDuringCachedPermissionRecheckPreventsProcessRefresh() {
+        let h = harness(snapshot: denied)
+        h.permissions.currentFreshSnapshot = granted
+        h.refreshPermissionProcess = { XCTFail("Stop must win over a cached-permission refresh") }
+        h.coordinator.start()
+        h.permissions.onSnapshot = { h.coordinator.stop() }
+        h.freshWorker.runRequest(); h.freshWorker.completeRequest()
+        XCTAssertEqual(h.coordinator.state, .stopped)
+        XCTAssertEqual(h.hardwareStartCount, 0)
+    }
+
 }
