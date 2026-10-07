@@ -6,9 +6,15 @@ struct TouchTargetIdentity: Equatable {
     let pid: pid_t
     let application: CFTypeRef
     let window: CFTypeRef
+    var hitElement: CFTypeRef? = nil
 
     static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.pid == rhs.pid && CFEqual(lhs.application, rhs.application) && CFEqual(lhs.window, rhs.window)
+        guard lhs.pid == rhs.pid, CFEqual(lhs.application, rhs.application), CFEqual(lhs.window, rhs.window) else { return false }
+        switch (lhs.hitElement, rhs.hitElement) {
+        case let (left?, right?): return CFEqual(left, right)
+        case (nil, nil): return true
+        default: return false
+        }
     }
 }
 
@@ -21,6 +27,12 @@ struct DoubleClickSequence {
         let mapper: CoordinateMapper
         let inputPermit: PhysicalInputGuard.Permit
     }
+    // A finger can land at different points on the same control. Broader spatial
+    // tolerance requires the exact retained AX hit element, not just its window.
+    private func pairingDistance(for target: TouchTargetIdentity) -> CGFloat {
+        target.hitElement == nil ? 4 : 24
+    }
+
     private var previous: Tap?
     private var active: Tap?
     private var count = 1
@@ -35,7 +47,7 @@ struct DoubleClickSequence {
         }
         if let previous, previous.inputPermit(), timestamp >= previous.timestamp,
            timestamp - previous.timestamp < interval, previous.mapper == mapper,
-           previous.target == target, hypot(point.x - previous.point.x, point.y - previous.point.y) <= 4 {
+           previous.target == target, hypot(point.x - previous.point.x, point.y - previous.point.y) <= pairingDistance(for: previous.target) {
             count = 2
         }
         previous = nil
@@ -48,7 +60,7 @@ struct DoubleClickSequence {
                      interval: UInt64) -> Bool {
         guard let previous, previous.inputPermit(), timestamp >= previous.timestamp else { return false }
         return timestamp - previous.timestamp < interval && previous.mapper == mapper &&
-            hypot(point.x - previous.point.x, point.y - previous.point.y) <= 4
+            hypot(point.x - previous.point.x, point.y - previous.point.y) <= pairingDistance(for: previous.target)
     }
 
     mutating func completed(at point: CGPoint, timestamp: UInt64, interval: UInt64,

@@ -130,7 +130,8 @@ final class AXTouchTargetPreparer: TouchTargetPreparing {
                 self.preparedPID = target.pid
                 self.preparedPassive = !target.requiresActivation
                 self.preparedIdentity = TouchTargetIdentity(pid: target.pid,
-                    application: target.application.rawValue, window: target.window.rawValue)
+                    application: target.application.rawValue, window: target.window.rawValue,
+                    hitElement: target.hitElement?.rawValue)
             }
             self.lock.unlock()
             self.onMain {

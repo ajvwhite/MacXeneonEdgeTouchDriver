@@ -33,6 +33,7 @@ final class AXTouchTargetBackend: AXTouchTargetResolving {
         let window: AXFocusElement
         let pid: pid_t
         var requiresActivation = true
+        var hitElement: AXFocusElement? = nil
     }
     private let operations: AXTouchTargetOperations
     private let timeout: Float
@@ -96,7 +97,8 @@ final class AXTouchTargetBackend: AXTouchTargetResolving {
                 passive = floatingWindow(pid, CGRect(origin: origin, size: size), point) && permit()
             }
         }
-        return Target(application: application, window: window, pid: pid, requiresActivation: !passive)
+        return Target(application: application, window: window, pid: pid, requiresActivation: !passive,
+                      hitElement: role == kAXWindowRole ? nil : hit)
     }
 
     func focusWindow(_ target: Target, at point: CGPoint, permit: () -> Bool) -> Bool {

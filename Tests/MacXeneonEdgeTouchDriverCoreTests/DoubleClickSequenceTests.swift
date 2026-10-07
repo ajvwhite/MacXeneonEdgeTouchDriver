@@ -7,6 +7,26 @@ final class DoubleClickSequenceTests: XCTestCase {
     private let target = TouchTargetIdentity(pid: 10, application: "app" as CFString, window: "window" as CFString)
     private let mapper = CoordinateMapper(displayBounds: CGRect(x: 0, y: 0, width: 2560, height: 720))
 
+    func testFingerLandingVariationPairsOnlyOnTheSameHitElement() {
+        let button = TouchTargetIdentity(pid: 10, application: "app" as CFString,
+                                        window: "window" as CFString, hitElement: "button" as CFString)
+        for scenario in ["same", "neighbour", "unknown", "too far"] {
+            var sequence = DoubleClickSequence()
+            XCTAssertEqual(sequence.begin(at: CGPoint(x: 519, y: 237), timestamp: 0,
+                target: button, mapper: mapper, interval: 500_000_000, inputPermit: { true }), 1)
+            sequence.completed(at: CGPoint(x: 519, y: 237), timestamp: 20_000_000,
+                interval: 500_000_000, dragged: false, posted: true)
+            let identity = scenario == "unknown" ? target : scenario == "neighbour" ?
+                TouchTargetIdentity(pid: 10, application: "app" as CFString,
+                    window: "window" as CFString, hitElement: "next button" as CFString) : button
+            let point = scenario == "too far" ? CGPoint(x: 544, y: 237) : CGPoint(x: 526, y: 246)
+            XCTAssertEqual(sequence.mayContinue(at: point, timestamp: 134_000_000,
+                mapper: mapper, interval: 500_000_000), scenario != "too far")
+            XCTAssertEqual(sequence.begin(at: point, timestamp: 134_000_000, target: identity,
+                mapper: mapper, interval: 500_000_000, inputPermit: { true }), scenario == "same" ? 2 : 1, scenario)
+        }
+    }
+
     func testNearbyCompletedTapsPairAndThirdStartsNewSequence() {
         var sequence = DoubleClickSequence()
         XCTAssertEqual(begin(&sequence, at: 0), 1)

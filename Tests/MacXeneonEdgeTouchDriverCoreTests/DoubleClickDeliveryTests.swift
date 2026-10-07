@@ -10,6 +10,16 @@ final class DoubleClickDeliveryTests: XCTestCase {
         XCTAssertEqual(f.input.counts, [1, 1, 2, 2, 1, 1])
     }
 
+    func testFingerLandingVariationDeliversDoubleClickButNeighbourDoesNot() {
+        for neighbour in [false, true] {
+            let f = DoubleClickFixture(debounce: 50)
+            f.tap(at: 0)
+            if neighbour { f.preparer.hit = "neighbour" as CFString }
+            f.tap(at: 30, x: 146)
+            XCTAssertEqual(f.input.counts, neighbour ? [1, 1, 1, 1] : [1, 1, 2, 2])
+        }
+    }
+
     func testValidSecondTapInsideDebounceStillReachesTarget() {
         let f = DoubleClickFixture(debounce: 50)
         f.tap(at: 0); f.tap(at: 30)
@@ -62,7 +72,8 @@ private final class DoubleClickFixture {
 private final class CountTarget: TouchTargetPreparing {
     let requiresPreparation = false
     var window: CFTypeRef = "window" as CFString
-    var preparedTargetIdentity: TouchTargetIdentity? { TouchTargetIdentity(pid: 10, application: "app" as CFString, window: window) }
+    var hit: CFTypeRef = "button" as CFString
+    var preparedTargetIdentity: TouchTargetIdentity? { TouchTargetIdentity(pid: 10, application: "app" as CFString, window: window, hitElement: hit) }
     func prepare(at point: CGPoint, completion: @escaping (Bool) -> Void) { completion(true) }
     func cancel() {}
 }

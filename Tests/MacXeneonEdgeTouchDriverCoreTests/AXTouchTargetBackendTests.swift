@@ -10,6 +10,7 @@ final class AXTouchTargetBackendTests: XCTestCase {
         var visible = true
         let backend = AXTouchTargetBackend(operations: f, floatingWindow: { _, _, _ in visible })
         let target = backend.resolve(at: f.point, permit: { true })!
+        XCTAssertEqual(target.hitElement.map { f.name($0) }, "hit")
         XCTAssertFalse(target.requiresActivation)
         XCTAssertTrue(backend.focusWindow(target, at: f.point, permit: { true }))
         XCTAssertTrue(f.mutations.isEmpty)
