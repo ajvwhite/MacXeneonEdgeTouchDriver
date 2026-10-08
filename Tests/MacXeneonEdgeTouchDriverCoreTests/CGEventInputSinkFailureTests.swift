@@ -7,6 +7,19 @@ final class CGEventInputSinkFailureTests: XCTestCase {
     private let downPoint = CGPoint(x: 120, y: 240)
     private let releasePoint = CGPoint(x: 345, y: 678)
 
+    func testDefaultPostingKeepsDownDragAndEmergencyReleaseAfterHardwareState() {
+        let effects = MockMouseEnvironment()
+        let sink = effects.makeSink()
+        XCTAssertEqual(sink.tryPostMouseDown(at: downPoint), .postInvoked)
+        XCTAssertEqual(sink.tryPostMouseDragged(to: releasePoint), .postInvoked)
+        effects.failFactoryFromCall = effects.requests.count + 1
+        XCTAssertEqual(sink.tryPostMouseUp(at: releasePoint), .postInvoked)
+        XCTAssertEqual(effects.posts.map(\.tap),
+                       [.cgSessionEventTap, .cgSessionEventTap, .cgSessionEventTap])
+        XCTAssertEqual(effects.posts.map { $0.event.type },
+                       [.leftMouseDown, .leftMouseDragged, .leftMouseUp])
+    }
+
     func testReserveCreationFailureDoesNotConstructOrPostDown() {
         let effects = MockMouseEnvironment()
         effects.failedFactoryCalls = [1]
@@ -359,6 +372,7 @@ private final class MockMouseEnvironment {
     var currentFlags: CGEventFlags = []
     var discardPosts = false
     var onEffect: ((String) -> Void)?
+    var makeScrollEvent: ((CGPoint) -> MouseInputEvent?)?
     private(set) var requests: [Request] = []
     private(set) var createdEvents: [MockMouseEvent] = []
     private(set) var posts: [Post] = []
@@ -367,7 +381,7 @@ private final class MockMouseEnvironment {
     private(set) var flagReads = 0
     private(set) var flagSourceIDs: [Int64?] = []
 
-    func makeSink(eventTap: CGEventTapLocation = .cghidEventTap) -> CGEventInputSink {
+    func makeSink(eventTap: CGEventTapLocation? = nil) -> CGEventInputSink {
         let explicitSourceID = sourceStateID
         let environment = MouseInputEnvironment(
             makeEvent: { type, point in
@@ -402,8 +416,63 @@ private final class MockMouseEnvironment {
                 self.flagSourceIDs.append(explicitSourceID)
                 self.onEffect?("flags")
                 return self.currentFlags
-            }
+            },
+            makeScrollEvent: makeScrollEvent
         )
-        return CGEventInputSink(environment: environment, eventTap: eventTap)
+        if let eventTap { return CGEventInputSink(environment: environment, eventTap: eventTap) }
+        return CGEventInputSink(environment: environment)
+    }
+}
+
+
+extension CGEventInputSinkFailureTests {
+    func testDoubleClickCountSurvivesReservedReleaseFallback() {
+        let environment = MockMouseEnvironment()
+        let sink = environment.makeSink()
+        XCTAssertEqual(sink.tryPostMouseDown(at: .zero, clickCount: 2), .postInvoked)
+        environment.failFactoryFromCall = 3
+        XCTAssertEqual(sink.tryPostMouseUp(at: CGPoint(x: 10, y: 20)), .postInvoked)
+        XCTAssertEqual(environment.posts.map { $0.event.getIntegerValueField(.mouseEventClickState) }, [2, 2])
+        XCTAssertEqual(environment.posts.map { $0.event.type }, [.leftMouseDown, .leftMouseUp])
+        XCTAssertEqual(sink.tryPostMouseUp(at: .zero), .noPendingMouseDown)
+    }
+
+    func testUnsupportedClickCountCannotAcquireReleaseOwnership() {
+        let environment = MockMouseEnvironment()
+        let sink = environment.makeSink()
+        XCTAssertEqual(sink.tryPostMouseDown(at: .zero, clickCount: 3), .constructionFailed)
+        XCTAssertTrue(environment.posts.isEmpty)
+        XCTAssertTrue(environment.requests.isEmpty)
+        XCTAssertEqual(sink.tryPostMouseDown(at: .zero, clickCount: 1), .postInvoked)
+        XCTAssertEqual(sink.tryPostMouseUp(at: .zero), .postInvoked)
+    }
+}
+
+
+extension CGEventInputSinkFailureTests {
+    func testPixelScrollMetadataHasNoMouseButtonOwnership() {
+        let environment = MockMouseEnvironment()
+        environment.makeScrollEvent = { MockMouseEvent(type: .scrollWheel, point: $0, sourceStateID: -42) }
+        let sink = environment.makeSink()
+        XCTAssertEqual(sink.tryPostScroll(deltaX: 2.5, deltaY: -3.25, at: CGPoint(x: 10, y: 20)), .postInvoked)
+        let event = environment.posts[0].event
+        XCTAssertEqual(event.type, .scrollWheel)
+        XCTAssertEqual(event.getIntegerValueField(.scrollWheelEventFixedPtDeltaAxis1), -212992)
+        XCTAssertEqual(event.getIntegerValueField(.scrollWheelEventFixedPtDeltaAxis2), 163840)
+        XCTAssertEqual(event.getIntegerValueField(.scrollWheelEventIsContinuous), 1)
+        XCTAssertEqual(event.getIntegerValueField(.scrollWheelEventScrollPhase), 0)
+        XCTAssertEqual(sink.tryPostMouseUp(at: .zero), .noPendingMouseDown)
+        XCTAssertEqual(sink.tryPostMouseDown(at: .zero), .postInvoked)
+        XCTAssertEqual(sink.tryPostScroll(deltaX: 1, deltaY: 1, at: .zero), .busy)
+        XCTAssertEqual(sink.tryPostMouseUp(at: .zero), .postInvoked)
+    }
+
+    func testInvalidOrWrongSourceScrollDoesNotPost() {
+        let environment = MockMouseEnvironment()
+        environment.makeScrollEvent = { MockMouseEvent(type: .scrollWheel, point: $0, sourceStateID: 123) }
+        let sink = environment.makeSink()
+        XCTAssertEqual(sink.tryPostScroll(deltaX: .infinity, deltaY: 0, at: .zero), .constructionFailed)
+        XCTAssertEqual(sink.tryPostScroll(deltaX: 0, deltaY: 1, at: .zero), .sourceUnavailable)
+        XCTAssertTrue(environment.posts.isEmpty)
     }
 }

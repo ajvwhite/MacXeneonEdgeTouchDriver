@@ -1,12 +1,59 @@
 import CoreGraphics
 import Darwin
 import Foundation
+import IOKit
 @testable import MacXeneonEdgeTouchDriverCore
 import XCTest
 
 /// Uses the application's real routing and teardown with fake startup and monitoring.
 /// The virtual clock also delivers cancelled tasks to exercise stale completions.
 final class CombinedStartupDisplayLifecycleTests: XCTestCase {
+    func testPermissionRetryKeepsFocusReusableAndRejectsOldPreparation() {
+        let fixture = CombinedStartupFixture()
+        fixture.startup.permissions.currentSnapshot = .axReady
+        fixture.startup.useFreshWorker = true
+        fixture.startup.permissions.supportsFreshSnapshots = true
+        fixture.startup.permissions.currentFreshSnapshot = SyntheticPermissionSnapshot(
+            postEventAccess: true, accessibilityTrusted: true, hidInputAccess: .granted,
+            requiresAccessibility: true)
+        fixture.onStart = {
+            if fixture.starts == 1 {
+                fixture.onGestureQueue { fixture.send(.down) }
+                throw HIDDeviceMonitorError.openFailed(kIOReturnNotPermitted)
+            }
+            fixture.acquired = true
+            fixture.effects.events.append(.hardwareAcquired)
+        }
+        let result = fixture.run {
+            XCTAssertEqual(fixture.starts, 1)
+            XCTAssertEqual(fixture.stops, 1)
+            XCTAssertEqual(fixture.effects.shutdownCount, 0,
+                "A recoverable device-open failure must not permanently close focus")
+            fixture.startup.polling.advance(bySeconds: 2)
+            fixture.startup.freshWorker.runRequest()
+            fixture.startup.freshWorker.completeRequest()
+            XCTAssertEqual(fixture.starts, 2)
+            fixture.onGestureQueue {
+                fixture.effects.completePreparation(0)
+                XCTAssertTrue(fixture.effects.input.isEmpty,
+                    "Preparation selected before the failed open cannot post input later")
+                fixture.send(.down)
+                fixture.effects.completePreparation(1)
+                fixture.send(.up)
+            }
+            XCTAssertEqual(fixture.effects.restores, [1])
+            XCTAssertEqual(fixture.effects.input, [.down(combinedStartupOrigin), .up(combinedStartupOrigin)])
+            XCTAssertEqual(fixture.effects.releases, [true])
+            fixture.startup.signals.send(SIGTERM)
+            fixture.startup.freshWorker.completeRequest()
+            fixture.startup.polling.tasks.forEach { $0.deliverEvenIfCancelled() }
+        }
+        XCTAssertEqual(result, EXIT_SUCCESS)
+        XCTAssertEqual(fixture.stops, 2)
+        XCTAssertEqual(fixture.effects.shutdownCount, 1)
+        fixture.effects.assertBalanced()
+    }
+
     func testPermissionGrantRoutesValidDisplayTouchWhenFocusNeverBecomesReady() {
         let fixture = CombinedStartupFixture()
         let result = fixture.run {

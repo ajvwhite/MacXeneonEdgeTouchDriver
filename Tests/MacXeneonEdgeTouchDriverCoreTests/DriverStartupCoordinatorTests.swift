@@ -328,8 +328,41 @@ final class DriverStartupCoordinatorTests: XCTestCase {
         assertHardwareFailure(result: kIOReturnExclusiveAccess)
     }
 
-    func testHIDNotPermittedFailureDoesNotBecomeSyntheticPermissionWaitOrRetry() {
-        assertHardwareFailure(result: kIOReturnNotPermitted)
+    func testHIDDenialWaitsInSameProcessAndRetriesOnlyAfterPositiveGrant() {
+        let harness = StartupTestHarness(snapshot: .cgReady)
+        harness.hardwareError = HIDDeviceMonitorError.openFailed(kIOReturnNotPermitted)
+        harness.coordinator.start()
+        XCTAssertEqual(harness.coordinator.state, .waitingForPermission)
+        XCTAssertEqual(harness.hardwareStartCount, 1)
+        XCTAssertEqual(harness.hardwareStopCount, 1)
+        harness.polling.advance(bySeconds: 20)
+        XCTAssertEqual(harness.hardwareStartCount, 1, "Unknown HID access must not retry or restart")
+        harness.permissions.currentSnapshot = SyntheticPermissionSnapshot(postEventAccess: true,
+            accessibilityTrusted: false, hidInputAccess: .denied)
+        harness.polling.advance(bySeconds: 20)
+        XCTAssertEqual(harness.hardwareStartCount, 1)
+        harness.hardwareError = nil
+        harness.permissions.currentSnapshot = SyntheticPermissionSnapshot(postEventAccess: true,
+            accessibilityTrusted: false, hidInputAccess: .granted)
+        harness.polling.advance(bySeconds: 2)
+        XCTAssertEqual(harness.coordinator.state, .running)
+        XCTAssertEqual(harness.hardwareStartCount, 2)
+        XCTAssertEqual(harness.permissions.requestCount, 0)
+        XCTAssertEqual(harness.worker.submissionCount, 0)
+        harness.coordinator.stop()
+        XCTAssertEqual(harness.hardwareStopCount, 2)
+    }
+
+    func testKnownHIDDenialDoesNotAttemptHardwareOrRequestSyntheticAccess() {
+        let harness = StartupTestHarness(snapshot: SyntheticPermissionSnapshot(postEventAccess: true,
+            accessibilityTrusted: false, hidInputAccess: .denied))
+        harness.coordinator.start()
+        XCTAssertEqual(harness.coordinator.state, .waitingForPermission)
+        XCTAssertEqual(harness.hardwareStartCount, 0)
+        XCTAssertEqual(harness.worker.submissionCount, 0)
+        harness.signals.send(SIGTERM)
+        XCTAssertEqual(harness.coordinator.state, .stopped)
+        XCTAssertEqual(harness.coordinator.exitStatus, EXIT_SUCCESS)
     }
 
     func testRunReturnsFailureWhenGrantLaterRevealsHardwareError() {
@@ -432,6 +465,9 @@ extension SyntheticPermissionSnapshot {
 final class StartupTestHarness {
     let permissions: FakeSyntheticPermissionProvider
     let worker = FakePermissionRequestWorker()
+    let freshWorker = FakePermissionRequestWorker()
+    var useFreshWorker = false
+    var refreshPermissionProcess: (() throws -> Void)?
     let polling = FakePermissionPollScheduler()
     let signals = FakeStartupSignals()
     let runLoop = FakeStartupRunLoop()
@@ -444,7 +480,9 @@ final class StartupTestHarness {
     var onStopHardware: (() -> Void)?
 
     var dependencies: DriverStartupDependencies {
-        DriverStartupDependencies(permissions: permissions, requestWorker: worker, polling: polling, signals: signals, runLoop: runLoop)
+        DriverStartupDependencies(permissions: permissions, requestWorker: worker, polling: polling, signals: signals, runLoop: runLoop,
+            freshPermissionWorker: useFreshWorker ? freshWorker : nil,
+            refreshPermissionProcess: refreshPermissionProcess)
     }
 
     lazy var coordinator = DriverStartupCoordinator(
@@ -472,6 +510,10 @@ final class StartupTestHarness {
 }
 
 final class FakeSyntheticPermissionProvider: SyntheticPermissionProviding {
+    var supportsFreshSnapshots = false
+    var currentFreshSnapshot: SyntheticPermissionSnapshot?
+    var onFreshSnapshot: ((StartupCancellation) -> Void)?
+    private(set) var freshSnapshotCount = 0
     var currentSnapshot: SyntheticPermissionSnapshot
     var onSnapshot: (() -> Void)?
     var onRequest: ((StartupCancellation) -> Void)?
@@ -487,6 +529,12 @@ final class FakeSyntheticPermissionProvider: SyntheticPermissionProviding {
         record?("permission.snapshot")
         onSnapshot?()
         return currentSnapshot
+    }
+
+    func freshSnapshot(cancellation: StartupCancellation) -> SyntheticPermissionSnapshot? {
+        freshSnapshotCount += 1
+        onFreshSnapshot?(cancellation)
+        return currentFreshSnapshot
     }
 
     func requestInitialAccess(cancellation: StartupCancellation) {

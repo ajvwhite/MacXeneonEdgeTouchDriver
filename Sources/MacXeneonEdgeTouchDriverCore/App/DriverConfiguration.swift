@@ -153,6 +153,21 @@ public struct DriverConfiguration: Codable, Equatable, Sendable {
         }
 
         if let gesture = partial.gesture {
+            if let mode = gesture.mode {
+                if let value = GestureOptions.Mode(rawValue: mode) { configuration.gesture.mode = value }
+                else { warnings.append("Unsupported gesture.mode '\(mode)'; keeping direct mode. Two-finger scrolling is unavailable on the observed hardware. Choose 'scroll' explicitly for single-finger scrolling.") }
+            }
+            if let value = gesture.holdDurationMs {
+                configuration.gesture.holdDurationMs = clamp(value, to: 100...2000, name: "gesture.holdDurationMs", warnings: &warnings)
+            }
+            if let value = gesture.movementThresholdPx {
+                configuration.gesture.movementThresholdPx = clamp(value, to: 1...100, name: "gesture.movementThresholdPx", warnings: &warnings)
+            }
+            if let value = gesture.scrollSensitivity {
+                configuration.gesture.scrollSensitivity = min(10, max(0.1, value))
+                if configuration.gesture.scrollSensitivity != value { warnings.append("gesture.scrollSensitivity must be between 0.1 and 10; using the nearest limit.") }
+            }
+            if let value = gesture.doubleClickEnabled { configuration.gesture.doubleClickEnabled = value }
             if let value = gesture.multiTouchEnabled {
                 configuration.gesture.multiTouchEnabled = value && XeneonEdgeDevice.supportsMultiTouch
                 if value && !XeneonEdgeDevice.supportsMultiTouch {
@@ -171,6 +186,7 @@ public struct DriverConfiguration: Codable, Equatable, Sendable {
         }
 
         if let diagnostics = partial.diagnostics {
+            if let value = diagnostics.performanceMetricsEnabled { configuration.diagnostics.performanceMetricsEnabled = value }
             if let value = diagnostics.fileLogPath {
                 configuration.diagnostics.fileLogPath = value
             }
@@ -236,6 +252,11 @@ public extension DriverConfiguration {
 
     /// Gesture configuration.
     struct Gesture: Codable, Equatable, Sendable {
+        public var mode: GestureOptions.Mode = .direct
+        public var holdDurationMs: Int = 300
+        public var movementThresholdPx: Int = 6
+        public var scrollSensitivity: Double = 1
+        public var doubleClickEnabled: Bool = true
         public var multiTouchEnabled: Bool
         public var pinchHysteresisPx: Int
         public var minPinchForMagnify: Int
@@ -244,6 +265,7 @@ public extension DriverConfiguration {
 
     /// Diagnostic file logging configuration.
     struct Diagnostics: Codable, Equatable, Sendable {
+        public var performanceMetricsEnabled: Bool = false
         public var fileLogPath: String?
         public var fileLogMaxBytes: Int
     }
@@ -313,6 +335,11 @@ private struct PartialCursor: Decodable {
 }
 
 private struct PartialGesture: Decodable {
+    var mode: String?
+    var holdDurationMs: Int?
+    var movementThresholdPx: Int?
+    var scrollSensitivity: Double?
+    var doubleClickEnabled: Bool?
     var multiTouchEnabled: Bool?
     var pinchHysteresisPx: Int?
     var minPinchForMagnify: Int?
@@ -320,6 +347,7 @@ private struct PartialGesture: Decodable {
 }
 
 private struct PartialDiagnostics: Decodable {
+    var performanceMetricsEnabled: Bool?
     var fileLogPath: String?
     var fileLogMaxBytes: Int?
 }

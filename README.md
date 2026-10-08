@@ -1,10 +1,10 @@
 # Mac Xeneon Edge Touch Driver
 
-A from-scratch macOS user-space touch driver for the Corsair Xeneon Edge 14.5 inch 32:9 touchscreen panel so you can make it genuinely useful when using it with a Mac.
+A macOS touch driver for the Corsair Xeneon Edge 14.5 inch 32:9 touchscreen. It supports tapping, dragging and selecting text with one finger.
 
 ## How To Install
 
-To install for the current user, just run the following from the root of the checked out repository on the relevant mac:
+From the repository folder on your Mac, run:
 
 ```sh
 ./Scripts/install.sh
@@ -36,15 +36,15 @@ The installer creates a default config file if one does not already exist:
 ~/Library/Application Support/MacXeneonEdgeTouchDriver/config.json
 ```
 
-Existing config files are validated as JSON objects and preserved byte-for-byte, including unknown keys and the focus/cursor settings. Invalid JSON stops the installer before replacement. New configs enable both `focus.restorePreviousWindow` and `cursor.returnToPreviousPosition`.
+The installer keeps your existing config, including settings it does not recognise. The file must contain a valid JSON object; otherwise installation stops before replacing anything. New configs enable both `focus.restorePreviousWindow` and `cursor.returnToPreviousPosition`.
 
-The installer builds and validates the replacement executable, config and LaunchAgent in staging directories before changing installed files or stopping the job. To sign the staged executable, set `CODESIGN_IDENTITY` when running the installer. Signing explicitly uses the `MacXeneonEdgeTouchDriver` identifier so the temporary filename does not change it. Signing and signature verification must both succeed before replacement. This interface adapts [Greg Thompson's (`isleofgreg`) signing contribution in PR #4](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/pull/4). Signing does not guarantee that macOS will retain permission grants.
+The installer checks the new executable, config and LaunchAgent before stopping the current driver. To sign the executable during installation, set `CODESIGN_IDENTITY`. Signing keeps the `MacXeneonEdgeTouchDriver` identifier and must pass verification before installation continues. This uses [Greg Thompson's (`isleofgreg`) signing contribution in PR #4](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/pull/4). macOS may still ask you to grant permissions again after an update.
 
-Before replacement, the installer saves the prior files and whether the job was registered under `~/Library/Application Support/MacXeneonEdgeTouchDriver/install-backups/transaction.*`. Backups remain after success or failure. A preflight failure leaves the installed executable, config, plist and registered job unchanged; it may leave newly created directories or a partial backup.
+Before replacing files, the installer saves a backup under `~/Library/Application Support/MacXeneonEdgeTouchDriver/install-backups/transaction.*`. It keeps that backup after installation. Your existing config is never rewritten.
 
-If replacement or bootstrap fails, the installer attempts to unload any replacement job, restore prior files (or their prior absence), and bootstrap the saved on-disk plist if the old job was registered. Existing config is never rewritten. Recovery stops if an unexpected job appears before activation, the replacement job cannot be unloaded, or its state cannot be determined. File restoration failures prevent restarting the prior job. Errors identify incomplete recovery and the retained backup directory for manual repair.
+If installation fails after replacement starts, the installer tries to stop the replacement, restore the previous files and reload the previous LaunchAgent. If it cannot safely determine which job is running, stop it, or restore its files, it stops recovery and reports the backup location. Check the error before trying again.
 
-Each file replacement uses a rename; the files and launchd state do not change atomically as a group. Rollback cannot recover an earlier PID or launchd's in-memory definition if the on-disk plist had been edited. The installer lock prevents concurrent runs of this installer, but does not coordinate with other tools editing these files. Forced termination or power loss can interrupt recovery and leave the lock in place; check the job and saved files before removing a stale lock or retrying. A successful bootstrap means launchd accepted the job, not that the daemon remains healthy. Persistent launchd enable/disable overrides are preserved, so a disabled job may reject bootstrap.
+Replacing files and reloading the driver happen in separate steps. A power loss or forced stop can interrupt them and leave the installer lock in place. Check the running driver and backups before removing a stale lock. The lock prevents two copies of this installer running together; it cannot prevent another tool from changing the files. Recovery uses the saved files, so it cannot recover unsaved changes to launchd's loaded configuration. Existing launchd enable/disable settings are kept. The LaunchAgent uses Interactive process scheduling to avoid macOS background timer delays. After installation, check the log and try a touch: launchd accepting the job does not prove the driver is working.
 
 Uninstall:
 
@@ -52,9 +52,9 @@ Uninstall:
 ./Scripts/uninstall.sh
 ```
 
-Uninstall removes the LaunchAgent and Application Support files (including config and retained installer backups) but keeps logs. It checks the current user's GUI-domain registration, requires a successful bootout for a registered job, and verifies that the job is unregistered before removing files. A bootout or ambiguous query failure leaves installation files untouched and returns failure. Like the installer, the state query treats service-print status 113 as absent only after a successful GUI-domain query; this macOS convention is not a guarantee of the public launchctl interface.
+Uninstall removes the LaunchAgent, config, driver and installer backups, but keeps logs. It stops and unregisters the current user's LaunchAgent before deleting files. If that fails or the job's status is unclear, the files are left alone.
 
-Registration checks do not prove synchronous process exit or stop manually started copies. Other tools can change registration after the final check. If file removal fails after unregistration, uninstall reports failure and leaves any remaining files for manual recovery; it does not claim rollback or complete removal.
+Uninstall does not stop copies started manually. If deleting files fails, the script reports what remains; it does not reinstall them. Avoid running other installation tools at the same time.
 
 Build a signed release binary:
 
@@ -104,9 +104,9 @@ python3 Scripts/test-install.py
 python3 Scripts/test-uninstall.py
 ```
 
-The unit tests use fake input, cursor, focus, permissions, request workers, signals, run loops, and HID startup dependencies. Delayed gesture tests advance a virtual clock instead of waiting for real time. These checks do not install or run the driver, require attached hardware, or request macOS permissions. GitHub Actions runs the same checks on macOS for pushes and pull requests.
+The tests use simulated input and a virtual clock. They do not run the driver, need an attached Edge or request macOS permissions. GitHub Actions runs tests and builds on macOS for pushes and pull requests.
 
-Installer tests use temporary homes and workspaces with a restricted command path. Swift builds, signing and launchctl are stubbed; the Foundation serializer is compiled and exercised with real JSON/XML parsers. Uninstaller tests use strict fake launchctl and removal commands, with deletion restricted to harmless fixtures inside owned temporary directories. They exercise registration-query, bootout and partial file-removal failures without running the driver or controlling any real jobs. The installer workflow runs when its scripts, template or workflow change.
+Installer and uninstaller tests use temporary folders and simulated signing and launchctl commands. They cover failures without changing your installed driver. The installer workflow runs when its scripts, template or workflow change.
 
 The package declares macOS 13 as its minimum deployment target. A successful build or CI run does not establish runtime validation on macOS 13.
 
@@ -145,28 +145,34 @@ All fields are optional. Missing or malformed config falls back to defaults and 
     "returnToPreviousPosition": true
   },
   "gesture": {
-    "multiTouchEnabled": false
+    "multiTouchEnabled": false,
+    "mode": "direct",
+    "holdDurationMs": 300,
+    "scrollThresholdPx": 6,
+    "scrollSensitivity": 1.0,
+    "doubleClickEnabled": true
   },
   "diagnostics": {
     "fileLogPath": "~/Library/Logs/MacXeneonEdgeTouchDriver/driver.log",
-    "fileLogMaxBytes": 5242880
+    "fileLogMaxBytes": 5242880,
+    "performanceMetricsEnabled": false
   }
 }
 ```
 
 Display matching requires the configured vendor and model and valid display bounds. If `display.serialNumber` is set, only displays with that serial are eligible. Matching `display.expectedWidth` and `display.expectedHeight` is preferred; if none match those dimensions, all otherwise eligible displays are considered.
 
-Touch routing pauses and input is dropped when more than one valid display is equally preferred, including displays reporting the same serial number. Detecting ambiguity cancels any active gesture and clears the previous mapping instead of choosing the first enumerated display. Routing resumes when a display refresh finds a unique best match. A configured serial resolves a tie only if it distinguishes the candidate displays. Adjust the display configuration or connected displays to resolve a tie; config changes require a driver restart. This matching safeguard does not establish support for multiple touch panels.
+If several displays match equally well, the driver pauses touch input rather than guessing. It cancels any current gesture and resumes when there is one clear match. Set `display.serialNumber` or disconnect an extra matching display to resolve the tie. A serial number only helps if the displays report different serials. Restart after changing the config. This driver supports one touch panel.
 
-`focus.restorePreviousWindow` defaults to `true`: the driver captures the focused window before each touch and attempts to restore it afterward. Set it to `false` to skip focus capture and restoration and leave focus to normal window behavior. If focus cannot be captured, the touch still proceeds.
+`focus.restorePreviousWindow` defaults to `true`. The driver remembers the window and text field you were using before a touch and tries to return focus there afterward. Set it to `false` to leave the touched app active.
 
-The gesture queue uses a 30 ms scheduled preparation deadline. If capture finishes first, input proceeds with that capture. If a move or release arrives first, the driver immediately delivers the original down followed by that event, without waiting for focus. Every subsequent drag point is delivered normally. The deadline also releases a stationary touch when capture is slow; late results are discarded. The existing warp and click delays apply after preparation. Queue scheduling can delay execution substantially, so this is not a hard real-time guarantee.
+With either setting, the driver first checks that the window under your finger is ready to receive a click. This lets the first tap work on an inactive window. It allows 30 ms to prepare the window and holds up to 256 movement/release events while waiting. If it cannot confirm the target in time, it drops that touch. The configured click delays follow this check. A slow macOS request can take longer than the scheduled limit.
 
-Accessibility work runs separately from input cleanup, with at most one operation outstanding. When focus changes during a touch, the driver makes one attempt to observe and confirm the destination window before the gesture queue receives the accepted HID touch-up report. Receipt of that report freezes the confirmed window, before any configured synthetic mouse-up delay; a later focus read cannot replace it. If confirmation is unfinished, stale, or unavailable at that boundary, the driver leaves focus alone. This can skip restoration for quick taps, late app activation, or further focus changes during a touch, without delaying button or cursor cleanup.
+Focus returns after the mouse button is released and cursor cleanup finishes. The driver checks the saved window and field before asking the app to restore focus. If a text field was captured but is no longer available, it leaves focus alone. Floating panels, such as a virtual Stream Deck, can receive a tap without needing a text field of their own. The driver can reactivate the original app once before restoring its field.
 
-Restoration starts after button and cursor cleanup, with a 150 ms budget for starting further work. It rechecks the exact captured process and frozen destination window, skips an already-focused window, and makes at most one supported focus or raise request. It verifies the result when possible; it never clicks a title bar or retries an uncertain request. A stalled request can outlive the budget; later touches continue without capture until that worker returns. If macOS cannot report focus reliably or the app does not support the required operations and observations, the driver leaves focus alone.
+Clicking the mouse, typing or scrolling cancels further focus restoration. New touches, closed windows, app changes, shutdown and Space/session changes can also cancel it. A focus request already sent to another app may still finish. Accessibility work runs separately so a slow app does not hold up mouse-button release or cursor cleanup.
 
-`cursor.returnToPreviousPosition` also defaults to `true`. Set it to `false` to skip the return to the pre-touch cursor position. Cleanup still releases the mouse button, restores cursor visibility and mouse association, and clears the borrowed state. This applies to normal completion, cancellation, device removal, and shutdown. Touch input still moves the shared system cursor; focus restoration does not warp it.
+`cursor.returnToPreviousPosition` defaults to `true`. Set it to `false` to leave the cursor where it is after the touch. Both settings release the mouse button, make the cursor visible and return control to the mouse, including after cancellation, USB removal or shutdown. Touch uses the system cursor; restoring focus does not move it.
 
 | Restore previous window | Return cursor | End of gesture |
 | --- | --- | --- |
@@ -175,48 +181,98 @@ Restoration starts after button and cursor cleanup, with a 150 ms budget for sta
 | `true` | `false` | Release the cursor at its current position and attempt to restore the previous window. |
 | `false` | `false` | Release the cursor at its current position; leave focus to normal window behavior. |
 
-The configured gesture delays are unchanged; enabling focus restoration can add the bounded preparation wait described above. Restart the driver after changing the configuration.
+The window readiness check applies with either focus setting. Restart the driver after changing the configuration.
 
-`gesture.multiTouchEnabled` is always forced to `false` as the hardware only exposes single touch information, if this ever changes we will look to see how to support multi-touch gestures.
+### Tap, drag and scroll
 
-## Touch report liveness and source ownership
+The default `gesture.mode`, `"direct"`, keeps the existing behavior: tap to click, or move a held finger to drag.
 
-Valid pressed reports from the accepted endpoint/contact renew `timing.stuckGestureTimeoutMs`, including identical stationary reports. They do not become moves, update the cursor, flush focus preparation, or change tap/drag classification. Accepted touch-up closes pressed liveness before focus eligibility freezes; delayed mouse-up and cursor return have a separate fixed cleanup bound using the same timeout. Default delays and restoration options are unchanged.
+Set `gesture.mode` to `"scroll"` to scroll with one finger. A quick tap still clicks. Movement beyond `scrollThresholdPx` scrolls the page; hold still for `holdDurationMs` before moving to drag instead. Increase `scrollSensitivity` for more scrolling per movement. Scrolling does not hold a mouse button down.
 
-Each HID registration has its own parser and contact epochs. Only the source/contact accepted by the gesture controller can move, end, or renew that gesture. A contact that begins on another endpoint while the button/cursor cleanup lease is occupied stays rejected until its own release. A silent rejected endpoint does not block later fresh taps on another endpoint. Merely matching or seizing another interface does not select, reject, or cancel the reporting source. No usage-page/usage pair is hard-coded as the reporting endpoint.
+Two nearby taps can produce a double-click within macOS's double-click interval. Both taps must hit the same window. If macOS identifies the button or control, both taps must hit it; otherwise they must land almost on the same point. A drag, failed click, changed display mapping or intervening mouse/keyboard input breaks the pair. Set `doubleClickEnabled` to `false` for separate clicks.
 
-Removing an idle source, or one whose accepted touch-up has already arrived, allows ordinary first-down admission on a replacement registration. If the currently accepted source disappears while still pressed, a prospective source must report release and then a fresh down before it can be accepted. Recovery uses reports and does not require restarting the driver. If a finger was lifted while disconnected and the device emits no neutral report on reconnect, this safeguard may consume the first real tap; that tap's release enables the next one. It is limited to interrupted accepted contacts. This first-tap loss can recover without restarting the driver.
+The touch reports currently handled by this driver contain one position. Two-finger scrolling and other multi-contact gestures remain unsupported. `gesture.multiTouchEnabled` is forced to `false`; an unsupported mode logs a warning and keeps direct touch behavior. It does not silently switch to single-finger scrolling.
 
-Endpoint registration identity does not establish physical-finger or panel identity. A previously silent endpoint beginning a stream after the prior gesture and debounce have ended may be admitted; the driver cannot distinguish a genuine new touch from an unobserved delayed alias using the available report format. This repair does not claim physical endpoint grouping or multiple-panel support.
+### Inconsistent touch reports
 
-The watchdog measures inactivity as processed on the serial gesture queue. When heartbeat and timeout compete, the first processed operation wins: a committed timeout cannot be reversed by a late report, even one captured earlier. Queued valid reports can keep a still-open gesture alive until one timeout after the last processed report, and queue starvation can delay cleanup. This is not a hardware-time or hard real-time guarantee.
+The driver checks consecutive reports before accepting a new touch. When a stream starts jumping between unrelated positions, it releases the affected gesture and looks for a consistent track. A deliberate touch can continue while unrelated reports arrive, provided the track remains clear. Noise alone cannot extend a held gesture indefinitely: a track that loses support for 120 ms is released. A quiet stream returns to normal validation automatically.
+
+Every report is checked, including reports that do not move the finger. During an established drag, queued movement can skip intermediate positions and use the latest accepted point. The first drag movement and final point before release are preserved. Scrolling keeps each accepted direction change.
+
+## Held touches and USB reconnect
+
+A held finger keeps the gesture alive while the Edge continues sending touch reports, even when the finger does not move. If reports stop for `timing.stuckGestureTimeoutMs` (2,000 ms by default), the driver releases the gesture. Lift and touch again after a timeout.
+
+New taps can wait briefly for the previous mouse-button release. The queue holds up to sixteen contacts and 256 events, with a 150 ms limit for admitting a waiting contact. Movements and releases stay in order, and the previous click keeps its minimum press time. Overflow, a timeout, a disconnected source or later mouse/keyboard input discards the affected work. Reports from other USB interfaces cannot take over an active gesture.
+
+If USB disconnects during a hold, the driver releases the mouse button. Before accepting another touch, it checks for a release from the replacement connection. On supported report-7 devices, it can also check the device's saved input values: all six fields must be available, two reads must agree that the buttons are up, and a button timestamp must be newer than the disconnect. Older queued reports are ignored. If those checks fail, the driver waits for a release.
+
+A full monitor power reset needs a different check because it can discard both the held touch and its lift. The supported reset path checks the USB location, new controller and hub connections, controller revision `bcdDevice=0x0150`, hub VID/PID `0x1a40/0x0801`, the report-7 format and two matching empty input reads. It waits for a fresh touch rather than treating a held finger as a new press. The reset check lasts ten seconds and includes the monitor's second startup connection. Other controller revisions, hubs and reconnects without a full reset keep the release requirement.
+
+USB connection identifiers do not uniquely identify a finger or physical panel. The available report format also cannot distinguish every delayed report from a new touch. Multiple-panel support and grouping reports from several connections remain unsupported.
+
+The timeout uses one pending timer, updated by reports from the active touch. Button-release and cursor cleanup have their own deadline. These checks run on the gesture queue, so a busy queue can delay cleanup. A late report cannot restart a gesture that has already timed out.
 
 ## Permission startup
 
-If synthetic event access is missing, the driver stays alive and waits before opening HID or starting gestures. It installs signal handlers first, makes at most one initial permission request sequence per process, and checks readiness without prompting every two seconds with 500 ms of timer leeway. Grant access to the executable or launcher identified in the log; startup continues automatically. SIGINT, SIGTERM, and normal stop cancel the wait and exit successfully. Cancellation cannot dismiss a dialog macOS has already shown.
+In System Settings > Privacy & Security, enable the driver under Device Control and Data Access and Input Monitoring. On macOS 26 and earlier, Device Control and Data Access is called Accessibility. The driver needs this access to prepare windows for touch, even if focus restoration is disabled. If access is missing, it stays running and waits; startup continues after approval.
 
-CoreGraphics post-event access and Accessibility trust remain separate checks. The existing compatibility rule accepts either; it does not prove that events reach another application. A missing focused window does not prevent touch startup. Apple's [Accessibility API documentation](https://developer.apple.com/documentation/applicationservices/1459186-axisprocesstrustedwithoptions) specifies that its prompt is asynchronous and does not change the immediate return value. The [CoreGraphics request](https://developer.apple.com/documentation/coregraphics/cgrequestposteventaccess()) runs on a separate worker so a blocked request cannot hold up shutdown. Only state changes are logged while waiting.
+Startup requests permission at most once per process and checks again every two seconds without repeated prompts. While waiting, it runs its read-only permission check in a short-lived process because macOS can keep an old answer in the running driver. Only one check runs at a time; a timeout or invalid answer cannot start touch input. You can stop the driver while it waits. Stopping cannot dismiss a permission dialog macOS has already shown. Apple's [Accessibility API documentation](https://developer.apple.com/documentation/applicationservices/1459186-axisprocesstrustedwithoptions) explains that the prompt does not grant access immediately. The [CoreGraphics request](https://developer.apple.com/documentation/coregraphics/cgrequestposteventaccess()) runs separately so it cannot hold up shutdown.
 
-This wait addresses the synthetic-permission restart loop reported in [issue #1](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/issues/1). Input Monitoring and HID open errors remain separate startup failures, reported with the IOKit error code. Opening HID can itself request Input Monitoring access; denial or another process holding exclusive device access can still cause a failed launch. The driver does not retry HID open on each permission poll. No persistent prompt marker or permission settings are added.
+If Input Monitoring is denied, the driver waits for a confirmed grant before opening the device again. An error such as `kIOReturnNotPermitted` starts that wait too. It closes a failed device-open attempt before retrying. If macOS still remembers the denial after approval, startup refreshes once to clear that answer. If the refresh fails, the driver stops and logs a request to check permissions and restart it; it cannot keep restarting itself. Other USB errors, including another process holding the device exclusively, still stop startup and are recorded in the log. This addresses the restart loop reported in [issue #1](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/issues/1). The driver does not change your permission settings.
+
+Run `MacXeneonEdgeTouchDriver --check-permissions` for a JSON snapshot without opening the touch device, requesting access or generating input. Exit status is zero only when device-control and Input Monitoring access are already granted; otherwise it is 77.
+
+An update or signing change may need a new permission approval. If the driver's entry is enabled but access is still denied, remove that entry and add the installed executable again. Do this only for the driver, in the affected permission category.
 
 ## Known Caveats
 
-- This version targets a single Xeneon Edge panel in landscape orientation. Rotations and multiple matching panels have not been validated.
-- A silent or interrupted accepted contact still reaches the safety timeout (`timing.stuckGestureTimeoutMs`, 2,000 ms by default). Continued held reports after cancellation cannot restart that contact; release and touch again. The hardware session verified stationary-report liveness and release-then-fresh-touch recovery on one panel.
-- Focus restoration is best effort. An intentional app or window selection made during a touch may be restored over, as with the previous behavior. Changes observed after the accepted touch-up report, a newer gesture, shutdown, target invalidation, or a Space/session change stop further restoration work. HID reports and focus notifications can arrive late, so the software boundary cannot establish the exact physical finger-lift time. An AX request already sent to another app can still finish afterward; invalidation cannot undo it.
-- With cursor return enabled, physical mouse movement during a touch does not change the saved return position. With it disabled, cleanup leaves the cursor at its current position rather than warping to an assumed final touch point.
-- Multi-contact gestures are not supported as the hardware doesn't report this information back.
-- If the process is killed with `SIGKILL`, normal shutdown cleanup cannot run. Relaunching the driver or moving the physical mouse after cursor association is restored may be needed.
+- This version supports one Xeneon Edge in landscape orientation. Rotation and multiple Edge panels have not been tested.
+- If touch reports stop, `timing.stuckGestureTimeoutMs` releases the gesture. Lift and touch again to continue.
+- Apps must expose their windows and text fields through macOS Accessibility for focus restoration to work. Mouse clicks, typing and scrolling cancel further restoration, but a request already sent to an app may still finish afterward.
+- With cursor return enabled, moving the mouse during a touch does not change the saved return position. With it disabled, the cursor stays where it is after cleanup.
+- The supported report format contains one position, so multi-contact gestures are unsupported.
+- Killing the process with `SIGKILL` prevents normal cleanup. Restarting the driver or moving the mouse after cursor control is restored may be needed.
 
 ## Troubleshooting
 
-- If the driver is waiting for synthetic event permission, grant Accessibility to the exact executable or launcher shown in the log. It will continue without a restart.
-- If HID open fails, check Input Monitoring permission and confirm no other process has seized the same VID/PID device.
+- If the driver is waiting for synthetic event permission, enable Device Control and Data Access (Accessibility on earlier macOS) for the exact executable or launcher shown in the log. Startup continues after approval.
+- If the driver is waiting for HID listen access, grant Input Monitoring to the executable or launcher identified in the log. Startup continues once access is granted. If the device is in exclusive use, close the other driver or diagnostic tool.
 - If taps land on the wrong display, run `swift run DisplayInfo` and adjust the optional display config override.
-- For HID investigation, stop the production daemon using the commands above, then run `swift run HIDDump`. The bundled diagnostic uses non-seize mode. Do not run a seizing build of HIDDump or another driver instance alongside the production daemon. Quit HIDDump before starting the installed LaunchAgent again.
+- For HID investigation, stop the production daemon using the commands above, then run `swift run HIDDump`. The bundled diagnostic uses non-seize mode. Do not run a seizing build of HIDDump or another driver instance alongside the production daemon. Quit HIDDump before starting the installed LaunchAgent again. `swift run HIDDump --describe-input-cache` reports descriptors and cached-read errors without opening the device. Add `--open` for non-seize cached reads after stopping the driver; this mode requires an existing HID grant and neither prompts nor sends feature requests.
+
+### Opt-in HID cache diagnostic
+
+With one XENEON attached, all fingers lifted and the installed driver stopped, run:
+
+```sh
+XENEON_RUN_HARDWARE_TESTS=1 swift test --filter HIDRecoveryHardwareTests
+```
+
+This check uses the production cached-release reader, requires already-granted Input Monitoring, and closes its non-seize HID manager before returning. It posts no input and requests no permissions. It checks descriptor support, coherent initialized neutral values and rejection of stale release evidence. It does not replace a physical reconnect test. Restart the installed service afterward. Ordinary test runs skip this hardware check.
+
+
+### Timing and report replay
+
+Set `diagnostics.performanceMetricsEnabled` to `true` to write a timing summary when the driver stops normally. It reports counts and recent median, 95th and 99th percentile timings for queued reports, mouse-event posting and focus restoration. Canceled or unverified focus work is counted separately. The summary contains no typed text or touch coordinates. Event-posting times do not establish when an app received the click.
+
+For an offline check, run:
+
+```sh
+swift run -c release Benchmarks
+swift run -c release Benchmarks --timers
+swift run -c release Benchmarks --backlog
+swift run -c release Benchmarks --trace recording.jsonl
+```
+
+The default replay generates repeatable taps. `--backlog` simulates delayed drag reports to check movement coalescing and balanced button release. `--timers` measures queue wake delays without touch input. Trace replay uses the driver's parser and gesture handling with simulated mouse, cursor and focus effects. It cannot establish physical touch accuracy or native focus behavior.
+
+To record raw touch reports, stop the installed driver first, then run `swift run HIDDump --record recording.jsonl`. The destination must be a new file. Quit the recorder before restarting the driver. Recordings contain touch coordinates, timestamps and USB connection identifiers; review them before sharing. The recorder does not change USB modes or request new permission grants.
 
 ## Contributors
 
 Thanks to [Greg Thompson (`isleofgreg`)](https://github.com/isleofgreg) for the per-touch-down display refresh proposal and moved-display regression test in [PR #4](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/pull/4), which this driver adapts.
 
-Thanks to [Clark Hager](https://github.com/clarkhager) for the already-focused-window guard proposed in [PR #5](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/pull/5). The focus restoration implementation retains that guard, with regression tests that verify it skips focus mutations when the target window is already focused.
+Thanks to [Clark Hager](https://github.com/clarkhager) for the focus check proposed in [PR #5](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/pull/5). The driver keeps that check to avoid unnecessarily refocusing an already focused window.
+
+Thanks to [`mrnocreativity`](https://github.com/mrnocreativity) for the touch-stream validation and gesture proposals in [PR #3](https://github.com/ajvwhite/MacXeneonEdgeTouchDriver/pull/3). The noise tracking, double-click and optional scroll work follows those proposals with separate implementation and tests.

@@ -65,8 +65,11 @@ final class HIDInputReportRegistration {
     let retirementFence: HIDSourceRetirementFence
 
     private let parser = HIDValueParser()
+    private var neutralState: HIDNeutralState?
+    private(set) var hasParsedPressedReport = false
     private let receiveObservation: (HIDTouchObservation, HIDSourceRetirementFence) -> Void
     private let token: UInt
+    private var callbackDiagnosticCount = 0
     private let sender: UnsafeMutableRawPointer
     private let receive: (UInt32, [UInt8], DispatchTime) -> Void
 
@@ -108,6 +111,17 @@ final class HIDInputReportRegistration {
         Self.registry.remove(token)
     }
 
+    /// A cache certificate may precede queued older raw packets. It is installed
+    /// only before this registration has admitted a pressed report.
+    @discardableResult
+    func installNeutralState(_ state: HIDNeutralState) -> Bool {
+        precondition(Thread.isMainThread)
+        guard !retirementFence.isRetired, !hasParsedPressedReport,
+              state.reportTimestamp > 0 else { return false }
+        neutralState = state
+        return true
+    }
+
     /// The production C callback and deterministic tests share this exact ingress.
     static func handleCallback(
         context: UnsafeMutableRawPointer?,
@@ -117,21 +131,38 @@ final class HIDInputReportRegistration {
         reportID: UInt32,
         report: UnsafeMutablePointer<UInt8>,
         reportLength: CFIndex,
-        timestamp: DispatchTime = .now()
+        timestamp: DispatchTime = .now(),
+        providerTimestamp: UInt64? = nil
     ) {
         // The manager is scheduled only on the main run loop. Do not access the
         // registry or parser if a callback unexpectedly arrives elsewhere.
-        guard Thread.isMainThread,
-              result == kIOReturnSuccess,
+        guard Thread.isMainThread, let context,
+              let registration = registry.registration(for: UInt(bitPattern: context)) else { return }
+        if registration.callbackDiagnosticCount < 4 {
+            registration.callbackDiagnosticCount += 1
+            DriverLoggers.log(.debug, category: .hid,
+                "Input callback metadata: result=\(result), type=\(type.rawValue), reportID=\(reportID), length=\(reportLength), senderMatches=\(sender == registration.sender), bufferMatches=\(report == registration.buffer).")
+        }
+        guard result == kIOReturnSuccess,
               type == kIOHIDReportTypeInput,
               reportID == UInt32(XeneonEdgeDevice.touchReportID),
               reportLength >= XeneonEdgeDevice.touchReportLength,
-              let context,
-              let registration = registry.registration(for: UInt(bitPattern: context)),
               sender == registration.sender,
               report == registration.buffer,
               reportLength <= registration.length else {
             return
+        }
+
+        if let neutral = registration.neutralState {
+            guard let providerTimestamp else { return }
+            if providerTimestamp == 0 {
+                // Old IOKit providers may omit timestamps. Never infer ordering
+                // for a held packet; an explicit raw release restores that path.
+                guard registration.buffer[1] == 0 else { return }
+                registration.neutralState = nil
+            } else {
+                guard providerTimestamp > neutral.reportTimestamp else { return }
+            }
         }
 
         // Both the pointer and its bound now refer to a live owned allocation.
@@ -142,6 +173,10 @@ final class HIDInputReportRegistration {
                 sourceID: registration.sourceID, reportID: Int(reportID),
                 bytes: bytes, timestamp: timestamp
             ) else { return }
+            if let event = observation.event, event.kind != .move {
+                DriverLoggers.log(.debug, category: .hid, "Normalized HID contact event: \(event.kind), epoch=\(observation.contactEpoch).")
+            }
+            if observation.isPressed { registration.hasParsedPressedReport = true }
             registration.receiveObservation(observation, registration.retirementFence)
             registration.receive(reportID, bytes, timestamp)
         }

@@ -14,6 +14,19 @@ public struct HIDTouchObservation: Equatable, Sendable {
     public let isPressed: Bool
     public let timestamp: DispatchTime
     public let event: TouchEvent?
+    public let rawX: Int?
+    public let rawY: Int?
+
+    public init(sourceID: HIDSourceID, contactEpoch: UInt64, isPressed: Bool,
+                timestamp: DispatchTime, event: TouchEvent?, rawX: Int? = nil, rawY: Int? = nil) {
+        self.sourceID = sourceID
+        self.contactEpoch = contactEpoch
+        self.isPressed = isPressed
+        self.timestamp = timestamp
+        self.event = event
+        self.rawX = rawX
+        self.rawY = rawY
+    }
 }
 
 /// A registration may retire while its immutable reports wait on the event queue.

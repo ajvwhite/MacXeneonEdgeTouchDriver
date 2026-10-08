@@ -274,3 +274,28 @@ final class ConfigurationTests: XCTestCase {
             .appendingPathComponent("MacXeneonEdgeTouchDriverTests", isDirectory: true)
     }
 }
+
+
+extension ConfigurationTests {
+    func testScrollModeConfigAndBoundsPreserveOtherSettings() throws {
+        let result = DriverConfiguration.load(from: try writeConfig("""
+        {"focus":{"restorePreviousWindow":false},"gesture":{"mode":"scroll","holdDurationMs":50,"movementThresholdPx":200,"scrollSensitivity":20,"doubleClickEnabled":false}}
+        """))
+        XCTAssertEqual(result.configuration.gesture.mode, .scroll)
+        XCTAssertEqual(result.configuration.gesture.holdDurationMs, 100)
+        XCTAssertEqual(result.configuration.gesture.movementThresholdPx, 100)
+        XCTAssertEqual(result.configuration.gesture.scrollSensitivity, 10)
+        XCTAssertFalse(result.configuration.gesture.doubleClickEnabled)
+        XCTAssertFalse(result.configuration.focus.restorePreviousWindow)
+        XCTAssertEqual(result.warnings.count, 3)
+    }
+
+    func testUnsupportedTwoFingerModeDoesNotEnableSingleFingerScroll() throws {
+        let result = DriverConfiguration.load(from: try writeConfig("""
+        {"gesture":{"mode":"twoFingerScroll"}}
+        """))
+        XCTAssertEqual(result.configuration.gesture.mode, .direct)
+        XCTAssertEqual(result.warnings.count, 1)
+        XCTAssertTrue(result.warnings[0].contains("Two-finger scrolling is unavailable"))
+    }
+}

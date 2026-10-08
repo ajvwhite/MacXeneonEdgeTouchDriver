@@ -10,7 +10,20 @@ protocol GestureScheduler {
     var now: DispatchTime { get }
 
     @discardableResult
+    func schedule(at deadline: DispatchTime, action: @escaping () -> Void) -> GestureScheduledTask
+
+    @discardableResult
     func schedule(afterMilliseconds milliseconds: Int, action: @escaping () -> Void) -> GestureScheduledTask
+}
+
+extension GestureScheduler {
+    @discardableResult
+    func schedule(at deadline: DispatchTime, action: @escaping () -> Void) -> GestureScheduledTask {
+        let current = now.uptimeNanoseconds
+        let remaining = deadline.uptimeNanoseconds > current ? deadline.uptimeNanoseconds - current : 0
+        let milliseconds = Int(remaining / 1_000_000 + (remaining % 1_000_000 == 0 ? 0 : 1))
+        return schedule(afterMilliseconds: milliseconds, action: action)
+    }
 }
 
 /// Preserves the controller's synchronous behavior when no queue or delay is supplied.
@@ -22,6 +35,17 @@ final class DispatchGestureScheduler: GestureScheduler {
     }
 
     var now: DispatchTime { .now() }
+
+    @discardableResult
+    func schedule(at deadline: DispatchTime, action: @escaping () -> Void) -> GestureScheduledTask {
+        let workItem = DispatchWorkItem(block: action)
+        guard deadline > now, let queue else {
+            workItem.perform()
+            return workItem
+        }
+        queue.asyncAfter(deadline: deadline, execute: workItem)
+        return workItem
+    }
 
     @discardableResult
     func schedule(afterMilliseconds milliseconds: Int, action: @escaping () -> Void) -> GestureScheduledTask {

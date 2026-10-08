@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import IOKit
 import IOKit.hid
@@ -51,6 +52,11 @@ public final class HIDDeviceMonitor {
     private var reportRegistrations: [HIDReportRegistration] = []
     private var managerCallbackRegistration: HIDManagerCallbackRegistration?
     private var isStarted = false
+    private var lastSourceLossTimestamp: UInt64 = 0
+    private var powerResetTracker = HIDUSBPowerResetTracker()
+    private var usbIdentities: [HIDSourceID: HIDUSBPowerIdentity] = [:]
+    private let sourcePowerResetHandler: ((HIDSourceID, HIDSourceRetirementFence) -> Void)?
+    private let sourceNeutralHandler: ((HIDSourceID, HIDSourceRetirementFence) -> Void)?
 
     /// Creates a HID monitor for the Xeneon Edge touchscreen controller.
     ///
@@ -71,11 +77,15 @@ public final class HIDDeviceMonitor {
         deviceRemovalHandler: @escaping DeviceRemovalHandler,
         deviceMatchedHandler: @escaping DeviceMatchedHandler = {},
         observationHandler: ObservationHandler? = nil,
-        sourceRemovalHandler: SourceRemovalHandler? = nil
+        sourceRemovalHandler: SourceRemovalHandler? = nil,
+        sourceNeutralHandler: ((HIDSourceID, HIDSourceRetirementFence) -> Void)? = nil,
+        sourcePowerResetHandler: ((HIDSourceID, HIDSourceRetirementFence) -> Void)? = nil
     ) {
         self.manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         self.eventQueue = eventQueue
         self.touchEventHandler = touchEventHandler
+        self.sourceNeutralHandler = sourceNeutralHandler
+        self.sourcePowerResetHandler = sourcePowerResetHandler
         if let observationHandler {
             self.observationDelivery = HIDSerialDelivery<HIDObservationDeliveryPayload>(queue: eventQueue) { payload in
                 // Observation mode never invokes the legacy event callback.
@@ -125,7 +135,10 @@ public final class HIDDeviceMonitor {
         IOHIDManagerRegisterDeviceRemovalCallback(manager, hidDeviceRemovedCallback, context)
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
-        let openResult = IOHIDManagerOpen(manager, openOptions)
+        let openResult = HIDManagerOpenAttempt.perform(
+            open: { IOHIDManagerOpen(manager, openOptions) },
+            close: { IOHIDManagerClose(manager, openOptions) }
+        )
         guard openResult == kIOReturnSuccess else {
             callbacks.invalidate()
             managerCallbackRegistration = nil
@@ -147,6 +160,9 @@ public final class HIDDeviceMonitor {
 
         precondition(Thread.isMainThread, "HID monitoring must stop on the main thread.")
         isStarted = false
+        powerResetTracker.invalidate()
+        usbIdentities.removeAll()
+        lastSourceLossTimestamp = mach_absolute_time()
         managerCallbackRegistration?.invalidate()
         managerCallbackRegistration = nil
         IOHIDManagerRegisterDeviceMatchingCallback(manager, nil, nil)
@@ -172,14 +188,20 @@ public final class HIDDeviceMonitor {
             }
         )
         reportRegistrations.append(registration)
+        if registration.input.length == XeneonEdgeDevice.touchReportLength,
+           let identity = HIDUSBPowerIdentity.read(device: device) {
+            usbIdentities[registration.input.sourceID] = identity
+        }
 
-        IOHIDDeviceRegisterInputReportCallback(
+        IOHIDDeviceRegisterInputReportWithTimeStampCallback(
             device,
             registration.input.buffer,
             registration.input.length,
             hidInputReportCallback,
             registration.input.context
         )
+
+        if lastSourceLossTimestamp > 0 { recoverNeutralState(for: registration) }
 
         DriverLoggers.log(
             .notice,
@@ -196,6 +218,12 @@ public final class HIDDeviceMonitor {
         precondition(Thread.isMainThread, "HID callbacks must use the main run loop.")
         guard isStarted else { return }
         let removed = reportRegistrations.filter { $0.matches(device) }
+        if !removed.isEmpty { lastSourceLossTimestamp = mach_absolute_time() }
+        for registration in removed {
+            if let identity = usbIdentities.removeValue(forKey: registration.input.sourceID) {
+                powerResetTracker.removed(identity)
+            }
+        }
         removed.forEach { $0.input.invalidate() }
         // Removal can precede the manager dropping its device reference. Stop
         // report delivery before releasing our preallocated input buffers.
@@ -214,6 +242,48 @@ public final class HIDDeviceMonitor {
                 deviceRemovalHandler()
             }
         }
+    }
+
+    private func recoverNeutralState(for registration: HIDReportRegistration) {
+        guard sourceNeutralHandler != nil || sourcePowerResetHandler != nil,
+              let reader = HIDNeutralStateReader(device: registration.device) else { return }
+        let lossTimestamp = lastSourceLossTimestamp
+        let deadline = DispatchTime.now() + .seconds(5)
+        func attempt() {
+            guard isStarted, !registration.input.retirementFence.isRetired,
+                  !registration.input.hasParsedPressedReport else { return }
+            if let identity = usbIdentities[registration.input.sourceID],
+               let handler = sourcePowerResetHandler,
+               !registration.input.hasParsedPressedReport,
+               powerResetTracker.qualifies(identity, now: DispatchTime.now().uptimeNanoseconds),
+               reader.hasUninitializedResetCache() {
+                let sourceID = registration.input.sourceID
+                let fence = registration.input.retirementFence
+                eventQueue.async(execute: DispatchWorkItem {
+                    guard !fence.isRetired else { return }
+                    handler(sourceID, fence)
+                })
+                DriverLoggers.log(.debug, category: .hid,
+                    "Qualified monitor power reset; replacement input starts a fresh contact stream.")
+                return
+            }
+            if let state = reader.read(after: lossTimestamp), registration.input.installNeutralState(state) {
+                let sourceID = registration.input.sourceID
+                let fence = registration.input.retirementFence
+                let handler = sourceNeutralHandler
+                eventQueue.async(execute: DispatchWorkItem {
+                    guard !fence.isRetired else { return }
+                    handler?(sourceID, fence)
+                })
+                DriverLoggers.log(.debug, category: .hid, "Confirmed cached release for replacement HID endpoint.")
+                return
+            }
+            guard DispatchTime.now() < deadline else { return }
+            // One bounded chain per replacement endpoint; no report-rate polling.
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50),
+                                          execute: DispatchWorkItem(block: attempt))
+        }
+        attempt()
     }
 
     private func handleObservation(_ observation: HIDTouchObservation, fence: HIDSourceRetirementFence) {
@@ -291,7 +361,7 @@ private final class HIDReportRegistration {
     }
 
     func unregisterCallback() {
-        IOHIDDeviceRegisterInputReportCallback(device, input.buffer, input.length, nil, input.context)
+        IOHIDDeviceRegisterInputReportWithTimeStampCallback(device, input.buffer, input.length, nil, input.context)
     }
 
     func matches(_ otherDevice: IOHIDDevice) -> Bool {
@@ -318,11 +388,13 @@ private func hidDeviceRemovedCallback(
 private func hidInputReportCallback(
     _ context: UnsafeMutableRawPointer?, _ result: IOReturn,
     _ sender: UnsafeMutableRawPointer?, _ type: IOHIDReportType,
-    _ reportID: UInt32, _ report: UnsafeMutablePointer<UInt8>, _ reportLength: CFIndex
+    _ reportID: UInt32, _ report: UnsafeMutablePointer<UInt8>, _ reportLength: CFIndex,
+    _ providerTimestamp: UInt64
 ) {
     HIDInputReportRegistration.handleCallback(
         context: context, result: result, sender: sender, type: type,
-        reportID: reportID, report: report, reportLength: reportLength
+        reportID: reportID, report: report, reportLength: reportLength,
+        providerTimestamp: providerTimestamp
     )
 }
 

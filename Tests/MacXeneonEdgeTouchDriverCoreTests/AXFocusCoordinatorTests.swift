@@ -4,6 +4,262 @@ import Foundation
 import XCTest
 
 final class AXFocusCoordinatorTests: XCTestCase {
+    func testWindowlessSourceAXReadMaySettleWithoutRepeatingActivation() {
+        let f = windowlessFixture()
+        var unsettledReads = 0
+        f.backend.onResolve = {
+            if f.workspace.activationCount > 0 && f.backend.attemptCount == 0 {
+                unsettledReads += 1
+                f.backend.resolveFailure = unsettledReads == 1
+                    ? AXFocusFailure(stage: "focused window", error: .noValue, systemWideError: .noValue) : nil
+            }
+        }
+        f.restorer.restoreCapturedWindow(); f.pump()
+        XCTAssertGreaterThan(unsettledReads, 1)
+        XCTAssertEqual(f.workspace.activationCount, 1)
+        XCTAssertEqual(f.backend.attemptCount, 1)
+    }
+
+    func testExactRecipientVerificationMaySettleWithoutRepeatingSetter() {
+        let f = windowlessFixture()
+        var verificationReads = 0
+        f.backend.onAttempt = {}
+        f.backend.onResolve = {
+            if f.backend.attemptCount > 0 {
+                verificationReads += 1
+                if verificationReads == 2 { f.backend.focused = f.captured }
+            }
+        }
+        f.restorer.restoreCapturedWindow(); f.pump()
+        XCTAssertEqual(verificationReads, 2)
+        XCTAssertEqual(f.workspace.activationCount, 1)
+        XCTAssertEqual(f.backend.attemptCount, 1)
+        XCTAssertEqual(f.backend.relationship(f.backend.focused, f.captured), .same)
+    }
+
+    func testWindowlessActivationCannotSetRecipientAfterReleaseBudgetExpires() {
+        let f = windowlessFixture()
+        let activate = f.workspace.onActivate
+        f.workspace.onActivate = { activate?(); f.clock.nanoseconds = 150_000_000 }
+        f.restorer.restoreCapturedWindow(); f.pump()
+        XCTAssertEqual(f.workspace.activationCount, 1)
+        XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
+    func testWindowlessPassiveDestinationActivatesSourceOnceThenRestoresExactRecipient() {
+        let f = windowlessFixture()
+        f.restorer.restoreCapturedWindow(); f.pump()
+        XCTAssertEqual(f.workspace.activationCount, 1)
+        XCTAssertEqual(f.backend.attemptCount, 1)
+        XCTAssertGreaterThanOrEqual(f.backend.windowlessResolveCount, 2)
+        XCTAssertEqual(f.backend.relationship(f.backend.focused, f.captured), .same)
+    }
+
+    func testWindowlessDestinationRequiresVerifiedPassiveTargetAndRestorableRecipient() {
+        for passive in [false, true] {
+            let f = windowlessFixture(passive: passive)
+            if passive { f.backend.exactRecipientRestorable = false }
+            f.restorer.restoreCapturedWindow(); f.pump()
+            XCTAssertEqual(f.workspace.activationCount, 0)
+            XCTAssertEqual(f.backend.attemptCount, 0)
+        }
+    }
+
+    func testWindowlessActivationFailureOrUnobservedActivationNeverSetsRecipient() {
+        for requestFails in [false, true] {
+            let f = windowlessFixture()
+            f.workspace.activationSucceeds = !requestFails
+            f.workspace.reportsActive = requestFails
+            f.restorer.restoreCapturedWindow(); f.pump()
+            XCTAssertEqual(f.workspace.activationCount, 1)
+            XCTAssertEqual(f.backend.attemptCount, 0)
+        }
+    }
+
+    func testPhysicalChoiceOrLifecycleAfterSourceActivationPreventsRecipientSetter() {
+        for lifecycle in [false, true] {
+            var inputUnchanged = true
+            let f = windowlessFixture(inputPermit: { inputUnchanged })
+            let restoreSource = f.workspace.onActivate
+            f.workspace.onActivate = {
+                restoreSource?()
+                if lifecycle { f.workspace.emit(.lifecycleChanged) } else { inputUnchanged = false }
+            }
+            f.restorer.restoreCapturedWindow(); f.pump()
+            XCTAssertEqual(f.workspace.activationCount, 1)
+            XCTAssertEqual(f.backend.attemptCount, 0)
+        }
+    }
+
+    func testWindowlessDestinationChangeDuringCertificateReadCannotActivateSource() {
+        let f = windowlessFixture()
+        f.backend.onWindowlessResolve = { f.workspace.emit(.focusChanged) }
+        f.restorer.restoreCapturedWindow(); f.pump()
+        XCTAssertEqual(f.workspace.activationCount, 0)
+        XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
+    private func windowlessFixture(passive: Bool = true, inputPermit: @escaping () -> Bool = { true }) -> FocusCoordinatorFixture {
+        let f = FocusCoordinatorFixture(inputPermit: inputPermit, withTypingRecipient: true)
+        f.prepare()
+        f.restorer.syntheticInputWillBegin(targetProcessIdentifier: 20, permitsWindowlessDestination: passive)
+        f.restorer.inputDidEnd(); f.changeFocusDuringTouch(enroll: false)
+        f.backend.resolveFailure = AXFocusFailure(stage: "focused window", error: .noValue, systemWideError: .noValue)
+        f.backend.windowless = AXWindowlessFocusTarget(application: f.other.application, workspaceApplication: f.other.workspaceApplication)
+        f.workspace.onActivate = {
+            f.backend.resolveFailure = nil
+            f.backend.focused = coordinatorTarget(pid: 10, window: "first")
+        }
+        f.backend.onAttempt = { f.backend.focused = f.captured }
+        return f
+    }
+
+    func testVerifiedClickDestinationCanActivateAfterRawLiftAndRestoreCapturedSource() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        f.restorer.syntheticInputWillBegin(targetProcessIdentifier: 20)
+        f.restorer.inputDidEnd()
+        f.changeFocusDuringTouch(enroll: false)
+        f.backend.onAttempt = {
+            f.backend.focused = f.captured
+            f.workspace.frontmost = f.captured.workspaceApplication
+        }
+        f.restorer.restoreCapturedWindow(); f.pump()
+        XCTAssertEqual(f.backend.attemptCount, 1)
+        XCTAssertEqual(f.backend.lastAttemptBaseline.map { f.backend.relationship($0, f.other) }, .same)
+    }
+
+    func testPostDeliveryThirdApplicationCannotBorrowClickPermission() {
+        let f = FocusCoordinatorFixture()
+        f.prepare(); f.restorer.syntheticInputWillBegin(targetProcessIdentifier: 20)
+        f.restorer.inputDidEnd()
+        let third = coordinatorTarget(pid: 30, window: "unrelated")
+        f.backend.focused = third; f.workspace.frontmost = third.workspaceApplication
+        f.workspace.emit(.focusChanged)
+        f.restorer.restoreCapturedWindow(); f.pump()
+        XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
+    func testRealInputAfterLiftStillCancelsOwnedClickRestoration() {
+        var unchanged = true
+        let f = FocusCoordinatorFixture(inputPermit: { unchanged })
+        f.prepare(); f.restorer.syntheticInputWillBegin(targetProcessIdentifier: 20)
+        f.restorer.inputDidEnd(); f.changeFocusDuringTouch(enroll: false)
+        unchanged = false
+        f.restorer.restoreCapturedWindow(); f.pump()
+        XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
+    func testDestinationChangeDuringPostDeliveryReadCannotCommitRestore() {
+        let f = FocusCoordinatorFixture()
+        f.prepare(); f.restorer.syntheticInputWillBegin(targetProcessIdentifier: 20)
+        f.restorer.inputDidEnd(); f.changeFocusDuringTouch(enroll: false)
+        f.backend.onResolve = { f.workspace.emit(.focusChanged) }
+        f.restorer.restoreCapturedWindow(); f.pump()
+        XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
+    func testUnavailableCaptureDoesNotBlockSeparatelyVerifiedTargetActivation() {
+        let f = FocusCoordinatorFixture()
+        f.backend.observationSucceeds = false
+        f.prepare()
+        XCTAssertTrue(f.restorer.beginTargetActivation())
+        var accepted: Bool?
+        f.restorer.confirmTargetActivation { accepted = $0 }
+        f.pump()
+        XCTAssertEqual(accepted, true)
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
+    func testIndependentConfirmationQueuedBeforeDiscardIsInvalidated() {
+        let f = FocusCoordinatorFixture()
+        f.backend.observationSucceeds = false
+        f.prepare()
+        XCTAssertTrue(f.restorer.beginTargetActivation())
+        var accepted: Bool?
+        f.restorer.confirmTargetActivation { accepted = $0 }
+        f.restorer.discardCapturedWindow()
+        f.pump()
+        XCTAssertEqual(accepted, false)
+    }
+
+    func testShutdownCannotAcceptIndependentTargetActivation() {
+        let f = FocusCoordinatorFixture()
+        f.backend.observationSucceeds = false
+        f.prepare()
+        XCTAssertTrue(f.restorer.beginTargetActivation())
+        f.restorer.shutdown()
+        var accepted: Bool?
+        f.restorer.confirmTargetActivation { accepted = $0 }
+        f.pump()
+        XCTAssertEqual(accepted, false)
+        XCTAssertFalse(f.restorer.beginTargetActivation())
+    }
+
+    func testOwnRestorationNotificationsDoNotSuppressFreshVerification() {
+        let f = FocusCoordinatorFixture()
+        f.prepare(); f.changeFocusDuringTouch()
+        f.backend.onAttempt = {
+            f.backend.focused = f.captured
+            f.workspace.frontmost = f.captured.workspaceApplication
+            f.workspace.emit(.focusChanged)
+            f.backend.emit(.keyboardFocusChanged, processIdentifier: 10)
+        }
+        let before = f.backend.resolveCount
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.attemptCount, 1)
+        XCTAssertGreaterThan(f.backend.resolveCount, before + 1, "An issued action must receive fresh verification")
+        XCTAssertEqual(f.backend.relationship(f.backend.focused, f.captured), .same)
+    }
+
+    func testOwnedTargetActivationIsCertifiedBeforeTouchDelivery() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        XCTAssertTrue(f.restorer.beginTargetActivation())
+        f.changeFocusDuringTouch(enroll: false)
+        var accepted: Bool?
+        f.restorer.confirmTargetActivation { accepted = $0 }
+        XCTAssertNil(accepted)
+        f.pump()
+        XCTAssertEqual(accepted, true)
+        XCTAssertEqual(f.backend.observers.count, 2)
+        f.backend.onAttempt = {
+            f.backend.focused = f.captured
+            f.workspace.frontmost = f.captured.workspaceApplication
+        }
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.attemptCount, 1)
+    }
+
+    func testTargetActivationCannotOutliveWorkspaceSessionLoss() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        XCTAssertTrue(f.restorer.beginTargetActivation())
+        f.workspace.emit(.lifecycleChanged)
+        var accepted: Bool?
+        f.restorer.confirmTargetActivation { accepted = $0 }
+        f.pump()
+        XCTAssertEqual(accepted, false)
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
+    func testReleaseDuringTargetCertificationCannotCreateALateBaseline() {
+        let f = FocusCoordinatorFixture()
+        f.prepare()
+        XCTAssertTrue(f.restorer.beginTargetActivation())
+        f.changeFocusDuringTouch(enroll: false)
+        var accepted: Bool?
+        f.restorer.confirmTargetActivation { accepted = $0 }
+        _ = f.main.runAll()
+        f.restorer.inputDidEnd()
+        f.pump()
+        XCTAssertEqual(accepted, false)
+        f.releaseAndRestore()
+        XCTAssertEqual(f.backend.attemptCount, 0)
+    }
+
     func testAcceptedPhysicalUpPreventsPostReleaseEnrollmentDuringSyntheticUpDelay() {
         for upDelay in [0, 20, 1_000] {
             let f = CoordinatorGestureFixture(upDelay: upDelay)
@@ -715,19 +971,23 @@ private final class FocusCoordinatorFixture {
     let worker = FocusManualExecutor()
     let callbacks = FocusManualExecutor()
     let clock = CoordinatorClock()
-    let captured = coordinatorTarget(pid: 10, window: "first")
+    let captured: AXFocusTarget
     let other = coordinatorTarget(pid: 20, window: "other")
     let backend: CoordinatorBackendFake
     let workspace: CoordinatorWorkspaceFake
     let restorer: AXFocusRestorer
 
-    init(now: (() -> UInt64)? = nil) {
+    init(now: (() -> UInt64)? = nil, inputPermit: @escaping () -> Bool = { true }, withTypingRecipient: Bool = false) {
+        let target = coordinatorTarget(pid: 10, window: "first")
+        captured = AXFocusTarget(application: target.application, window: target.window,
+            workspaceApplication: target.workspaceApplication,
+            focusedElement: withTypingRecipient ? AXFocusElement(rawValue: "text" as NSString) : nil)
         backend = CoordinatorBackendFake(focused: captured)
         workspace = CoordinatorWorkspaceFake(application: captured.workspaceApplication)
         let clock = self.clock
         restorer = AXFocusRestorer(backend: backend, workspace: workspace,
             onMain: main.enqueue, onWorker: worker.enqueue, onCallback: callbacks.enqueue,
-            now: now ?? { clock.nanoseconds })
+            now: now ?? { clock.nanoseconds }, captureInputPermit: { inputPermit })
     }
 
     func prepare() {
@@ -750,7 +1010,8 @@ private final class FocusCoordinatorFixture {
     }
 
     func pump(includeCallbacks: Bool = true) {
-        for _ in 0..<30 {
+        // Settling adds bounded read-only main/worker stages after one action.
+        for _ in 0..<80 {
             let didMain = main.runAll()
             let didWorker = worker.runAll()
             let didCallbacks = includeCallbacks && callbacks.runAll()
@@ -831,6 +1092,12 @@ private final class CoordinatorBackendFake: AXFocusBackendProtocol {
     var observationSource: CFRunLoopSource?
     var resolveCount = 0
     var attemptCount = 0
+    var lastAttemptBaseline: AXFocusTarget?
+    var resolveFailure: AXFocusFailure?
+    var windowless: AXWindowlessFocusTarget?
+    var windowlessResolveCount = 0
+    var exactRecipientRestorable = true
+    var onWindowlessResolve: (() -> Void)?
     var observers: [CoordinatorObservationFake] = []
     var onResolve: (() -> Void)?
     var onAttempt: (() -> Void)?
@@ -847,19 +1114,36 @@ private final class CoordinatorBackendFake: AXFocusBackendProtocol {
     func resolve(workspace: AXFocusWorkspaceApplication?, permit: () -> Bool) -> AXFocusResolution {
         resolveCount += 1
         onResolve?()
+        if let resolveFailure { return .unknown(resolveFailure) }
         return .known(focused) // Deliberately can return a stale answer after its permit expires.
     }
 
     func relationship(_ lhs: AXFocusTarget, _ rhs: AXFocusTarget) -> AXFocusRelationship {
+        guard windowRelationship(lhs, rhs) == .same else { return .different }
+        switch (lhs.focusedElement, rhs.focusedElement) {
+        case (nil, nil): return .same
+        case let (left?, right?): return CFEqual(left.rawValue, right.rawValue) ? .same : .different
+        default: return .different
+        }
+    }
+
+    func windowRelationship(_ lhs: AXFocusTarget, _ rhs: AXFocusTarget) -> AXFocusRelationship {
         CFEqual(lhs.application.rawValue, rhs.application.rawValue)
             && CFEqual(lhs.window.rawValue, rhs.window.rawValue) ? .same : .different
     }
+    func resolveWindowlessApplication(workspace: AXFocusWorkspaceApplication?, permit: () -> Bool) -> AXWindowlessFocusTarget? {
+        windowlessResolveCount += 1; onWindowlessResolve?()
+        guard permit(), let windowless, workspace?.isSameApplication(as: windowless.workspaceApplication) == true else { return nil }
+        return windowless
+    }
+    func canRestoreExactRecipient(_ captured: AXFocusTarget, permit: () -> Bool) -> Bool { exactRecipientRestorable && permit() }
 
     func attemptRestore(captured: AXFocusTarget, baseline: AXFocusTarget,
         workspace: AXFocusWorkspaceApplication?, capturedApplication: AXFocusWorkspaceApplication?,
         permit: () -> Bool) -> AXFocusAttemptResult {
         guard permit() else { return .skipped }
         attemptCount += 1
+        lastAttemptBaseline = baseline
         onAttempt?()
         return .attempted(.success)
     }
@@ -881,6 +1165,10 @@ private final class CoordinatorWorkspaceFake: WorkspaceFocusMonitoring {
     var startCount = 0
     var stopCount = 0
     var observer: ((FocusObservationEvent) -> Void)?
+    var activationCount = 0
+    var activationSucceeds = true
+    var reportsActive = true
+    var onActivate: (() -> Void)?
     init(application: AXFocusWorkspaceApplication) { frontmost = application; original = application }
     func start(observation: @escaping (FocusObservationEvent) -> Void) { startCount += 1; observer = observation }
     func snapshot() -> WorkspaceFocusSnapshot {
@@ -890,5 +1178,42 @@ private final class CoordinatorWorkspaceFake: WorkspaceFocusMonitoring {
         processIdentifier == original.processIdentifier ? original : frontmost
     }
     func emit(_ event: FocusObservationEvent) { revision += 1; observer?(event) }
+    func activate(_ application: AXFocusWorkspaceApplication) -> Bool {
+        activationCount += 1
+        guard activationSucceeds else { return false }
+        frontmost = application; emit(.focusChanged); onActivate?(); return true
+    }
+    func isActive(_ application: AXFocusWorkspaceApplication) -> Bool { reportsActive && frontmost.isSameApplication(as: application) }
     func stop() { stopCount += 1; observer = nil }
+}
+
+extension AXFocusCoordinatorTests {
+    func testPerformanceMetricsCountVerifiedRestorationOnce() {
+        let f = FocusCoordinatorFixture()
+        let metrics = DriverPerformanceMetrics()
+        f.restorer.setPerformanceMetrics(metrics)
+        f.prepare()
+        f.restorer.inputDidEnd()
+        f.clock.nanoseconds = 1_000_000
+        f.restorer.restoreCapturedWindow()
+        f.clock.nanoseconds = 3_000_000
+        f.pump()
+        XCTAssertEqual(metrics.snapshot().timings["focusRestoration"]?.count, 1)
+        XCTAssertEqual(metrics.snapshot().timings["focusRestoration"]?.p50Milliseconds, 2)
+        XCTAssertEqual(metrics.snapshot().counters["focusVerified"], 1)
+        f.restorer.discardCapturedWindow(); f.pump()
+        XCTAssertEqual(metrics.snapshot().timings["focusRestoration"]?.count, 1)
+    }
+
+    func testCancelledFocusWorkIsNotReportedAsVerified() {
+        let f = FocusCoordinatorFixture()
+        let metrics = DriverPerformanceMetrics()
+        f.restorer.setPerformanceMetrics(metrics)
+        f.prepare(); f.changeFocusDuringTouch(); f.restorer.inputDidEnd()
+        f.restorer.restoreCapturedWindow()
+        f.restorer.discardCapturedWindow(); f.pump()
+        XCTAssertEqual(metrics.snapshot().timings["focusRestoration"]?.count, 1)
+        XCTAssertNil(metrics.snapshot().counters["focusVerified"])
+        XCTAssertEqual(metrics.snapshot().counters["focusUnverifiedOrCancelled"], 1)
+    }
 }
