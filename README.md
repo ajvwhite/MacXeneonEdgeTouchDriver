@@ -4,7 +4,7 @@ Use a Corsair Xeneon Edge touchscreen on your Mac. Tap to click, tap twice to do
 
 The driver supports one Xeneon Edge in landscape orientation. Two-finger gestures and multiple touch panels are not supported. It requires macOS 13 or later. Hardware testing has used Apple Silicon; Intel hardware has not been tested.
 
-## Install without building on this Mac
+## Building an install for another Mac
 
 A portable installer lets you build and sign the driver on one Mac, then install it on another. The receiving Mac needs neither Xcode nor your signing certificate. To create the ZIP on your development Mac, follow [Make a portable installer](docs/PORTABLE-INSTALLER.md).
 
