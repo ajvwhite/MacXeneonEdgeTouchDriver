@@ -16,7 +16,6 @@ For Developer ID signing during source installation, set `CODESIGN_IDENTITY` to 
 
 ## Run the checks
 
-
 Run the native tests and both build configurations on macOS:
 
 ```sh
@@ -28,6 +27,16 @@ swift build --configuration release
 python3 Scripts/test-install.py
 python3 Scripts/test-uninstall.py
 ```
+
+For the portable installer, also run:
+
+```sh
+/bin/sh -n Scripts/build-portable-installer.sh
+xcrun swiftc -typecheck Scripts/PortableInstaller.swift
+python3 Scripts/test-portable-installer.py
+```
+
+These packaging checks simulate signing and Apple's services. They do not need signing credentials or submit anything to Apple.
 
 The tests use simulated input and a virtual clock. They do not run the driver, need an attached Edge or request macOS permissions. GitHub Actions runs tests and builds on macOS for pushes and pull requests.
 

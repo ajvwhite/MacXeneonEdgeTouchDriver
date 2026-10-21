@@ -36,7 +36,7 @@ Keep the ZIP intact when copying it to another Mac. You can use AirDrop, a USB d
 
 Signing identifies who built the software. Notarization is a separate Apple check that helps macOS decide whether downloaded software can open. A signed installer without notarization can still be blocked by macOS or your work Mac's software policy.
 
-If you already have a notarization profile saved in your keychain, add its name when building:
+If `NOTARIZATION_PROFILE` is already set in your shell, the builder uses it automatically. Otherwise, if you have a profile saved in your keychain, add its name when building:
 
 ```sh
 CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
