@@ -103,10 +103,64 @@ if command == "swift":
             (Path(args[2]) / "agent.plist").mkdir()
         sys.exit(subprocess.run([os.environ["XE_TEST_SERIALIZER"], *args[1:]], check=False).returncode)
     reject("unexpected swift invocation")
+elif command == "prepare-install":
+    if state.get("prebuilt_helper_verified") != str(Path(sys.argv[0])):
+        reject("prebuilt helper executed before signature verification")
+    if len(args) != 5:
+        reject("unexpected prebuilt helper invocation")
+    for value in args:
+        inside(value)
+    fail("serialization")
+    if "serialization-write" in failures:
+        record(injection="serialization-write")
+        (Path(args[1]) / "agent.plist").mkdir()
+    sys.exit(subprocess.run([os.environ["XE_TEST_SERIALIZER"], *args], check=False).returncode)
 elif command == "codesign":
     binary = inside(args[-1]) if args else reject("missing codesign arguments")
     if binary == Path(paths["binary"]) or binary == Path(paths["workspace"]) / ".build/release/MacXeneonEdgeTouchDriver":
         reject("codesign must operate on the staged binary")
+    if os.environ.get("XE_TEST_PREBUILT") == "1":
+        developer_id = '=anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+        driver = binary.name == "binary"
+        if "--sign" in args:
+            reject("a prebuilt release must never be resigned")
+        if args[:3] == ["--verify", "--strict", "-R"] and len(args) == 5:
+            if driver:
+                expected = developer_id + ' and identifier "MacXeneonEdgeTouchDriver"'
+                if args[3] != expected:
+                    reject("driver verification lacks its Developer ID and identifier requirement")
+                fail("prebuilt-driver-signature")
+                fail("prebuilt-driver-identifier")
+                fail("prebuilt-ad-hoc")
+                state["prebuilt_driver_verified"] = str(binary)
+            else:
+                expected = developer_id + ' and identifier "MacXeneonEdgeTouchDriver.PrepareInstall" and certificate leaf[subject.OU] = "TESTTEAM42"'
+                if args[3] != expected:
+                    reject("helper verification lacks its same-team and identifier requirement")
+                if "prebuilt_driver_verified" not in state:
+                    reject("helper checked before driver")
+                fail("prebuilt-helper-signature")
+                fail("prebuilt-helper-identifier")
+                fail("prebuilt-helper-team")
+                state["prebuilt_helper_verified"] = str(binary)
+            save()
+            sys.exit(0)
+        if args[:2] == ["-d", "--verbose=2"] and len(args) == 3 and driver:
+            if state.get("prebuilt_driver_verified") != str(binary):
+                reject("metadata inspected before driver verification")
+            fail("prebuilt-metadata")
+            if "prebuilt-missing-team" in failures:
+                record(injection="prebuilt-missing-team")
+            elif "prebuilt-invalid-team" in failures:
+                record(injection="prebuilt-invalid-team")
+                print('TeamIdentifier=TESTTEAM42" or true')
+            elif "prebuilt-duplicate-team" in failures:
+                record(injection="prebuilt-duplicate-team")
+                print("TeamIdentifier=TESTTEAM42\nTeamIdentifier=OTHERTEAM1")
+            else:
+                print("TeamIdentifier=TESTTEAM42")
+            sys.exit(0)
+        reject("unexpected prebuilt codesign invocation")
     if "--sign" in args:
         if args[args.index("--sign") + 1] != "Installer Test Identity":
             reject("unexpected signing identity")
@@ -303,7 +357,22 @@ class InstallerTests(unittest.TestCase):
         self.tmp = self.case / "tmp"
         self.tmp.mkdir()
 
-    def run_installer(self, failures=(), signing=False):
+    def enable_prebuilt(self):
+        self.prebuilt = True
+        payload = self.workspace.parent / "Helpers"
+        payload.mkdir()
+        driver = payload / BINARY
+        driver.write_bytes(NEW_BINARY)
+        driver.chmod(0o755)
+        helper = payload / "PrepareInstall"
+        helper.write_text(STUB_SOURCE)
+        helper.chmod(0o755)
+        shutil.copyfile(self.workspace / "Resources" / (LABEL + ".plist.template"), self.workspace / (LABEL + ".plist.template"))
+        # A release installation must work without any Swift executable/source.
+        (self.stub_bin / "swift").unlink()
+        (self.workspace / "Scripts/prepare-install.swift").unlink()
+
+    def run_installer(self, failures=(), signing=False, arguments=None):
         env = {
             "HOME": str(self.home), "PATH": str(self.stub_bin), "TMPDIR": str(self.tmp) + "/",
             "LC_ALL": "en_US.UTF-8", "XE_TEST_ROOT": str(self.case),
@@ -316,8 +385,12 @@ class InstallerTests(unittest.TestCase):
         }
         if signing:
             env["CODESIGN_IDENTITY"] = "Installer Test Identity"
+        if getattr(self, "prebuilt", False):
+            env["XE_TEST_PREBUILT"] = "1"
+        if arguments is None:
+            arguments = ["--prebuilt"] if getattr(self, "prebuilt", False) else []
         result = subprocess.run(
-            ["/bin/sh", str(self.workspace / "Scripts/install.sh")], env=env,
+            ["/bin/sh", str(self.workspace / "Scripts/install.sh"), *arguments], env=env,
             cwd=self.workspace, capture_output=True, text=True, timeout=30,
         )
         self.output = result.stdout + result.stderr
@@ -368,6 +441,96 @@ class InstallerTests(unittest.TestCase):
 
     def backup_directories(self):
         return list((self.support / "install-backups").glob("transaction.*"))
+
+    def test_prebuilt_upgrade_needs_no_swift_and_preserves_config(self):
+        self.prepare("release folder with spaces-雪")
+        self.enable_prebuilt()
+        self.assertEqual(self.run_installer(), 0, self.output)
+        self.assert_new_installation()
+        self.assertFalse(any(call["command"] == "swift" for call in self.calls))
+        helper = next(index for index, call in enumerate(self.calls) if call["command"] == "prepare-install")
+        verify = [index for index, call in enumerate(self.calls) if call["command"] == "codesign" and call["args"][0] == "--verify"]
+        self.assertEqual(len(verify), 2)
+        self.assertLess(max(verify), helper)
+        bootout = next(index for index, call in enumerate(self.calls) if call["command"] == "launchctl" and call["args"][0] == "bootout")
+        self.assertLess(helper, bootout)
+        backup = self.backup_directories()[0]
+        self.assertEqual((backup / "binary").read_bytes(), OLD_BINARY)
+        self.assertEqual((backup / "config.json").read_bytes(), OLD_CONFIG)
+
+    def test_prebuilt_first_install_creates_defaults_without_swift(self):
+        self.prepare(existing=False)
+        self.enable_prebuilt()
+        self.assertEqual(self.run_installer(), 0, self.output)
+        self.assert_new_installation(preserved=False)
+        self.assertFalse(any(call["command"] == "swift" for call in self.calls))
+        self.assertIn("Input Monitoring", self.output)
+        self.assertIn("Device Control and Data Access", self.output)
+
+    def test_prebuilt_signature_rejections_leave_files_and_job_unchanged(self):
+        original_case = self.case
+        for failure in ["prebuilt-driver-signature", "prebuilt-driver-identifier", "prebuilt-ad-hoc", "prebuilt-metadata", "prebuilt-missing-team", "prebuilt-invalid-team", "prebuilt-duplicate-team", "prebuilt-helper-signature", "prebuilt-helper-identifier", "prebuilt-helper-team"]:
+            with self.subTest(failure=failure):
+                self.case = original_case / failure
+                self.case.mkdir()
+                self.prepare()
+                self.enable_prebuilt()
+                self.assert_preflight_failure([failure])
+                self.assertFalse(any(call["command"] == "prepare-install" for call in self.calls))
+        self.case = original_case
+
+    def test_prebuilt_payload_must_be_regular_nonempty_executables(self):
+        original_case = self.case
+        for name in [BINARY, "PrepareInstall"]:
+            for problem in ["missing", "empty", "symlink", "not-executable"]:
+                with self.subTest(name=name, problem=problem):
+                    self.case = original_case / (name + "-" + problem)
+                    self.case.mkdir()
+                    self.prepare()
+                    self.enable_prebuilt()
+                    path = self.workspace.parent / "Helpers" / name
+                    if problem == "missing":
+                        path.unlink()
+                    elif problem == "empty":
+                        path.write_bytes(b"")
+                    elif problem == "symlink":
+                        replacement = self.case / "replacement"
+                        path.rename(replacement)
+                        path.symlink_to(replacement)
+                    else:
+                        path.chmod(0o644)
+                    self.assert_preflight_failure()
+                    self.assertFalse(any(call["command"] == "prepare-install" for call in self.calls))
+        self.case = original_case
+
+    def test_prebuilt_refuses_resigning(self):
+        self.prepare()
+        self.enable_prebuilt()
+        self.assert_preflight_failure(signing=True)
+        self.assertFalse(any(call["command"] in ["codesign", "prepare-install"] for call in self.calls))
+
+    def test_prebuilt_serialization_failure_leaves_existing_installation(self):
+        self.prepare()
+        self.enable_prebuilt()
+        self.config.write_bytes(b"not valid JSON")
+        self.initial[str(self.config)] = self.config.read_bytes()
+        self.assert_preflight_failure()
+
+    def test_prebuilt_failed_activation_rolls_back_and_restarts_prior_job(self):
+        self.prepare()
+        self.enable_prebuilt()
+        self.assertNotEqual(self.run_installer(["bootstrap-partial"]), 0, self.output)
+        self.assert_unchanged()
+        self.assertTrue(self.state["loaded"])
+        self.assertEqual(self.state["active_binary"], OLD_BINARY.decode())
+        self.assertEqual(self.state["bootout_count"], 2)
+        self.assertEqual(self.state["bootstrap_count"], 2)
+
+    def test_bad_arguments_do_not_change_installation(self):
+        self.prepare()
+        self.assertNotEqual(self.run_installer(arguments=["--prebuilt", "extra"]), 0)
+        self.assert_unchanged()
+        self.assert_no_job_change()
 
     def test_successful_upgrade_retains_originals(self):
         self.prepare()

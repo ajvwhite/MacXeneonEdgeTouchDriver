@@ -5,6 +5,7 @@ umask 077
 label="com.ajvwhite.MacXeneonEdgeTouchDriver"
 binary_name="MacXeneonEdgeTouchDriver"
 package_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+prebuilt=0
 app_support_dir="${HOME}/Library/Application Support/MacXeneonEdgeTouchDriver"
 bin_dir="${app_support_dir}/bin"
 log_dir="${HOME}/Library/Logs/MacXeneonEdgeTouchDriver"
@@ -36,6 +37,42 @@ config_changed=0
 fail() {
   printf '%s\n' "$*" >&2
   exit 1
+}
+
+case "$#:$*" in
+  0:) ;;
+  1:--prebuilt) prebuilt=1 ;;
+  1:--help|1:-h)
+    printf 'Usage: %s [--prebuilt]\n' "$0"
+    printf 'Install for the current user. --prebuilt uses the signed portable installer files.\n'
+    exit 0
+    ;;
+  *) fail 'Usage: install.sh [--prebuilt]' ;;
+esac
+if [ "$prebuilt" -eq 1 ]; then
+  plist_template="${package_root}/${label}.plist.template"
+  [ -z "${CODESIGN_IDENTITY:-}" ] || fail 'The portable installer files are already signed. Remove CODESIGN_IDENTITY and try again.'
+fi
+
+# Verify Apple-issued Developer ID signatures, executable identities and a
+# shared signing team before running the bundled preparation tool.
+verify_prebuilt() {
+  developer_id='=anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+  codesign --verify --strict -R "$developer_id and identifier \"$binary_name\"" "$stage_dir/binary" || fail 'The driver signature is invalid. Create or obtain a new portable installer.'
+  codesign -d --verbose=2 "$stage_dir/binary" > "$stage_dir/signature.txt" 2>&1 || fail 'Could not read the driver signature.'
+  driver_team=
+  while IFS= read -r signature_line || [ -n "$signature_line" ]; do
+    case "$signature_line" in
+      TeamIdentifier=*)
+        [ -z "$driver_team" ] || fail 'The driver has conflicting signing information.'
+        driver_team=${signature_line#TeamIdentifier=}
+        ;;
+    esac
+  done < "$stage_dir/signature.txt"
+  case "$driver_team" in
+    ''|*[!A-Z0-9]*) fail 'The driver does not have a valid Developer ID team.' ;;
+  esac
+  codesign --verify --strict -R "$developer_id and identifier \"$binary_name.PrepareInstall\" and certificate leaf[subject.OU] = \"$driver_team\"" "$stage_dir/prepare-install" || fail 'The installer signature does not match the driver. Create or obtain a new portable installer.'
 }
 
 # Only the service-not-found status means absent. Other query failures abort.
@@ -158,11 +195,18 @@ case "$HOME" in
   /*) ;;
   *) fail 'HOME must be an absolute path.' ;;
 esac
-for tool in swift launchctl plutil; do
+for tool in launchctl plutil; do
   command -v "$tool" >/dev/null 2>&1 || fail "Required tool not found: $tool"
 done
-if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+if [ "$prebuilt" -eq 1 ] || [ -n "${CODESIGN_IDENTITY:-}" ]; then
   command -v codesign >/dev/null 2>&1 || fail 'codesign not found.'
+fi
+if [ "$prebuilt" -eq 0 ]; then
+  command -v swift >/dev/null 2>&1 || fail 'Swift is required to build from source. Use a portable installer to install without Xcode.'
+else
+  for payload in "$package_root/../Helpers/$binary_name" "$package_root/../Helpers/PrepareInstall"; do
+    [ ! -L "$payload" ] && [ -f "$payload" ] && [ -s "$payload" ] && [ -x "$payload" ] || fail "The portable installer is missing a valid executable: $payload"
+  done
 fi
 [ -f "$plist_template" ] || fail "LaunchAgent template not found: $plist_template"
 
@@ -180,9 +224,16 @@ mkdir "$lock_dir" || fail "Another installer may be running. Check before removi
 lock_acquired=1
 stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/Xeneon-install.XXXXXX")"
 
-echo "Building ${binary_name} in release mode..."
-swift build -c release --package-path "$package_root"
-install -m 755 "${package_root}/.build/release/${binary_name}" "$stage_dir/binary"
+if [ "$prebuilt" -eq 1 ]; then
+  echo 'Checking the installer files...'
+  install -m 755 "$package_root/../Helpers/$binary_name" "$stage_dir/binary"
+  install -m 755 "$package_root/../Helpers/PrepareInstall" "$stage_dir/prepare-install"
+  verify_prebuilt
+else
+  echo "Building ${binary_name} in release mode..."
+  swift build -c release --package-path "$package_root"
+  install -m 755 "${package_root}/.build/release/${binary_name}" "$stage_dir/binary"
+fi
 [ -s "$stage_dir/binary" ] && [ -x "$stage_dir/binary" ] || fail 'The staged executable is empty or not executable.'
 
 # CODESIGN_IDENTITY follows isleofgreg's interface from PR #4. Both signing
@@ -192,7 +243,11 @@ if [ -n "${CODESIGN_IDENTITY:-}" ]; then
   codesign --force --sign "$CODESIGN_IDENTITY" --identifier "$binary_name" "$stage_dir/binary"
   codesign --verify --strict "$stage_dir/binary"
 fi
-swift "$package_root/Scripts/prepare-install.swift" "$plist_template" "$stage_dir" "$installed_binary" "$config_path" "$log_dir"
+if [ "$prebuilt" -eq 1 ]; then
+  "$stage_dir/prepare-install" "$plist_template" "$stage_dir" "$installed_binary" "$config_path" "$log_dir"
+else
+  swift "$package_root/Scripts/prepare-install.swift" "$plist_template" "$stage_dir" "$installed_binary" "$config_path" "$log_dir"
+fi
 plutil -lint -- "$stage_dir/agent.plist"
 
 # Prepare destination directories, retained backups and same-filesystem rename
@@ -257,7 +312,12 @@ rollback_needed=0
 
 cat <<EOF_RESULT
 Installed ${binary_name}. launchd accepted the new job.
-Continued daemon operation and macOS permissions have not been checked.
+Open System Settings > Privacy & Security and allow this driver to control
+input and read the touch device. Depending on your macOS version, these
+permissions are named Device Control and Data Access (or Accessibility)
+and Input Monitoring. If asked to choose a file, use the Binary path below.
+Then try a touch on the Edge. Starting the service does not confirm that
+permissions are granted or that touch input is working.
 
 Binary: ${installed_binary}
 LaunchAgent: ${plist_path}
