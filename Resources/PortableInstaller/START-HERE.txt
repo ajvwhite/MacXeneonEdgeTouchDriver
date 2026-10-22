@@ -1,0 +1,32 @@
+Xeneon Edge touch driver
+
+Use this installer on the Mac connected to your Corsair Xeneon Edge.
+You do not need Xcode, Swift or signing certificates on that Mac.
+
+1. Extract the ZIP, then open Install Xeneon Touch.app.
+2. Lift all fingers from the Edge and release all mouse buttons.
+3. Choose Install or Update. Your existing settings are kept.
+4. When installation finishes, choose Open Privacy Settings.
+5. Under Privacy & Security, allow MacXeneonEdgeTouchDriver in Device Control
+   and Data Access (called Accessibility on older macOS) and Input Monitoring.
+   If the driver is not listed, choose Show Driver in the installer and add
+   that exact file in System Settings.
+6. Try a tap and a drag on the Edge. Check that your mouse works after lifting.
+
+macOS asks for these permissions separately on each Mac. Signing does not
+transfer them from the development Mac. A work Mac may require IT approval.
+
+To update, make a new portable installer on the development Mac, copy the ZIP
+here, and repeat these steps. To remove the driver, reopen the installer and
+choose Remove Driver. Removal also deletes your settings and saved installation
+backups. It keeps logs.
+
+The installer requires macOS 13 or later. A universal build supports both
+Apple Silicon and Intel Macs; a build labelled arm64 or x86_64 supports only
+that processor. Only the tested hardware and macOS versions are validated.
+
+If macOS blocks this installer, check with the person who made it. Signing and
+Apple notarization are separate steps. Do not disable macOS security checks.
+
+This ZIP contains no private signing keys or copied personal configuration.
+Its signatures include the signer's public certificate, name and team ID.

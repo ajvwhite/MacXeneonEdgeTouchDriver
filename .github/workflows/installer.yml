@@ -6,6 +6,10 @@ on:
       - Scripts/install.sh
       - Scripts/prepare-install.swift
       - Scripts/test-install.py
+      - Scripts/build-portable-installer.sh
+      - Scripts/PortableInstaller.swift
+      - Scripts/test-portable-installer.py
+      - Resources/PortableInstaller/**
       - Scripts/uninstall.sh
       - Scripts/test-uninstall.py
       - Resources/com.ajvwhite.MacXeneonEdgeTouchDriver.plist.template
@@ -15,6 +19,10 @@ on:
       - Scripts/install.sh
       - Scripts/prepare-install.swift
       - Scripts/test-install.py
+      - Scripts/build-portable-installer.sh
+      - Scripts/PortableInstaller.swift
+      - Scripts/test-portable-installer.py
+      - Resources/PortableInstaller/**
       - Scripts/uninstall.sh
       - Scripts/test-uninstall.py
       - Resources/com.ajvwhite.MacXeneonEdgeTouchDriver.plist.template
@@ -33,7 +41,12 @@ jobs:
         run: |
           /bin/sh -n Scripts/install.sh
           /bin/sh -n Scripts/uninstall.sh
+          /bin/sh -n Scripts/build-portable-installer.sh
       - name: Check staged installation and serialization
         run: python3 Scripts/test-install.py
       - name: Check guarded uninstall failure handling
         run: python3 Scripts/test-uninstall.py
+      - name: Check the portable installer app compiles
+        run: xcrun swiftc -typecheck -target "$(uname -m)-apple-macosx13.0" Scripts/PortableInstaller.swift
+      - name: Check portable packaging without signing or installing
+        run: python3 Scripts/test-portable-installer.py
