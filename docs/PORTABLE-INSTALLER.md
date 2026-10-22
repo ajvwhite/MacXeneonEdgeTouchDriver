@@ -15,7 +15,7 @@ You need macOS, Xcode or Apple's Command Line Tools, and a Developer ID Applicat
    security find-identity -v -p codesigning
    ```
 
-3. Find your `Developer ID Application` identity. Use its full quoted name in this command, replacing the example with your own:
+3. Find the entry beginning `Developer ID Application:`. Copy its full name between the quotation marks, including the Team ID in parentheses. `Apple Development:` is a different certificate used for development builds. Replace the example below with your own identity:
 
    ```sh
    CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
@@ -36,7 +36,7 @@ Keep the ZIP intact when copying it to another Mac. You can use AirDrop, a USB d
 
 Signing identifies who built the software. Notarization is a separate Apple check that helps macOS decide whether downloaded software can open. A signed installer without notarization can still be blocked by macOS or your work Mac's software policy.
 
-If `NOTARIZATION_PROFILE` is already set in your shell, the builder uses it automatically. Otherwise, if you have a profile saved in your keychain, add its name when building:
+If `NOTARIZATION_PROFILE` is already exported in your shell, the builder uses it automatically. Otherwise, if you have a profile saved in your keychain, add its name when building:
 
 ```sh
 CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
@@ -44,11 +44,34 @@ NOTARIZATION_PROFILE='Your keychain profile' \
   ./Scripts/build-portable-installer.sh
 ```
 
+`NOTARIZATION_PROFILE` is the name you chose when saving your notarization credentials in Keychain. It can be different from the Apple Team ID shown in parentheses in your certificate name.
+
 The builder first submits the driver and setup helper to Apple, then signs and submits the complete installer app. This follows Apple's [two-stage process for custom installers](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow). It attaches Apple's approval to the app and creates the final ZIP. Use the output from a successful run; a failed submission is not a notarized installer. This requires an internet connection and a configured Apple developer account. The profile stays in your keychain and is not included in the ZIP.
 
 The standalone driver cannot carry an attached approval ticket in the same way as an app. macOS may need an internet connection to check that approval when the driver first runs.
 
 If you need to create a profile, follow Apple's [notarization instructions](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow). Do that on the development Mac. Do not copy its credentials to the receiving Mac or put them in this repository.
+
+### Save your build settings
+
+You can export both settings as environment variables so you do not have to type them for each build. Replace the examples with your certificate name and existing Keychain profile name, then run:
+
+```sh
+export CODESIGN_IDENTITY='Developer ID Application: Your Name (TEAMID)'
+export NOTARIZATION_PROFILE='Your keychain profile'
+```
+
+From the repository folder, you can then build with:
+
+```sh
+./Scripts/build-portable-installer.sh
+```
+
+With both variables exported, a successful build signs and notarizes the installer. If `NOTARIZATION_PROFILE` is unset or empty, the builder signs the installer without notarizing it.
+
+The exports above last for the current Terminal session. To keep them for future sessions, save those two lines in `~/.zshrc` if you use zsh, or in an exports file that it already loads. If either setting is already there, keep or update its existing line.
+
+Keep your saved values outside this repository. Open a new Terminal window after saving the lines.
 
 ### Choose a processor or output folder
 
