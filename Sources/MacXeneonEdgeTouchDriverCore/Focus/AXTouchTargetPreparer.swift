@@ -192,7 +192,12 @@ final class AXTouchTargetPreparer: TouchTargetPreparing {
         lock.lock(); busy = false; lock.unlock()
         onCallback {
             guard self.isCurrent(expected) else { return }
-            let confirmed = accepted && inputPermit()
+            let physicalInputUnchanged = inputPermit()
+            let confirmed = accepted && physicalInputUnchanged
+            if !confirmed {
+                DriverLoggers.log(.debug, category: .focus,
+                    "Touch target rejection detail: targetAccepted=\(accepted), physicalInputUnchanged=\(physicalInputUnchanged).")
+            }
             if !confirmed {
                 self.lock.lock(); self.preparedIdentity = nil; self.lock.unlock()
             }

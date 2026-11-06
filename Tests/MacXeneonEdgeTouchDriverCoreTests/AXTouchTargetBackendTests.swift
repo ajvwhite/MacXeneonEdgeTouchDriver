@@ -79,7 +79,29 @@ final class AXTouchTargetBackendTests: XCTestCase {
 
     func testSuccessfulRequestWithoutFocusedWindowConfirmationFails() {
         let f = TargetOperations(); f.applyMutation = false
-        let backend = AXTouchTargetBackend(operations: f)
+        let backend = AXTouchTargetBackend(operations: f, topmostWindow: { _, _, _ in false })
+        let target = backend.resolve(at: f.point, permit: { true })!
+        XCTAssertFalse(backend.focusWindow(target, at: f.point, permit: { true }))
+        XCTAssertEqual(f.mutations, ["window"])
+    }
+
+    func testSameProcessSiblingReportedAsFocusedIsAdmittedOnlyWithTopmostProof() {
+        let f = TargetOperations(); f.applyMutation = false
+        var checked: (pid_t, CGRect, CGPoint)?
+        let backend = AXTouchTargetBackend(operations: f, topmostWindow: { pid, bounds, point in
+            checked = (pid, bounds, point); return true
+        })
+        let target = backend.resolve(at: f.point, permit: { true })!
+        XCTAssertTrue(backend.focusWindow(target, at: f.point, permit: { true }))
+        XCTAssertEqual(f.mutations, ["window"])
+        XCTAssertEqual(checked?.0, 33)
+        XCTAssertEqual(checked?.1, CGRect(origin: f.origin, size: f.size))
+        XCTAssertEqual(checked?.2, f.point)
+    }
+
+    func testForeignProcessReportedAsFocusedFailsEvenWithTopmostProof() {
+        let f = TargetOperations(); f.applyMutation = false; f.focusedWindowPID = 44
+        let backend = AXTouchTargetBackend(operations: f, topmostWindow: { _, _, _ in true })
         let target = backend.resolve(at: f.point, permit: { true })!
         XCTAssertFalse(backend.focusWindow(target, at: f.point, permit: { true }))
         XCTAssertEqual(f.mutations, ["window"])
@@ -115,6 +137,7 @@ private final class TargetOperations: AXTouchTargetOperations {
     var origin = CGPoint(x: -100, y: 0)
     var size = CGSize(width: 100, height: 100)
     var hitPID: pid_t = 33
+    var focusedWindowPID: pid_t = 33
     var hitError: AXError = .success
     var minimized = false
     var dialog = false
@@ -132,7 +155,13 @@ private final class TargetOperations: AXTouchTargetOperations {
     func applicationElement(pid: pid_t) -> AXFocusElement { handle("app") }
     func setTimeout(_ element: AXFocusElement, seconds: Float) -> AXError { .success }
     func element(at point: CGPoint, system: AXFocusElement) -> (AXError, AXFocusElement?) { (hitError, handle("hit")) }
-    func ownerPID(_ element: AXFocusElement) -> (AXError, pid_t) { (.success, name(element) == "hit" ? hitPID : 33) }
+    func ownerPID(_ element: AXFocusElement) -> (AXError, pid_t) {
+        switch name(element) {
+        case "hit": return (.success, hitPID)
+        case focusedWindow where focusedWindow != "window": return (.success, focusedWindowPID)
+        default: return (.success, 33)
+        }
+    }
     func equal(_ lhs: AXFocusElement, _ rhs: AXFocusElement) -> Bool { name(lhs) == name(rhs) }
     func read(_ element: AXFocusElement, attribute: String) -> AXFocusRead {
         let value: AXFocusValue
