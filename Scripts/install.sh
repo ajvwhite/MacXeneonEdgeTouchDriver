@@ -231,7 +231,19 @@ if [ "$prebuilt" -eq 1 ]; then
   verify_prebuilt
 else
   echo "Building ${binary_name} in release mode..."
-  swift build -c release --package-path "$package_root"
+  if ! swift build -c release --package-path "$package_root"; then
+    # Newer SwiftPM releases default to the Swift Build engine, which can fail
+    # to start when Command Line Tools is the selected developer directory
+    # (SwiftPM issue 10561). Retry once with the deprecated
+    # native build system; a second failure stops before any installed change.
+    cat >&2 <<'EOF_BUILD_RETRY'
+The default Swift build failed. Retrying once with --build-system native.
+If the error above mentions "Unknown error parsing property list", Command Line
+Tools is probably selected instead of Xcode. To avoid the retry, run:
+  sudo xcode-select -s /Applications/Xcode.app
+EOF_BUILD_RETRY
+    swift build -c release --build-system native --package-path "$package_root"
+  fi
   install -m 755 "${package_root}/.build/release/${binary_name}" "$stage_dir/binary"
 fi
 [ -s "$stage_dir/binary" ] && [ -x "$stage_dir/binary" ] || fail 'The staged executable is empty or not executable.'

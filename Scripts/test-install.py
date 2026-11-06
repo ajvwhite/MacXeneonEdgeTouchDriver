@@ -81,11 +81,15 @@ def fail(name, status=71):
 
 record()
 if command == "swift":
-    if len(args) == 5 and args[:4] == ["build", "-c", "release", "--package-path"]:
-        package = inside(args[4])
+    default_build = len(args) == 5 and args[:4] == ["build", "-c", "release", "--package-path"]
+    native_build = len(args) == 7 and args[:6] == ["build", "-c", "release", "--build-system", "native", "--package-path"]
+    if default_build or native_build:
+        package = inside(args[-1])
         if package != Path(paths["workspace"]):
             reject("unexpected package build")
-        fail("build")
+        if native_build and not any(call.get("failure") == "build" for call in map(json.loads, log.read_text().splitlines())):
+            reject("the native build system is only a fallback after a failed default build")
+        fail("native-build" if native_build else "build")
         if "missing-build-output" not in failures:
             binary = package / ".build/release/MacXeneonEdgeTouchDriver"
             binary.parent.mkdir(parents=True, exist_ok=True)
@@ -570,7 +574,7 @@ class InstallerTests(unittest.TestCase):
         self.assertLess(max(sign_calls), bootout)
 
     def test_preflight_failure_leaves_old_files_and_job(self):
-        for failure in ["build", "missing-build-output", "serialization", "serialization-write", "sign", "verify", "backup-write", "stage-binary-write", "stage-plist-write", "domain-print", "job-print"]:
+        for failure in ["missing-build-output", "serialization", "serialization-write", "sign", "verify", "backup-write", "stage-binary-write", "stage-plist-write", "domain-print", "job-print"]:
             with self.subTest(failure=failure):
                 original_case = self.case
                 self.case = original_case / failure
@@ -578,6 +582,33 @@ class InstallerTests(unittest.TestCase):
                 self.prepare()
                 self.assert_preflight_failure([failure], signing=failure in ["sign", "verify"])
                 self.case = original_case
+
+    def swift_builds(self):
+        # The stub logs each invocation once, then again for any injected failure.
+        return [call["args"] for call in self.calls if call["command"] == "swift" and call["args"][:1] == ["build"]
+                and call.keys() == {"command", "args"}]
+
+    def test_default_build_does_not_use_native_fallback(self):
+        self.prepare()
+        self.assertEqual(self.run_installer(), 0, self.output)
+        self.assertEqual(self.swift_builds(), [["build", "-c", "release", "--package-path", str(self.workspace)]])
+        self.assertNotIn("--build-system native", self.output)
+
+    def test_failed_default_build_retries_with_native_build_system(self):
+        self.prepare()
+        self.assertEqual(self.run_installer(["build"]), 0, self.output)
+        self.assert_new_installation()
+        self.assertEqual(self.swift_builds(), [
+            ["build", "-c", "release", "--package-path", str(self.workspace)],
+            ["build", "-c", "release", "--build-system", "native", "--package-path", str(self.workspace)],
+        ])
+        self.assertIn("--build-system native", self.output)
+        self.assertIn("xcode-select", self.output)
+
+    def test_failed_fallback_build_leaves_old_files_and_job(self):
+        self.prepare()
+        self.assert_preflight_failure(["build", "native-build"])
+        self.assertEqual(len(self.swift_builds()), 2, self.output)
 
     def test_new_config_staging_failure_leaves_installation_absent(self):
         self.prepare(existing=False)

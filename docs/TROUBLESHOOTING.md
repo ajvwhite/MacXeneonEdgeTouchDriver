@@ -41,6 +41,14 @@ The first command stops the installed service; the second starts it again. If st
 
 Read the installer message before retrying. It checks the new files before stopping the current driver and keeps a backup when replacing an existing installation. If recovery cannot finish, the message gives the backup location. Keep those files and the error message so you can investigate or ask for help.
 
+When installing from source, `Scripts/install.sh` retries once with `--build-system native` if the default Swift build fails. This works around a SwiftPM problem that reports `Unknown error parsing property list` when Command Line Tools is selected instead of Xcode. To avoid the retry, select Xcode and run the installer again:
+
+```sh
+sudo xcode-select -s /Applications/Xcode.app
+```
+
+If the retry fails too, the build error is unrelated to this problem. Nothing installed has been changed at that point.
+
 If macOS blocks the installer, check the source of the ZIP and whether its builder completed notarization. Signing identifies the builder; notarization is Apple's separate check of the software. Do not disable macOS security checks to make it run. On a managed work Mac, ask the administrator how to install approved software.
 
 ## Current limits
