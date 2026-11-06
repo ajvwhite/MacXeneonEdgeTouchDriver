@@ -5,6 +5,7 @@
 - Add a portable installer you can build and sign on one Mac, then use on another without development tools. It can install, update or remove the driver for the current user.
 - Check bundled signatures before installation and support Apple's notarization process without copying private keys or saved credentials.
 - Put everyday setup and use first in the README, with separate guides for settings, troubleshooting and development.
+- Retry a failed source build once with SwiftPM's native build system. This lets installation finish when Command Line Tools, rather than Xcode, is selected.
 
 - Check inconsistent touch reports and track clear, deliberate touches through noise. Release a track when it loses support, then recover automatically when the stream settles.
 - Add double-clicks for nearby taps on the same window and control, with an option to keep separate clicks.
