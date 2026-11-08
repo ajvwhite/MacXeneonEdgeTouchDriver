@@ -38,10 +38,13 @@ final class AXTouchTargetBackend: AXTouchTargetResolving {
     private let operations: AXTouchTargetOperations
     private let timeout: Float
     private let floatingWindow: (pid_t, CGRect, CGPoint) -> Bool
+    private let desktopWindow: (pid_t, CGRect, CGPoint) -> Bool
     init(operations: AXTouchTargetOperations = SystemAXFocusOperations(), timeout: Float = 0.008,
-         floatingWindow: @escaping (pid_t, CGRect, CGPoint) -> Bool = AXTouchTargetBackend.systemFloatingWindow) {
+         floatingWindow: @escaping (pid_t, CGRect, CGPoint) -> Bool = AXTouchTargetBackend.systemFloatingWindow,
+         desktopWindow: @escaping (pid_t, CGRect, CGPoint) -> Bool = AXTouchTargetBackend.systemDesktopWindow) {
         self.operations = operations
         self.floatingWindow = floatingWindow
+        self.desktopWindow = desktopWindow
         self.timeout = max(0.001, min(timeout, 0.05))
     }
 
@@ -84,17 +87,21 @@ final class AXTouchTargetBackend: AXTouchTargetResolving {
         guard case .string(kAXApplicationRole)? = read(application, kAXRoleAttribute, permit: permit), permit() else { return nil }
         let (appError, appPID) = operations.ownerPID(application)
         guard appError == .success, appPID == pid, permit() else { return nil }
-        // A floating dialog with no focus setter can receive mouse input while
-        // leaving the source application's keyboard recipient intact. Do not
-        // activate its app merely to manufacture a focused-window certificate.
+        // Floating dialogs and desktop widgets can receive mouse input without
+        // keyboard focus. Widgets expose AXUnknown windows, not AXDialog. Require
+        // matching WindowServer ownership, geometry and level before admitting
+        // either kind without activation; ordinary windows keep the focus path.
         var passive = false
-        if case .string(kAXDialogSubrole)? = read(window, kAXSubroleAttribute, permit: permit),
+        if case let .string(subrole)? = read(window, kAXSubroleAttribute, permit: permit),
+           subrole == kAXDialogSubrole || subrole == kAXUnknownSubrole,
            case .bool(false)? = read(window, kAXFocusedAttribute, permit: permit), permit() {
             let (capabilityError, settable) = operations.isSettable(window, attribute: kAXFocusedAttribute)
             if capabilityError == .success, !settable, permit(),
                case let .point(origin)? = read(window, kAXPositionAttribute, permit: permit),
                case let .size(size)? = read(window, kAXSizeAttribute, permit: permit) {
-                passive = floatingWindow(pid, CGRect(origin: origin, size: size), point) && permit()
+                let bounds = CGRect(origin: origin, size: size)
+                passive = (subrole == kAXDialogSubrole ? floatingWindow(pid, bounds, point) :
+                    desktopWindow(pid, bounds, point)) && permit()
             }
         }
         return Target(application: application, window: window, pid: pid, requiresActivation: !passive,
@@ -140,17 +147,32 @@ final class AXTouchTargetBackend: AXTouchTargetResolving {
     /// surface at this point. Missing WindowServer data fails closed. No title,
     /// window contents or application-specific allowlist is used.
     private static func systemFloatingWindow(pid: pid_t, bounds: CGRect, point: CGPoint) -> Bool {
-        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+        systemPassiveWindow(pid: pid, bounds: bounds, point: point, desktop: false)
+    }
+
+    private static func systemDesktopWindow(pid: pid_t, bounds: CGRect, point: CGPoint) -> Bool {
+        systemPassiveWindow(pid: pid, bounds: bounds, point: point, desktop: true)
+    }
+
+    private static func systemPassiveWindow(pid: pid_t, bounds: CGRect, point: CGPoint, desktop: Bool) -> Bool {
+        // Desktop elements must be included: that is where macOS hosts widgets.
+        guard let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly,
                                                        kCGNullWindowID) as? [[String: Any]] else { return false }
+        return matchesPassiveWindow(pid: pid, bounds: bounds, point: point, windows: windows, desktop: desktop)
+    }
+
+    static func matchesPassiveWindow(pid: pid_t, bounds: CGRect, point: CGPoint,
+                                     windows: [[String: Any]], desktop: Bool) -> Bool {
         for window in windows {
             guard let alpha = window[kCGWindowAlpha as String] as? Double, alpha > 0,
                   let rawBounds = window[kCGWindowBounds as String] as? NSDictionary,
                   let rect = CGRect(dictionaryRepresentation: rawBounds), rect.contains(point) else { continue }
             guard let owner = window[kCGWindowOwnerPID as String] as? Int32,
                   let level = window[kCGWindowLayer as String] as? Int32 else { return false }
-            return owner == pid && rect == bounds
-                && level > CGWindowLevelForKey(.normalWindow)
-                && level <= CGWindowLevelForKey(.modalPanelWindow)
+            let validLevel = desktop ?
+                level > CGWindowLevelForKey(.desktopWindow) && level < CGWindowLevelForKey(.normalWindow) :
+                level > CGWindowLevelForKey(.normalWindow) && level <= CGWindowLevelForKey(.modalPanelWindow)
+            return owner == pid && rect == bounds && validLevel
         }
         return false
     }
