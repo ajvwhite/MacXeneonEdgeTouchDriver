@@ -27,7 +27,8 @@ final class AXReadHardwareTests: XCTestCase {
         wait(for: [finished], timeout: 5)
     }
 
-    /// Read-only native check for an already visible, nonfocusable floating panel.
+    /// Read-only native check for an already visible, nonfocusable floating panel
+    /// or desktop widget. Supply a point inside the unobscured target surface.
     /// The guard below prevents this diagnostic from entering any mutation path.
     func testPassiveFloatingTargetIsResolvableWithoutActivation() throws {
         let environment = ProcessInfo.processInfo.environment

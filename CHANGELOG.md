@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Allow clicks and drags on verified, nonfocusable desktop widget windows without activating Notification Center.
 - Add a portable installer you can build and sign on one Mac, then use on another without development tools. It can install, update or remove the driver for the current user.
 - Check bundled signatures before installation and support Apple's notarization process without copying private keys or saved credentials.
 - Put everyday setup and use first in the README, with separate guides for settings, troubleshooting and development.

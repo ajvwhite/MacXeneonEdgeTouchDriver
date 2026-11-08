@@ -5,6 +5,58 @@ import XCTest
 @testable import MacXeneonEdgeTouchDriverCore
 
 final class AXTouchTargetBackendTests: XCTestCase {
+    func testDesktopWidgetIsRevalidatedWithoutActivationOrFocusMutation() {
+        let f = TargetOperations(); f.unknownSubrole = true; f.windowSettable = false
+        var visible = true
+        let backend = AXTouchTargetBackend(operations: f, desktopWindow: { pid, bounds, point in
+            XCTAssertEqual(pid, 33)
+            XCTAssertEqual(bounds, CGRect(origin: f.origin, size: f.size))
+            XCTAssertEqual(point, f.point)
+            return visible
+        })
+        let target = backend.resolve(at: f.point, permit: { true })!
+        XCTAssertFalse(target.requiresActivation)
+        XCTAssertTrue(backend.focusWindow(target, at: f.point, permit: { true }))
+        XCTAssertTrue(f.mutations.isEmpty)
+        visible = false
+        XCTAssertFalse(backend.focusWindow(target, at: f.point, permit: { true }))
+        XCTAssertTrue(f.mutations.isEmpty)
+    }
+
+    func testUnknownWindowNeedsDesktopProofAndNoFocusSetter() {
+        for proven in [false, true] {
+            for settable in [false, true] {
+                let f = TargetOperations(); f.unknownSubrole = true; f.windowSettable = settable
+                let backend = AXTouchTargetBackend(operations: f, desktopWindow: { _, _, _ in proven })
+                XCTAssertEqual(backend.resolve(at: f.point, permit: { true })!.requiresActivation,
+                               !proven || settable)
+            }
+        }
+    }
+
+    func testDesktopWindowProofRejectsOcclusionWrongOwnerGeometryAndLevels() {
+        let f = TargetOperations()
+        let bounds = CGRect(origin: f.origin, size: f.size)
+        func window(pid: Int32 = 33, rect: CGRect? = nil, level: Int32 = CGWindowLevelForKey(.desktopIconWindow) + 2,
+                    alpha: Double = 1) -> [String: Any] {
+            [kCGWindowOwnerPID as String: pid, kCGWindowBounds as String: (rect ?? bounds).dictionaryRepresentation,
+             kCGWindowLayer as String: level, kCGWindowAlpha as String: alpha]
+        }
+        func matches(_ windows: [[String: Any]]) -> Bool {
+            AXTouchTargetBackend.matchesPassiveWindow(pid: 33, bounds: bounds, point: f.point,
+                                                      windows: windows, desktop: true)
+        }
+        XCTAssertTrue(matches([window()]))
+        XCTAssertTrue(matches([window(pid: 44, alpha: 0), window()]))
+        XCTAssertFalse(matches([]))
+        XCTAssertFalse(matches([window(pid: 44)]))
+        XCTAssertFalse(matches([window(rect: bounds.insetBy(dx: -1, dy: -1))]))
+        XCTAssertFalse(matches([window(level: CGWindowLevelForKey(.normalWindow))]))
+        XCTAssertFalse(matches([window(level: CGWindowLevelForKey(.desktopWindow))]))
+        XCTAssertFalse(matches([window(level: CGWindowLevelForKey(.floatingWindow))]))
+        XCTAssertFalse(matches([window(pid: 44, level: CGWindowLevelForKey(.normalWindow)), window()]))
+    }
+
     func testNonFocusableFloatingDialogIsRevalidatedWithoutMutation() {
         let f = TargetOperations(); f.dialog = true; f.windowSettable = false
         var visible = true
@@ -118,6 +170,7 @@ private final class TargetOperations: AXTouchTargetOperations {
     var hitError: AXError = .success
     var minimized = false
     var dialog = false
+    var unknownSubrole = false
     var focusedWindow = "sibling"
     var appSettable = true
     var windowSettable = true
@@ -141,7 +194,7 @@ private final class TargetOperations: AXTouchTargetOperations {
         case kAXWindowAttribute: value = .element(handle("window"))
         case kAXPositionAttribute: value = .point(origin)
         case kAXSizeAttribute: value = .size(size)
-        case kAXSubroleAttribute: value = .string(dialog ? kAXDialogSubrole : kAXStandardWindowSubrole)
+        case kAXSubroleAttribute: value = .string(dialog ? kAXDialogSubrole : unknownSubrole ? kAXUnknownSubrole : kAXStandardWindowSubrole)
         case kAXFocusedAttribute: value = .bool(false)
         case kAXMinimizedAttribute: value = .bool(minimized)
         case kAXFocusedWindowAttribute: value = .element(handle(focusedWindow))
